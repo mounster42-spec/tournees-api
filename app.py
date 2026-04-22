@@ -808,17 +808,20 @@ def _or_opt_matrix(matrix, route_local, seg_sizes=[1, 2, 3]):
 
 
 def _two_opt_matrix(matrix, route_local):
-    """2-opt utilisant une matrice de distances routieres reelles."""
+    """2-opt utilisant une matrice de distances routieres reelles.
+    Comparaison du cout total (et non du delta partiel) pour matrice asymetrique."""
     best = list(route_local)
+    best_cost = _matrix_route_cost(matrix, best)
     improved = True
     while improved:
         improved = False
         for i in range(1, len(best) - 2):
             for j in range(i + 1, len(best) - 1):
-                d_current = matrix[best[i-1]][best[i]] + matrix[best[j]][best[j+1]]
-                d_new     = matrix[best[i-1]][best[j]] + matrix[best[i]][best[j+1]]
-                if d_new < d_current - 1e-6:
-                    best[i:j+1] = best[i:j+1][::-1]
+                candidate = best[:i] + best[i:j+1][::-1] + best[j+1:]
+                new_cost = _matrix_route_cost(matrix, candidate)
+                if new_cost < best_cost - 1e-6:
+                    best = candidate
+                    best_cost = new_cost
                     improved = True
     return best
 
