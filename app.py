@@ -233,7 +233,7 @@ def _create_sub_clusters(coords, delivery_indices, k_sub):
     return [g for g in sub_groups if g]  # enlever groupes vides
 
 
-def _enumerate_partitions(sub_groups, num_vehicles, points, max_per_vehicle, max_partitions=5):
+def _enumerate_partitions(sub_groups, num_vehicles, points, max_per_vehicle, max_partitions=50):
     """Enumere TOUTES les facons d'assigner les sous-clusters aux vehicules.
     Pour num_vehicles=2 : teste chaque combinaison valide de sous-clusters.
     Garantit des partitions genuinement differentes (pas de recurrence sur K-Means centroides)."""
@@ -391,9 +391,23 @@ def kmeans_partition(points, num_vehicles, max_per_vehicle, start_idx, end_idx):
                 seen_keys.add(key)
                 all_partitions.append((f"k={k_sub}", groups))
 
-    MAX_PARTITIONS = 5
-    all_partitions = all_partitions[:MAX_PARTITIONS]
-    print(f"{len(all_partitions)} partitions uniques a tester (max={MAX_PARTITIONS})", flush=True)
+    print(f"{len(all_partitions)} partitions uniques enumerees", flush=True)
+
+    # Pre-scoring haversine (0 appel API) : classe les partitions par distance estimee
+    def _hav_cost(groups):
+        total = 0.0
+        for group in groups:
+            route = _nearest_neighbor_route(points, group, start_idx, end_idx)
+            total += _compute_route_distance(points, route)
+        return total
+
+    all_partitions.sort(key=lambda x: _hav_cost(x[1]))
+    for i, (name, groups) in enumerate(all_partitions[:6]):
+        print(f"  #{i+1} '{name}': {[len(g) for g in groups]} pts, hav={_hav_cost(groups):.2f}km", flush=True)
+
+    # Appel Vroom sur les 4 meilleures partitions (8 appels max, 0 rate limit)
+    TOP_VROOM = 4
+    print(f"Vroom sur top {TOP_VROOM} partitions...", flush=True)
 
     best_routes = None
     best_dur = float("inf")
@@ -401,7 +415,7 @@ def kmeans_partition(points, num_vehicles, max_per_vehicle, start_idx, end_idx):
     best_err = None
     best_name = ""
 
-    for name, groups in all_partitions:
+    for name, groups in all_partitions[:TOP_VROOM]:
         pts_str = [len(g) for g in groups]
         print(f"Partition '{name}': pts={pts_str}", flush=True)
 
