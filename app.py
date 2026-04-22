@@ -933,7 +933,10 @@ def optimize():
     road_metrics = []
     if routes_idx:
         print("Or-opt + 2-opt routier...", flush=True)
-        routes_idx, road_metrics = apply_or_opt_and_routing_2opt(points, routes_idx)
+        try:
+            routes_idx, road_metrics = apply_or_opt_and_routing_2opt(points, routes_idx)
+        except Exception as e:
+            print(f"Or-opt + 2-opt routier: erreur ignoree ({e}), on continue", flush=True)
 
     # 5. POST-PROCESSING : swap des points frontiere
     if routes_idx and vroom_ok:

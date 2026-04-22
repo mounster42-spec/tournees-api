@@ -133,11 +133,14 @@ function callAPI(points, params) {
     end_id: params.end_id
   };
 
-  // Réveil du serveur (Render free tier s'endort)
-  try {
-    UrlFetchApp.fetch("https://tournees-api.onrender.com/", { muteHttpExceptions: true });
-  } catch (e) {}
-  Utilities.sleep(2000);
+  // Réveil du serveur (Render free tier s'endort, peut prendre 30-60s)
+  for (var attempt = 0; attempt < 6; attempt++) {
+    try {
+      var wakeResp = UrlFetchApp.fetch("https://tournees-api.onrender.com/", { muteHttpExceptions: true });
+      if (wakeResp.getResponseCode() === 200) break;
+    } catch (e) {}
+    Utilities.sleep(10000);
+  }
 
   const response = UrlFetchApp.fetch(url, {
     method: "post",
@@ -259,16 +262,25 @@ function writeResult(result, params, points) {
   sheet.getRange(infoRow + 1, 2).setValue(modeText);
   sheet.getRange(infoRow + 1, 1).setFontWeight("bold");
 
-  var km1 = result.tournee_1_km || 0;
-  var km2 = result.tournee_2_km || 0;
+  var km1  = result.tournee_1_km  || 0;
+  var km2  = result.tournee_2_km  || 0;
+  var min1 = result.tournee_1_min;
+  var min2 = result.tournee_2_min;
+
+  var dist1Text = km1 + " km routiers" + (min1 != null ? " (~" + min1 + " min)" : "");
+  var dist2Text = km2 + " km routiers" + (min2 != null ? " (~" + min2 + " min)" : "");
+  var totalKm   = Math.round((km1 + km2) * 100) / 100;
+  var totalMin  = (min1 != null && min2 != null) ? Math.round((min1 + min2) * 10) / 10 : null;
+  var totalText = totalKm + " km routiers" + (totalMin != null ? " (~" + totalMin + " min)" : "");
+
   sheet.getRange(infoRow + 2, 1).setValue("Distance Tournée 1");
-  sheet.getRange(infoRow + 2, 2).setValue(km1 + " km");
+  sheet.getRange(infoRow + 2, 2).setValue(dist1Text);
   sheet.getRange(infoRow + 2, 1).setFontWeight("bold");
   sheet.getRange(infoRow + 3, 1).setValue("Distance Tournée 2");
-  sheet.getRange(infoRow + 3, 2).setValue(km2 + " km");
+  sheet.getRange(infoRow + 3, 2).setValue(dist2Text);
   sheet.getRange(infoRow + 3, 1).setFontWeight("bold");
   sheet.getRange(infoRow + 4, 1).setValue("Distance totale");
-  sheet.getRange(infoRow + 4, 2).setValue(Math.round((km1 + km2) * 100) / 100 + " km");
+  sheet.getRange(infoRow + 4, 2).setValue(totalText);
   sheet.getRange(infoRow + 4, 1).setFontWeight("bold");
   sheet.getRange(infoRow + 4, 2).setFontWeight("bold");
 
