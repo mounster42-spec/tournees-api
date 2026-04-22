@@ -41,7 +41,7 @@ def _call_vroom_multi(jobs, vehicles, headers):
             ORS_VROOM_URL,
             json={"jobs": jobs, "vehicles": vehicles},
             headers=headers,
-            timeout=30
+            timeout=15
         )
         data = response.json()
 
@@ -151,18 +151,26 @@ def optimize_with_vroom(points, num_vehicles, max_per_vehicle, start_idx, end_id
     best_name = ""
     last_err = None
 
+    consecutive_failures = 0
     for name, jobs in orderings_to_run:
+        if consecutive_failures >= 2:
+            print(f"  Abandon apres 2 echecs consecutifs", flush=True)
+            break
+        if name != orderings_to_run[0][0]:
+            time.sleep(1.5)
         print(f"  Run '{name}'...", flush=True)
         result, err = _call_vroom_multi(jobs, vehicles, headers)
         if result:
             routes, dur = result
             print(f"    -> {dur}s", flush=True)
+            consecutive_failures = 0
             if dur < best_duration:
                 best_duration = dur
                 best = routes
                 best_name = name
         else:
             last_err = err
+            consecutive_failures += 1
             print(f"    -> erreur: {err}", flush=True)
 
     if best:
