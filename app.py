@@ -851,26 +851,26 @@ def apply_or_opt_and_routing_2opt(points, routes_idx):
     for v, route in enumerate(routes_idx):
         dist_matrix, dur_matrix = _fetch_ors_matrix(points, route, headers)
 
-        if dur_matrix:
+        if dist_matrix:
             n = len(route)
             local = list(range(n))
 
-            # Or-opt sur durees routieres (meme objectif que Vroom)
-            before_s = _matrix_route_cost(dur_matrix, local)
-            local = _or_opt_matrix(dur_matrix, local)
-            after_or = _matrix_route_cost(dur_matrix, local)
-            if after_or < before_s:
-                print(f"  Or-opt T{v+1}: {before_s/60:.1f}min -> {after_or/60:.1f}min (-{(before_s-after_or)/60:.1f}min)", flush=True)
+            # Or-opt sur distances routieres (minimise les km)
+            before_m = _matrix_route_cost(dist_matrix, local)
+            local = _or_opt_matrix(dist_matrix, local)
+            after_or = _matrix_route_cost(dist_matrix, local)
+            if after_or < before_m:
+                print(f"  Or-opt T{v+1}: {before_m/1000:.2f}km -> {after_or/1000:.2f}km (-{(before_m-after_or)/1000:.2f}km)", flush=True)
 
-            # 2-opt sur durees routieres
-            local = _two_opt_matrix(dur_matrix, local)
-            after_2opt = _matrix_route_cost(dur_matrix, local)
+            # 2-opt sur distances routieres
+            local = _two_opt_matrix(dist_matrix, local)
+            after_2opt = _matrix_route_cost(dist_matrix, local)
             if after_2opt < after_or:
-                print(f"  2-opt routier T{v+1}: {after_or/60:.1f}min -> {after_2opt/60:.1f}min (-{(after_or-after_2opt)/60:.1f}min)", flush=True)
+                print(f"  2-opt routier T{v+1}: {after_or/1000:.2f}km -> {after_2opt/1000:.2f}km (-{(after_or-after_2opt)/1000:.2f}km)", flush=True)
 
             route = [route[i] for i in local]
-            road_km  = round(_matrix_route_cost(dist_matrix, local) / 1000, 2) if dist_matrix else None
-            road_min = round(_matrix_route_cost(dur_matrix,  local) / 60,   1)
+            road_km  = round(_matrix_route_cost(dist_matrix, local) / 1000, 2)
+            road_min = round(_matrix_route_cost(dur_matrix,  local) / 60,   1) if dur_matrix else None
             print(f"  T{v+1}: {road_km}km routiers, ~{road_min}min", flush=True)
             road_metrics.append({"km": road_km, "min": road_min})
         else:
