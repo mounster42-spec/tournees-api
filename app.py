@@ -74,10 +74,13 @@ def _call_vroom_multi(jobs, vehicles, headers):
         return None, str(e)
 
 
-def _auto_num_runs(n_jobs):
-    """Ajuste automatiquement le nombre de runs Vroom selon la taille du probleme.
-    Moins de jobs = plus de runs (recherche plus exhaustive, calcul plus rapide).
+def _auto_num_runs(n_jobs, num_vehicles):
+    """Ajuste automatiquement le nombre de runs Vroom.
+    1 vehicule : Vroom est exact (LKH3), 1 run suffit.
+    Multi-vehicules : l'affectation est heuristique, plus de runs = meilleure solution.
     """
+    if num_vehicles == 1:
+        return 1
     if n_jobs <= 40:
         return 5
     else:
@@ -119,7 +122,7 @@ def optimize_with_vroom(points, num_vehicles, max_per_vehicle, start_idx, end_id
         })
 
     # Nombre de runs auto-ajuste
-    n_runs = _auto_num_runs(len(delivery_indices))
+    n_runs = _auto_num_runs(len(delivery_indices), num_vehicles)
     print(f"Vroom multi-vehicules: {len(delivery_indices)} jobs -> {n_runs} runs", flush=True)
 
     # 5 ordres de jobs possibles (tronques a n_runs)
