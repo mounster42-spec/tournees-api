@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 import math
 import os
+import time
 import numpy as np
 import requests
 from itertools import combinations
@@ -232,7 +233,7 @@ def _create_sub_clusters(coords, delivery_indices, k_sub):
     return [g for g in sub_groups if g]  # enlever groupes vides
 
 
-def _enumerate_partitions(sub_groups, num_vehicles, points, max_per_vehicle, max_partitions=12):
+def _enumerate_partitions(sub_groups, num_vehicles, points, max_per_vehicle, max_partitions=5):
     """Enumere TOUTES les facons d'assigner les sous-clusters aux vehicules.
     Pour num_vehicles=2 : teste chaque combinaison valide de sous-clusters.
     Garantit des partitions genuinement differentes (pas de recurrence sur K-Means centroides)."""
@@ -298,6 +299,7 @@ def _sequence_groups(points, groups, start_idx, end_idx, headers):
         jobs = [{"id": idx, "location": [points[idx]["lon"], points[idx]["lat"]]} for idx in group]
 
         try:
+            time.sleep(0.5)  # delay between Vroom calls
             response = requests.post(
                 ORS_VROOM_URL,
                 json={"jobs": jobs, "vehicles": [vehicle]},
@@ -389,7 +391,9 @@ def kmeans_partition(points, num_vehicles, max_per_vehicle, start_idx, end_idx):
                 seen_keys.add(key)
                 all_partitions.append((f"k={k_sub}", groups))
 
-    print(f"{len(all_partitions)} partitions uniques a tester", flush=True)
+    MAX_PARTITIONS = 5
+    all_partitions = all_partitions[:MAX_PARTITIONS]
+    print(f"{len(all_partitions)} partitions uniques a tester (max={MAX_PARTITIONS})", flush=True)
 
     best_routes = None
     best_dur = float("inf")
