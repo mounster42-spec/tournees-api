@@ -853,24 +853,32 @@ def apply_or_opt_and_routing_2opt(points, routes_idx):
 
         if dist_matrix:
             n = len(route)
-            local = list(range(n))
+            before_m = _matrix_route_cost(dist_matrix, list(range(n)))
 
-            # Or-opt sur distances routieres (minimise les km)
-            before_m = _matrix_route_cost(dist_matrix, local)
-            local = _or_opt_matrix(dist_matrix, local)
-            after_or = _matrix_route_cost(dist_matrix, local)
-            if after_or < before_m:
-                print(f"  Or-opt T{v+1}: {before_m/1000:.2f}km -> {after_or/1000:.2f}km (-{(before_m-after_or)/1000:.2f}km)", flush=True)
+            # Multi-start Or-opt + 2-opt : 3 points de depart differents, on garde le meilleur
+            depot_local = 0  # index local du depot (toujours 0)
+            interior = list(range(1, n - 1))  # points interieurs (hors depot depart/arrivee)
+            starts = [
+                list(range(n)),                                       # ordre Vroom
+                [0] + list(reversed(interior)) + [n - 1],            # interieur inverse
+                [0] + sorted(interior, key=lambda i: sum(dist_matrix[0][i] for _ in [1])) + [n - 1],  # par distance au depot
+            ]
 
-            # 2-opt sur distances routieres
-            local = _two_opt_matrix(dist_matrix, local)
-            after_2opt = _matrix_route_cost(dist_matrix, local)
-            if after_2opt < after_or:
-                print(f"  2-opt routier T{v+1}: {after_or/1000:.2f}km -> {after_2opt/1000:.2f}km (-{(after_or-after_2opt)/1000:.2f}km)", flush=True)
+            best_local = None
+            best_cost  = float("inf")
+            for s_idx, start in enumerate(starts):
+                candidate = _or_opt_matrix(dist_matrix, start)
+                candidate = _two_opt_matrix(dist_matrix, candidate)
+                cost = _matrix_route_cost(dist_matrix, candidate)
+                print(f"  Or-opt start#{s_idx+1} T{v+1}: {cost/1000:.2f}km", flush=True)
+                if cost < best_cost:
+                    best_cost  = cost
+                    best_local = candidate
 
-            route = [route[i] for i in local]
-            road_km  = round(_matrix_route_cost(dist_matrix, local) / 1000, 2)
-            road_min = round(_matrix_route_cost(dur_matrix,  local) / 60,   1) if dur_matrix else None
+            print(f"  T{v+1}: {before_m/1000:.2f}km -> {best_cost/1000:.2f}km (-{(before_m-best_cost)/1000:.2f}km)", flush=True)
+            route = [route[i] for i in best_local]
+            road_km  = round(best_cost / 1000, 2)
+            road_min = round(_matrix_route_cost(dur_matrix, best_local) / 60, 1) if dur_matrix else None
             print(f"  T{v+1}: {road_km}km routiers, ~{road_min}min", flush=True)
             road_metrics.append({"km": road_km, "min": road_min})
         else:
