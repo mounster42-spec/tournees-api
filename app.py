@@ -791,17 +791,14 @@ def _or_opt_matrix(matrix, route_local, seg_sizes=[1, 2, 3]):
                 remaining = best[:i] + best[i+seg_size:]
                 segment   = best[i:i+seg_size]
                 for j in range(1, len(remaining) - 1):
-                    for seg in [segment, list(reversed(segment))]:
-                        d_inserted = (
-                            matrix[remaining[j-1]][seg[0]] +
-                            matrix[seg[-1]][remaining[j]] -
-                            matrix[remaining[j-1]][remaining[j]]
-                        )
-                        if d_removed - d_inserted > 1e-6:
-                            best = remaining[:j] + seg + remaining[j:]
-                            improved = True
-                            break
-                    if improved:
+                    d_inserted = (
+                        matrix[remaining[j-1]][segment[0]] +
+                        matrix[segment[-1]][remaining[j]] -
+                        matrix[remaining[j-1]][remaining[j]]
+                    )
+                    if d_removed - d_inserted > 1e-6:
+                        best = remaining[:j] + segment + remaining[j:]
+                        improved = True
                         break
                 if improved:
                     break
