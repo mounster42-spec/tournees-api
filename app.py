@@ -758,6 +758,23 @@ def _or_opt(points, route, seg_sizes=[1, 2, 3]):
     return best
 
 
+def _fetch_ors_matrix(points, route_indices, headers):
+    """Recupere les matrices de distances (m) et durees (s) ORS pour une route.
+    Retourne (dist_matrix, dur_matrix) ou (None, None) en cas d'erreur."""
+    locations = [[points[i]["lon"], points[i]["lat"]] for i in route_indices]
+    try:
+        response = requests.post(
+            "https://api.openrouteservice.org/v2/matrix/driving-car",
+            json={"locations": locations, "metrics": ["distance", "duration"]},
+            headers=headers,
+            timeout=20
+        )
+        data = response.json()
+        return data.get("distances", None), data.get("durations", None)
+    except Exception:
+        return None, None
+
+
 def _or_opt_matrix(matrix, route_local, seg_sizes=[1, 2, 3]):
     """Or-opt utilisant une matrice de distances routieres reelles."""
     best = list(route_local)
