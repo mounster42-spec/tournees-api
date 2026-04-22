@@ -78,14 +78,10 @@ def _auto_num_runs(n_jobs):
     """Ajuste automatiquement le nombre de runs Vroom selon la taille du probleme.
     Moins de jobs = plus de runs (recherche plus exhaustive, calcul plus rapide).
     """
-    if n_jobs <= 15:
+    if n_jobs <= 40:
         return 5
-    elif n_jobs <= 25:
-        return 4
-    elif n_jobs <= 40:
-        return 3
     else:
-        return 2
+        return 3
 
 
 def optimize_with_vroom(points, num_vehicles, max_per_vehicle, start_idx, end_idx):
