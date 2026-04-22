@@ -651,6 +651,51 @@ def post_process_swaps(points, routes_idx, start_idx, end_idx, max_per_vehicle):
 
 
 # =========================
+# 6b. 2-OPT POST-PROCESSING
+# =========================
+def _two_opt(points, route):
+    """2-opt local search sur une route (distances a vol d'oiseau).
+    Teste tous les echanges de 2 aretes et garde les ameliorations.
+    Retourne la route optimisee (2-optimale)."""
+    best = list(route)
+    improved = True
+    while improved:
+        improved = False
+        for i in range(1, len(best) - 2):
+            for j in range(i + 1, len(best) - 1):
+                d_current = (
+                    haversine((points[best[i-1]]["lat"], points[best[i-1]]["lon"]),
+                              (points[best[i]]["lat"],   points[best[i]]["lon"])) +
+                    haversine((points[best[j]]["lat"],   points[best[j]]["lon"]),
+                              (points[best[j+1]]["lat"], points[best[j+1]]["lon"]))
+                )
+                d_new = (
+                    haversine((points[best[i-1]]["lat"], points[best[i-1]]["lon"]),
+                              (points[best[j]]["lat"],   points[best[j]]["lon"])) +
+                    haversine((points[best[i]]["lat"],   points[best[i]]["lon"]),
+                              (points[best[j+1]]["lat"], points[best[j+1]]["lon"]))
+                )
+                if d_new < d_current - 1e-6:
+                    best[i:j+1] = best[i:j+1][::-1]
+                    improved = True
+    return best
+
+
+def apply_two_opt(points, routes_idx):
+    """Applique 2-opt sur chaque tournee independamment."""
+    improved_routes = []
+    for v, route in enumerate(routes_idx):
+        before = _compute_route_distance(points, route)
+        optimized = _two_opt(points, route)
+        after = _compute_route_distance(points, optimized)
+        gain = round(before - after, 2)
+        if gain > 0:
+            print(f"  2-opt T{v+1}: {before}km -> {after}km (-{gain}km)", flush=True)
+        improved_routes.append(optimized)
+    return improved_routes
+
+
+# =========================
 # 7. API
 # =========================
 @app.route("/optimize", methods=["POST"])
@@ -698,13 +743,18 @@ def optimize():
             points, num_vehicles, max_per_vehicle, start_idx, end_idx
         )
 
-    # 3. POST-PROCESSING : swap des points frontiere
+    # 3. 2-OPT : amelioration locale de chaque tournee
+    if routes_idx:
+        print("2-opt par tournee...", flush=True)
+        routes_idx = apply_two_opt(points, routes_idx)
+
+    # 4. POST-PROCESSING : swap des points frontiere
     if routes_idx and vroom_ok:
         routes_idx = post_process_swaps(
             points, routes_idx, start_idx, end_idx, max_per_vehicle
         )
 
-    # 4. FORMAT RESPONSE (compatible code.js)
+    # 5. FORMAT RESPONSE (compatible code.js)
     response = {
         "num_clusters_dbscan": num_vehicles,
         "vroom_used": vroom_ok,
