@@ -714,6 +714,116 @@ def apply_two_opt(points, routes_idx):
 
 
 # =========================
+# 6c. OR-OPT + 2-OPT ROUTIER
+# =========================
+def _or_opt(points, route, seg_sizes=[1, 2, 3]):
+    """Or-opt : deplace des segments de 1-3 points vers la meilleure position.
+    Complementaire au 2-opt : trouve des ameliorations que 2-opt ne voit pas."""
+    best = list(route)
+    improved = True
+    while improved:
+        improved = False
+        for seg_size in seg_sizes:
+            for i in range(1, len(best) - seg_size - 1):
+                segment = best[i:i + seg_size]
+                remaining = best[:i] + best[i + seg_size:]
+                d_removed = (
+                    haversine((points[best[i-1]]["lat"], points[best[i-1]]["lon"]),
+                              (points[best[i]]["lat"],   points[best[i]]["lon"])) +
+                    haversine((points[best[i+seg_size-1]]["lat"], points[best[i+seg_size-1]]["lon"]),
+                              (points[best[i+seg_size]]["lat"],   points[best[i+seg_size]]["lon"])) -
+                    haversine((points[best[i-1]]["lat"], points[best[i-1]]["lon"]),
+                              (points[best[i+seg_size]]["lat"],   points[best[i+seg_size]]["lon"]))
+                )
+                for j in range(1, len(remaining) - 1):
+                    for seg in [segment, list(reversed(segment))]:
+                        d_inserted = (
+                            haversine((points[remaining[j-1]]["lat"], points[remaining[j-1]]["lon"]),
+                                      (points[seg[0]]["lat"],         points[seg[0]]["lon"])) +
+                            haversine((points[seg[-1]]["lat"],         points[seg[-1]]["lon"]),
+                                      (points[remaining[j]]["lat"],   points[remaining[j]]["lon"])) -
+                            haversine((points[remaining[j-1]]["lat"], points[remaining[j-1]]["lon"]),
+                                      (points[remaining[j]]["lat"],   points[remaining[j]]["lon"]))
+                        )
+                        if d_removed - d_inserted > 1e-6:
+                            best = remaining[:j] + seg + remaining[j:]
+                            improved = True
+                            break
+                    if improved:
+                        break
+                if improved:
+                    break
+            if improved:
+                break
+    return best
+
+
+def _fetch_ors_matrix(points, route_indices, headers):
+    """Recupere la matrice de durees ORS pour les points d'une route."""
+    locations = [[points[i]["lon"], points[i]["lat"]] for i in route_indices]
+    try:
+        response = requests.post(
+            "https://api.openrouteservice.org/v2/matrix/driving-car",
+            json={"locations": locations, "metrics": ["duration"]},
+            headers=headers,
+            timeout=20
+        )
+        data = response.json()
+        return data.get("durations", None)
+    except Exception:
+        return None
+
+
+def _two_opt_matrix(matrix, route_local):
+    """2-opt utilisant une matrice de durees routieres reelles."""
+    best = list(route_local)
+    improved = True
+    while improved:
+        improved = False
+        for i in range(1, len(best) - 2):
+            for j in range(i + 1, len(best) - 1):
+                d_current = matrix[best[i-1]][best[i]] + matrix[best[j]][best[j+1]]
+                d_new     = matrix[best[i-1]][best[j]] + matrix[best[i]][best[j+1]]
+                if d_new < d_current - 1e-6:
+                    best[i:j+1] = best[i:j+1][::-1]
+                    improved = True
+    return best
+
+
+def apply_or_opt_and_routing_2opt(points, routes_idx):
+    """Pour chaque tournee : Or-opt (haversine) puis 2-opt sur matrice ORS (distances reelles)."""
+    headers = {
+        "Authorization": ORS_KEY,
+        "Content-Type": "application/json"
+    }
+    improved_routes = []
+
+    for v, route in enumerate(routes_idx):
+        # --- Or-opt (haversine, 0 appel API) ---
+        before = _compute_route_distance(points, route)
+        route = _or_opt(points, route)
+        after = _compute_route_distance(points, route)
+        if after < before:
+            print(f"  Or-opt T{v+1}: {before}km -> {after}km (-{round(before-after,2)}km)", flush=True)
+
+        # --- 2-opt routier (matrice ORS) ---
+        matrix = _fetch_ors_matrix(points, route, headers)
+        if matrix:
+            optimized_local = _two_opt_matrix(matrix, list(range(len(route))))
+            route_routing = [route[i] for i in optimized_local]
+            after_rt = _compute_route_distance(points, route_routing)
+            if after_rt < after:
+                print(f"  2-opt routier T{v+1}: {after}km -> {after_rt}km (-{round(after-after_rt,2)}km)", flush=True)
+            route = route_routing
+        else:
+            print(f"  2-opt routier T{v+1}: matrice ORS indisponible, skip", flush=True)
+
+        improved_routes.append(route)
+
+    return improved_routes
+
+
+# =========================
 # 7. API
 # =========================
 @app.route("/optimize", methods=["POST"])
@@ -761,18 +871,23 @@ def optimize():
             points, num_vehicles, max_per_vehicle, start_idx, end_idx
         )
 
-    # 3. 2-OPT : amelioration locale de chaque tournee
+    # 3. 2-OPT haversine : amelioration locale de chaque tournee
     if routes_idx:
         print("2-opt par tournee...", flush=True)
         routes_idx = apply_two_opt(points, routes_idx)
 
-    # 4. POST-PROCESSING : swap des points frontiere
+    # 4. Or-opt + 2-opt routier
+    if routes_idx:
+        print("Or-opt + 2-opt routier...", flush=True)
+        routes_idx = apply_or_opt_and_routing_2opt(points, routes_idx)
+
+    # 5. POST-PROCESSING : swap des points frontiere
     if routes_idx and vroom_ok:
         routes_idx = post_process_swaps(
             points, routes_idx, start_idx, end_idx, max_per_vehicle
         )
 
-    # 5. FORMAT RESPONSE (compatible code.js)
+    # 6. FORMAT RESPONSE (compatible code.js)
     response = {
         "num_clusters_dbscan": num_vehicles,
         "vroom_used": vroom_ok,
@@ -792,7 +907,7 @@ def optimize():
 
 
 # =========================
-# 7. TEST
+# 8. TEST
 # =========================
 @app.route("/")
 def home():
