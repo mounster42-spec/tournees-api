@@ -758,24 +758,43 @@ def _or_opt(points, route, seg_sizes=[1, 2, 3]):
     return best
 
 
-def _fetch_ors_matrix(points, route_indices, headers):
-    """Recupere la matrice de durees ORS pour les points d'une route."""
-    locations = [[points[i]["lon"], points[i]["lat"]] for i in route_indices]
-    try:
-        response = requests.post(
-            "https://api.openrouteservice.org/v2/matrix/driving-car",
-            json={"locations": locations, "metrics": ["duration"]},
-            headers=headers,
-            timeout=20
-        )
-        data = response.json()
-        return data.get("durations", None)
-    except Exception:
-        return None
+def _or_opt_matrix(matrix, route_local, seg_sizes=[1, 2, 3]):
+    """Or-opt utilisant une matrice de distances routieres reelles."""
+    best = list(route_local)
+    improved = True
+    while improved:
+        improved = False
+        for seg_size in seg_sizes:
+            for i in range(1, len(best) - seg_size - 1):
+                d_removed = (
+                    matrix[best[i-1]][best[i]] +
+                    matrix[best[i+seg_size-1]][best[i+seg_size]] -
+                    matrix[best[i-1]][best[i+seg_size]]
+                )
+                remaining = best[:i] + best[i+seg_size:]
+                segment   = best[i:i+seg_size]
+                for j in range(1, len(remaining) - 1):
+                    for seg in [segment, list(reversed(segment))]:
+                        d_inserted = (
+                            matrix[remaining[j-1]][seg[0]] +
+                            matrix[seg[-1]][remaining[j]] -
+                            matrix[remaining[j-1]][remaining[j]]
+                        )
+                        if d_removed - d_inserted > 1e-6:
+                            best = remaining[:j] + seg + remaining[j:]
+                            improved = True
+                            break
+                    if improved:
+                        break
+                if improved:
+                    break
+            if improved:
+                break
+    return best
 
 
 def _two_opt_matrix(matrix, route_local):
-    """2-opt utilisant une matrice de durees routieres reelles."""
+    """2-opt utilisant une matrice de distances routieres reelles."""
     best = list(route_local)
     improved = True
     while improved:
@@ -790,37 +809,54 @@ def _two_opt_matrix(matrix, route_local):
     return best
 
 
+def _matrix_route_cost(matrix, route_local):
+    """Calcule le cout total d'une route a partir d'une matrice."""
+    return sum(matrix[route_local[i]][route_local[i+1]] for i in range(len(route_local)-1))
+
+
 def apply_or_opt_and_routing_2opt(points, routes_idx):
-    """Pour chaque tournee : Or-opt (haversine) puis 2-opt sur matrice ORS (distances reelles)."""
+    """Pour chaque tournee : Or-opt + 2-opt sur matrice ORS distance reelle.
+    Retourne (routes_ameliorees, road_metrics) ou road_metrics = [{km, min}, ...]."""
     headers = {
         "Authorization": ORS_KEY,
         "Content-Type": "application/json"
     }
     improved_routes = []
+    road_metrics = []
 
     for v, route in enumerate(routes_idx):
-        # --- Or-opt (haversine, 0 appel API) ---
-        before = _compute_route_distance(points, route)
-        route = _or_opt(points, route)
-        after = _compute_route_distance(points, route)
-        if after < before:
-            print(f"  Or-opt T{v+1}: {before}km -> {after}km (-{round(before-after,2)}km)", flush=True)
+        dist_matrix, dur_matrix = _fetch_ors_matrix(points, route, headers)
 
-        # --- 2-opt routier (matrice ORS) ---
-        matrix = _fetch_ors_matrix(points, route, headers)
-        if matrix:
-            optimized_local = _two_opt_matrix(matrix, list(range(len(route))))
-            route_routing = [route[i] for i in optimized_local]
-            after_rt = _compute_route_distance(points, route_routing)
-            if after_rt < after:
-                print(f"  2-opt routier T{v+1}: {after}km -> {after_rt}km (-{round(after-after_rt,2)}km)", flush=True)
-            route = route_routing
+        if dist_matrix:
+            n = len(route)
+            local = list(range(n))
+
+            # Or-opt sur distances routieres
+            before_m = _matrix_route_cost(dist_matrix, local)
+            local = _or_opt_matrix(dist_matrix, local)
+            after_or = _matrix_route_cost(dist_matrix, local)
+            if after_or < before_m:
+                print(f"  Or-opt T{v+1}: {before_m/1000:.2f}km -> {after_or/1000:.2f}km (-{(before_m-after_or)/1000:.2f}km)", flush=True)
+
+            # 2-opt sur distances routieres
+            local = _two_opt_matrix(dist_matrix, local)
+            after_2opt = _matrix_route_cost(dist_matrix, local)
+            if after_2opt < after_or:
+                print(f"  2-opt routier T{v+1}: {after_or/1000:.2f}km -> {after_2opt/1000:.2f}km (-{(after_or-after_2opt)/1000:.2f}km)", flush=True)
+
+            route = [route[i] for i in local]
+            road_km  = round(_matrix_route_cost(dist_matrix, local) / 1000, 2)
+            road_min = round(_matrix_route_cost(dur_matrix,  local) / 60,   1) if dur_matrix else None
+            print(f"  T{v+1}: {road_km}km routiers, ~{road_min}min", flush=True)
+            road_metrics.append({"km": road_km, "min": road_min})
         else:
-            print(f"  2-opt routier T{v+1}: matrice ORS indisponible, skip", flush=True)
+            print(f"  Matrice ORS T{v+1} indisponible, fallback haversine", flush=True)
+            route = _or_opt(points, route)
+            road_metrics.append({"km": _compute_route_distance(points, route), "min": None})
 
         improved_routes.append(route)
 
-    return improved_routes
+    return improved_routes, road_metrics
 
 
 # =========================
@@ -877,9 +913,10 @@ def optimize():
         routes_idx = apply_two_opt(points, routes_idx)
 
     # 4. Or-opt + 2-opt routier
+    road_metrics = []
     if routes_idx:
         print("Or-opt + 2-opt routier...", flush=True)
-        routes_idx = apply_or_opt_and_routing_2opt(points, routes_idx)
+        routes_idx, road_metrics = apply_or_opt_and_routing_2opt(points, routes_idx)
 
     # 5. POST-PROCESSING : swap des points frontiere
     if routes_idx and vroom_ok:
@@ -898,10 +935,16 @@ def optimize():
         key = "tournee_" + str(v + 1)
         if v < len(routes_idx):
             response[key] = [points[i]["id"] for i in routes_idx[v]]
-            response[key + "_km"] = _compute_route_distance(points, routes_idx[v])
+            if v < len(road_metrics) and road_metrics[v]["km"] is not None:
+                response[key + "_km"]  = road_metrics[v]["km"]
+                response[key + "_min"] = road_metrics[v]["min"]
+            else:
+                response[key + "_km"]  = _compute_route_distance(points, routes_idx[v])
+                response[key + "_min"] = None
         else:
             response[key] = []
-            response[key + "_km"] = 0
+            response[key + "_km"]  = 0
+            response[key + "_min"] = None
 
     return jsonify(response)
 
