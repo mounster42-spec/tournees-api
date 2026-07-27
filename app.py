@@ -546,7 +546,10 @@ def _resequence_single(points, vehicle_pts, start_idx, end_idx, headers):
                 ordered.append(step["id"])
         ordered.append(end_idx)
         dur = data["routes"][0].get("duration", 0)
-        dist = data["routes"][0].get("distance", 0)
+        dist = data["routes"][0].get("distance")
+        if dist is None:
+            print(f"_resequence_single: champ 'distance' absent, cles route={sorted(data['routes'][0].keys())}", flush=True)
+            dist = 0
         return ordered, dur, dist
 
     except Exception:
@@ -984,6 +987,7 @@ def optimize():
             optimization_path += "_swaps"
 
     print(f"Chemin emprunte: {optimization_path}, vroom_ok={vroom_ok}, erreur={vroom_error}", flush=True)
+    print(f"Metriques routes finales: {road_metrics}", flush=True)
 
     # 6. FORMAT RESPONSE (compatible code.js)
     response = {
