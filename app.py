@@ -10,6 +10,16 @@ from itertools import combinations
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 
+# OR-Tools est optionnel. Son absence (echec de build Render, wheel trop
+# lourde) ne doit jamais empecher le demarrage ni degrader la strategie
+# kmeans : elle desactive seulement les strategies ortools_*, qui repondent
+# alors 501 au lieu de retomber silencieusement sur K-Means.
+try:
+    from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+    ORTOOLS_AVAILABLE = True
+except ImportError:
+    ORTOOLS_AVAILABLE = False
+
 app = Flask(__name__)
 
 
@@ -38,7 +48,16 @@ ORS_MATRIX_URL = "https://api.openrouteservice.org/v2/matrix/driving-car"
 # 2b. INSTRUMENTATION (compteur d'appels API + strategies)
 # =========================
 VALID_STRATEGIES = ("kmeans", "ortools_haversine", "ortools_ors_matrix")
-IMPLEMENTED_STRATEGIES = {"kmeans"}  # s'elargit aux lots 3 et 4
+IMPLEMENTED_STRATEGIES = {"kmeans"}  # s'elargit au lot 4
+if ORTOOLS_AVAILABLE:
+    IMPLEMENTED_STRATEGIES.add("ortools_haversine")
+
+# Criteres d'arret du solveur OR-Tools.
+# solution_limit est le critere REEL : il est deterministe, contrairement a
+# time_limit qui depend de la charge CPU. time_limit n'est qu'un garde-fou ;
+# s'il se declenche, le determinisme est perdu et on le journalise.
+ORTOOLS_SOLUTION_LIMIT = 250
+ORTOOLS_TIME_LIMIT_S = 25
 
 _API_STATS = {"vroom": 0, "matrix": 0}
 
@@ -484,6 +503,151 @@ def kmeans_partition(points, num_vehicles, max_per_vehicle, start_idx, end_idx):
         best_routes.append([start_idx, end_idx])
 
     return best_routes, best_ok, best_err
+
+
+# =========================
+# 4b. PARTITION OR-TOOLS (affectation seule, le sequencement reste a Vroom)
+# =========================
+def _build_haversine_matrix(points):
+    """Matrice n x n de distances haversine en METRES entiers.
+    OR-Tools exige des couts entiers. Symetrique, diagonale nulle."""
+    n = len(points)
+    coords = [(float(p["lat"]), float(p["lon"])) for p in points]
+    matrix = [[0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = int(round(haversine(coords[i], coords[j]) * 1000))
+            matrix[i][j] = d
+            matrix[j][i] = d
+    return matrix
+
+
+def _ortools_status(routing):
+    """Statut du solveur, defensif : l'API a change selon les versions
+    d'OR-Tools et ce libelle ne sert qu'aux logs. Il ne doit jamais faire
+    echouer une resolution reussie."""
+    try:
+        return routing.status()
+    except Exception:
+        return "n/a"
+
+
+def _solve_cvrp_ortools(cost_matrix, num_vehicles, capacity, start_idx, end_idx):
+    """Resout un CVRP localement et retourne UNIQUEMENT l'affectation.
+
+    L'ordre trouve par OR-Tools est volontairement jete : c'est Vroom qui
+    sequence ensuite, sur le reseau routier reel. On ne compare donc que la
+    qualite de la partition.
+
+    Entree : matrice de couts entiers, nb de vehicules, capacite par vehicule,
+             index du depot de depart, index du depot d'arrivee.
+    Retour : (groups, None) ou (None, message_erreur).
+             groups = [[indices vehicule 0], [indices vehicule 1], ...]
+    """
+    if not ORTOOLS_AVAILABLE:
+        return None, "ortools not installed"
+
+    n = len(cost_matrix)
+    depots = {start_idx, end_idx}
+
+    try:
+        # Depart == arrivee -> forme mono-depot. Sinon, depart et arrivee
+        # distincts par vehicule (supporte nativement par OR-Tools).
+        if start_idx == end_idx:
+            manager = pywrapcp.RoutingIndexManager(n, num_vehicles, start_idx)
+        else:
+            manager = pywrapcp.RoutingIndexManager(
+                n, num_vehicles,
+                [start_idx] * num_vehicles,
+                [end_idx] * num_vehicles
+            )
+
+        routing = pywrapcp.RoutingModel(manager)
+
+        def transit_callback(from_index, to_index):
+            return cost_matrix[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
+
+        transit_idx = routing.RegisterTransitCallback(transit_callback)
+        routing.SetArcCostEvaluatorOfAllVehicles(transit_idx)
+
+        # Capacite : 1 point = 1 unite, les depots ne consomment rien.
+        def demand_callback(from_index):
+            return 0 if manager.IndexToNode(from_index) in depots else 1
+
+        demand_idx = routing.RegisterUnaryTransitCallback(demand_callback)
+        routing.AddDimensionWithVehicleCapacity(
+            demand_idx,
+            0,                              # pas de marge
+            [capacity] * num_vehicles,      # capacite par vehicule
+            True,                           # cumul demarre a zero
+            "Capacity"
+        )
+
+        params = pywrapcp.DefaultRoutingSearchParameters()
+        params.first_solution_strategy = (
+            routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC)
+        params.local_search_metaheuristic = (
+            routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH)
+        params.solution_limit = ORTOOLS_SOLUTION_LIMIT
+        params.time_limit.FromSeconds(ORTOOLS_TIME_LIMIT_S)
+        params.log_search = False
+
+        t0 = time.time()
+        solution = routing.SolveWithParameters(params)
+        elapsed = time.time() - t0
+
+        if solution is None:
+            return None, f"no solution (status={_ortools_status(routing)})"
+
+        # Le garde-fou temps ne doit jamais trancher : s'il tranche, le
+        # resultat depend de la machine et n'est plus reproductible.
+        if elapsed >= ORTOOLS_TIME_LIMIT_S - 0.5:
+            print(f"  ATTENTION OR-Tools: arret sur time_limit ({elapsed:.1f}s), "
+                  f"resultat NON deterministe", flush=True)
+
+        groups = [[] for _ in range(num_vehicles)]
+        for v in range(num_vehicles):
+            index = routing.Start(v)
+            while not routing.IsEnd(index):
+                node = manager.IndexToNode(index)
+                if node not in depots:
+                    groups[v].append(node)
+                index = solution.Value(routing.NextVar(index))
+
+        print(f"  OR-Tools: status={_ortools_status(routing)}, objectif={solution.ObjectiveValue()}m, "
+              f"{elapsed:.1f}s, {ORTOOLS_SOLUTION_LIMIT} solutions max", flush=True)
+
+        return groups, None
+
+    except Exception as e:
+        return None, f"ortools error: {e}"
+
+
+def ortools_partition_haversine(points, num_vehicles, max_per_vehicle, start_idx, end_idx):
+    """Affectation des points aux vehicules par OR-Tools, cout = haversine.
+    Aucun appel ORS. Retourne (groups, None) ou (None, message_erreur)."""
+    depot_indices = {start_idx, end_idx}
+    delivery_indices = [i for i in range(len(points)) if i not in depot_indices]
+
+    if not delivery_indices:
+        return [[] for _ in range(num_vehicles)], None
+
+    if num_vehicles * max_per_vehicle < len(delivery_indices):
+        return None, (f"capacity too small: {num_vehicles} x {max_per_vehicle} "
+                      f"< {len(delivery_indices)} points")
+
+    print(f"OR-Tools haversine: {len(delivery_indices)} points, {num_vehicles} vehicules, "
+          f"capacite {max_per_vehicle}", flush=True)
+
+    matrix = _build_haversine_matrix(points)
+    groups, err = _solve_cvrp_ortools(
+        matrix, num_vehicles, max_per_vehicle, start_idx, end_idx
+    )
+    if groups is None:
+        return None, err
+
+    print(f"  Partition: {[len(g) for g in groups]} pts", flush=True)
+    return groups, None
 
 
 # =========================
@@ -991,9 +1155,13 @@ def optimize():
         return jsonify({"error": f"unknown strategy '{strategy}'",
                         "valid": list(VALID_STRATEGIES)}), 400
     if strategy not in IMPLEMENTED_STRATEGIES:
-        return jsonify({"error": f"strategy '{strategy}' not implemented yet",
+        detail = f"strategy '{strategy}' not implemented yet"
+        if strategy.startswith("ortools_") and not ORTOOLS_AVAILABLE:
+            detail = (f"strategy '{strategy}' unavailable: "
+                      f"ortools is not installed on the server")
+        return jsonify({"error": detail,
                         "implemented": sorted(IMPLEMENTED_STRATEGIES)}), 501
-    strategy_used = strategy  # divergera si un repli survient (lots 3-4)
+    strategy_used = strategy  # divergerait en cas de repli (jamais silencieux)
 
     # Resoudre les index depart / arrivee
     start_idx = 0
@@ -1016,29 +1184,79 @@ def optimize():
     print(f"Optimisation: {len(points)} points, {num_vehicles} vehicules, max={max_per_vehicle}", flush=True)
     print(f"Strategie: {strategy} | signature jeu: {_points_signature(points)}", flush=True)
 
-    # --- LOT 3/4 : l'aiguillage vers les partitions OR-Tools s'inserera ici.
-    #     Tant que seul 'kmeans' est implemente, le pipeline ci-dessous reste
-    #     strictement inchange (aucune reindentation, aucune reorganisation).
+    # --- AIGUILLAGE PAR STRATEGIE ---
+    # Seules les etapes 1 et 2 (l'affectation) different. Les etapes 3, 4 et 5
+    # sont communes a toutes les strategies : c'est ce qui rend la comparaison
+    # valide, seule la partition change.
+    routes_idx, vroom_ok, vroom_error = None, False, None
 
-    # 1. VROOM MULTI-VEHICULES (affectation + sequencement sur reseau routier reel)
-    routes_idx, vroom_ok, vroom_error = optimize_with_vroom(
-        points, num_vehicles, max_per_vehicle, start_idx, end_idx
-    )
-    optimization_path = "vroom_multi" if routes_idx is not None else None
+    # optimization_path decrit UNIQUEMENT la strategie de partition et n'est
+    # jamais suffixe. Les etapes communes reellement executees sont listees
+    # a part dans post_processing.
+    optimization_path = strategy
+    post_processing = []
 
-    # 2. FALLBACK: K-Means + Vroom par vehicule
-    if routes_idx is None:
-        print("Fallback K-Means + Vroom...", flush=True)
-        routes_idx, vroom_ok, vroom_error = kmeans_partition(
+    # Moteur d'affectation reellement utilise. Sous strategy=kmeans, la
+    # partition vient de Vroom multi (jeu <= 59 points) ou de kmeans_partition :
+    # deux methodes differentes sous la meme etiquette de strategie.
+    partition_engine = None
+
+    if strategy == "kmeans":
+        # 1. VROOM MULTI-VEHICULES (affectation + sequencement sur reseau routier reel)
+        routes_idx, vroom_ok, vroom_error = optimize_with_vroom(
             points, num_vehicles, max_per_vehicle, start_idx, end_idx
         )
-        optimization_path = "kmeans_fallback" if routes_idx is not None else None
+        if routes_idx is not None:
+            partition_engine = "vroom_multi"
+
+        # 2. FALLBACK: K-Means + Vroom par vehicule
+        if routes_idx is None:
+            print("Fallback K-Means + Vroom...", flush=True)
+            routes_idx, vroom_ok, vroom_error = kmeans_partition(
+                points, num_vehicles, max_per_vehicle, start_idx, end_idx
+            )
+            if routes_idx is not None:
+                partition_engine = "kmeans_fallback"
+
+    else:
+        # 1bis. VROOM multi est explicitement saute : sans cela, un jeu <= 59
+        #       points verrait sa strategie ignoree en silence.
+        # 2bis. Partition locale, puis le MEME _sequence_groups() que kmeans.
+        headers = {
+            "Authorization": ORS_KEY,
+            "Content-Type": "application/json"
+        }
+
+        if strategy == "ortools_haversine":
+            groups, part_err = ortools_partition_haversine(
+                points, num_vehicles, max_per_vehicle, start_idx, end_idx
+            )
+        else:
+            groups, part_err = None, f"no partition function for '{strategy}'"
+
+        # Echec de partition = erreur explicite. Retomber sur K-Means ici
+        # produirait une ligne de Benchmark etiquetee ortools_* contenant du
+        # K-Means, ce qui fausserait la comparaison sans laisser de trace.
+        if groups is None:
+            print(f"Partition '{strategy}' echouee: {part_err}", flush=True)
+            return jsonify({
+                "error": f"partition failed for strategy '{strategy}': {part_err}",
+                "strategy_requested": strategy,
+                "elapsed_ms": int((time.time() - t_start) * 1000),
+            }), 500
+
+        partition_engine = strategy
+
+        print(f"Sequencement Vroom des groupes {strategy}...", flush=True)
+        routes_idx, _seq_dur, vroom_ok, vroom_error = _sequence_groups(
+            points, groups, start_idx, end_idx, headers
+        )
 
     # 3. 2-OPT haversine : seulement si Vroom a echoue (Vroom deja optimal pour la duree ORS)
     if routes_idx and not vroom_ok:
         print("2-opt par tournee (fallback haversine)...", flush=True)
         routes_idx = apply_two_opt(points, routes_idx)
-        optimization_path = "haversine_2opt"
+        post_processing.append("haversine_2opt")
 
     # 4. Or-opt + 2-opt routier
     road_metrics = []
@@ -1051,8 +1269,7 @@ def optimize():
         routes_before_or2opt = [list(r) for r in routes_idx]
         try:
             routes_idx, road_metrics = apply_or_opt_and_routing_2opt(points, routes_idx)
-            if optimization_path is not None:
-                optimization_path += "_or2opt"
+            post_processing.append("or2opt")
         except Exception as e:
             print(f"Or-opt + 2-opt routier: erreur ignoree ({e}), on continue", flush=True)
         routes_after_or2opt = [list(r) for r in routes_idx]
@@ -1074,8 +1291,7 @@ def optimize():
         )
         if swap_metrics is not None:
             road_metrics = swap_metrics
-        if optimization_path is not None:
-            optimization_path += "_swaps"
+        post_processing.append("swaps")
 
         if d2_probe is not None and routes_after_or2opt is not None:
             d2_probe["swaps_ran"] = True
@@ -1088,7 +1304,9 @@ def optimize():
                 set(a) != set(b) for a, b in zip(routes_after_or2opt, routes_idx)
             ]
 
-    print(f"Chemin emprunte: {optimization_path}, vroom_ok={vroom_ok}, erreur={vroom_error}", flush=True)
+    print(f"Partition: {optimization_path} (moteur: {partition_engine}) | "
+          f"post-traitement: {post_processing} | "
+          f"vroom_ok={vroom_ok}, erreur={vroom_error}", flush=True)
     print(f"Metriques routes finales: {road_metrics}", flush=True)
     print(f"Appels API: vroom={_API_STATS['vroom']} matrix={_API_STATS['matrix']} "
           f"total={_api_calls_total()} | duree calcul={int((time.time()-t_start)*1000)}ms", flush=True)
@@ -1101,9 +1319,11 @@ def optimize():
         "vroom_error": vroom_error,
         "optimization_path": optimization_path,
 
-        # --- champs additifs lot 1 (aucune cle existante modifiee) ---
+        # --- champs additifs (aucune cle existante supprimee) ---
         "strategy_requested": strategy,
         "strategy_used": strategy_used,
+        "partition_engine": partition_engine,
+        "post_processing": post_processing,
         "elapsed_ms": int((time.time() - t_start) * 1000),
         "api_calls": {
             "vroom": _API_STATS["vroom"],
