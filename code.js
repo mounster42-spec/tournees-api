@@ -1,3 +1,24 @@
+// =========================
+// CONSTANTES
+// =========================
+const API_BASE = "https://tournees-api.onrender.com";
+
+const STRATEGIES = ["kmeans", "ortools_haversine", "ortools_ors_matrix"];
+const DEFAULT_STRATEGY = "kmeans";
+
+// Ligne de la feuille "Paramètres" portant la stratégie
+const STRATEGY_ROW = 6;
+
+const BENCH_SHEET = "Benchmark";
+const BENCH_HEADERS = [
+  "Date", "Stratégie exécutée", "Stratégie demandée", "Nb pts", "Signature jeu", "Nb véh",
+  "Km T1", "Km T2", "Km total",
+  "Min T1", "Min T2", "Min total",
+  "Temps calcul (s)", "Appels API", "Vroom", "Matrix",
+  "optimization_path", "Répartition"
+];
+
+
 function setupSheets() {
 
   const ss = SpreadsheetApp.getActive();
@@ -15,10 +36,14 @@ function setupSheets() {
     ["Nombre de véhicules", 2],
     ["Max points par véhicule", 35],
     ["Point de départ (ID)", ""],
-    ["Point d'arrivée (ID)", ""]
+    ["Point d'arrivée (ID)", ""],
+    ["Stratégie", DEFAULT_STRATEGY]
   ];
 
   paramSheet.getRange(1, 1, paramData.length, 2).setValues(paramData);
+
+  // Menu déroulant sur la cellule Stratégie
+  paramSheet.getRange(STRATEGY_ROW, 2).setDataValidation(strategyValidationRule());
 
   // Style header
   const paramHeaderRange = paramSheet.getRange(1, 1, 1, 2);
@@ -67,7 +92,41 @@ function setupSheets() {
   resSheet.setColumnWidth(1, 150);
   resSheet.setColumnWidth(2, 600);
 
+  // NB : la feuille "Benchmark" n'est jamais touchée ici, son historique est conservé.
+
   SpreadsheetApp.getActive().toast("Feuilles créées et mises en page !", "Setup", 3);
+}
+
+
+// =========================
+// STRATÉGIE : VALIDATION + MIGRATION
+// =========================
+function strategyValidationRule() {
+  return SpreadsheetApp.newDataValidation()
+    .requireValueInList(STRATEGIES, true)
+    .setAllowInvalid(false)
+    .build();
+}
+
+
+/**
+ * Ajoute la ligne "Stratégie" aux feuilles Paramètres déjà existantes.
+ * Évite d'avoir à relancer setupSheets(), qui efface Paramètres et Résultats.
+ * Idempotent : n'écrase jamais une valeur déjà saisie.
+ */
+function ensureStrategyCell() {
+
+  const sheet = SpreadsheetApp.getActive().getSheetByName("Paramètres");
+  if (!sheet) return;
+
+  if (String(sheet.getRange(STRATEGY_ROW, 1).getValue()).trim() === "") {
+    sheet.getRange(STRATEGY_ROW, 1).setValue("Stratégie");
+    sheet.getRange(STRATEGY_ROW, 2).setValue(DEFAULT_STRATEGY);
+    sheet.getRange(STRATEGY_ROW, 1, 1, 2)
+      .setBorder(true, true, true, true, true, true);
+  }
+
+  sheet.getRange(STRATEGY_ROW, 2).setDataValidation(strategyValidationRule());
 }
 
 
@@ -77,13 +136,28 @@ function setupSheets() {
 function getParams() {
 
   const sheet = SpreadsheetApp.getActive().getSheetByName("Paramètres");
-  const data = sheet.getRange(2, 2, 4, 1).getValues();
+  const data = sheet.getRange(2, 2, 5, 1).getValues();
+
+  // Cellule vide (feuille antérieure au lot 2) -> défaut kmeans.
+  // Valeur saisie mais inconnue -> erreur explicite : une ligne de Benchmark
+  // ne doit jamais porter une étiquette de stratégie fausse.
+  const raw = data[4][0] === "" || data[4][0] === null || data[4][0] === undefined
+    ? DEFAULT_STRATEGY
+    : String(data[4][0]).trim().toLowerCase();
+
+  if (STRATEGIES.indexOf(raw) === -1) {
+    throw new Error(
+      "Stratégie inconnue en Paramètres!B" + STRATEGY_ROW + " : \"" + raw + "\". " +
+      "Valeurs acceptées : " + STRATEGIES.join(", ")
+    );
+  }
 
   return {
     num_vehicles: Number(data[0][0]) || 2,
     max_per_vehicle: Number(data[1][0]) || 35,
     start_id: data[2][0] ? String(data[2][0]) : "",
-    end_id: data[3][0] ? String(data[3][0]) : ""
+    end_id: data[3][0] ? String(data[3][0]) : "",
+    strategy: raw
   };
 }
 
@@ -123,20 +197,21 @@ function getPoints() {
 // =========================
 function callAPI(points, params) {
 
-  const url = "https://tournees-api.onrender.com/optimize";
+  const url = API_BASE + "/optimize";
 
   const payload = {
     points: points,
     num_vehicles: params.num_vehicles,
     max_per_vehicle: params.max_per_vehicle,
     start_id: params.start_id,
-    end_id: params.end_id
+    end_id: params.end_id,
+    strategy: params.strategy
   };
 
   // Réveil du serveur (Render free tier s'endort, peut prendre 30-60s)
   for (var attempt = 0; attempt < 6; attempt++) {
     try {
-      var wakeResp = UrlFetchApp.fetch("https://tournees-api.onrender.com/", { muteHttpExceptions: true });
+      var wakeResp = UrlFetchApp.fetch(API_BASE + "/", { muteHttpExceptions: true });
       if (wakeResp.getResponseCode() === 200) break;
     } catch (e) {}
     Utilities.sleep(10000);
@@ -152,8 +227,24 @@ function callAPI(points, params) {
   const text = response.getContentText();
   const code = response.getResponseCode();
 
-  if (code !== 200 || text.startsWith("<!")) {
+  // Le backend renvoie un corps JSON explicite sur 400 (stratégie inconnue)
+  // et 501 (stratégie pas encore implémentée). Sans ce traitement, ces cas
+  // étaient masqués par le message générique "L'API n'est pas prête".
+  if (code !== 200) {
+    var detail = "";
+    try {
+      var errJson = JSON.parse(text);
+      if (errJson && errJson.error) detail = String(errJson.error);
+    } catch (e) {}
+
+    if (detail) {
+      throw new Error("API (code " + code + ") : " + detail);
+    }
     throw new Error("L'API n'est pas prête (code " + code + "). Réessayez dans 1 minute.");
+  }
+
+  if (text.startsWith("<!")) {
+    throw new Error("L'API n'est pas prête (réponse HTML). Réessayez dans 1 minute.");
   }
 
   return JSON.parse(text);
@@ -289,11 +380,84 @@ function writeResult(result, params, points) {
 
 
 // =========================
+// BENCHMARK (historique cumulatif, jamais effacé)
+// =========================
+function _num(v) {
+  return (v === null || v === undefined || v === "") ? "" : Number(v);
+}
+
+
+/**
+ * Ajoute une ligne à la feuille "Benchmark". Ne nettoie jamais, ne réécrit
+ * jamais les lignes précédentes : c'est l'historique de comparaison.
+ */
+function appendBenchmark(result, params, points) {
+
+  const ss = SpreadsheetApp.getActive();
+  let sheet = ss.getSheetByName(BENCH_SHEET);
+
+  if (!sheet) {
+    sheet = ss.insertSheet(BENCH_SHEET);
+    sheet.getRange(1, 1, 1, BENCH_HEADERS.length).setValues([BENCH_HEADERS]);
+    sheet.getRange(1, 1, 1, BENCH_HEADERS.length)
+      .setBackground("#434343").setFontColor("#ffffff").setFontWeight("bold");
+    sheet.setFrozenRows(1);
+    sheet.setColumnWidth(1, 140);   // Date
+    sheet.setColumnWidth(2, 150);   // Stratégie exécutée
+    sheet.setColumnWidth(3, 150);   // Stratégie demandée
+    sheet.setColumnWidth(17, 240);  // optimization_path
+  }
+
+  const km1 = _num(result.tournee_1_km);
+  const km2 = _num(result.tournee_2_km);
+  const min1 = _num(result.tournee_1_min);
+  const min2 = _num(result.tournee_2_min);
+
+  const kmTotal  = (km1 !== "" && km2 !== "")   ? Math.round((km1 + km2) * 100) / 100 : "";
+  const minTotal = (min1 !== "" && min2 !== "") ? Math.round((min1 + min2) * 10) / 10 : "";
+
+  const calls = result.api_calls || {};
+  const sizes = result.partition_sizes || [];
+
+  sheet.appendRow([
+    new Date(),
+    // strategy_used = ce qui a RÉELLEMENT tourné. Un écart avec la colonne
+    // suivante signale un repli et invalide la ligne comme point de comparaison.
+    result.strategy_used || "",
+    result.strategy_requested || params.strategy,
+    points.length,
+    result.points_signature || "",
+    params.num_vehicles,
+    km1, km2, kmTotal,
+    min1, min2, minTotal,
+    result.elapsed_ms != null ? Math.round(result.elapsed_ms / 100) / 10 : "",
+    calls.total  != null ? calls.total  : "",
+    calls.vroom  != null ? calls.vroom  : "",
+    calls.matrix != null ? calls.matrix : "",
+    result.optimization_path || "",
+    sizes.join(" / ")
+  ]);
+}
+
+
+// =========================
 // LANCER L'OPTIMISATION
 // =========================
-function runOptimisation() {
+/**
+ * @param {string=} strategyOverride  Forcé par les entrées de menu.
+ *                                    Absent -> stratégie lue dans Paramètres!B6.
+ * Une seule stratégie par exécution : enchaîner les trois dépasserait
+ * la limite de 6 minutes d'Apps Script.
+ */
+function runOptimisation(strategyOverride) {
+
+  ensureStrategyCell();
 
   const params = getParams();
+  if (typeof strategyOverride === "string" && strategyOverride) {
+    params.strategy = strategyOverride;
+  }
+
   const points = getPoints();
 
   if (points.length === 0) {
@@ -301,7 +465,10 @@ function runOptimisation() {
     return;
   }
 
-  SpreadsheetApp.getActive().toast("Optimisation en cours... (" + points.length + " points)", "Info", 10);
+  SpreadsheetApp.getActive().toast(
+    "Optimisation en cours... (" + points.length + " points, stratégie " + params.strategy + ")",
+    "Info", 10
+  );
 
   const result = callAPI(points, params);
 
@@ -311,19 +478,36 @@ function runOptimisation() {
   }
 
   writeResult(result, params, points);
+  appendBenchmark(result, params, points);
 
   var vroomInfo = result.vroom_used ? "Vroom direct" : "K-Means + Vroom (fallback)";
-  SpreadsheetApp.getActive().toast("Terminé ! Mode : " + vroomInfo, "Succès", 10);
+  var stratLabel = result.strategy_used || params.strategy;
+  SpreadsheetApp.getActive().toast(
+    "Terminé ! Stratégie : " + stratLabel + " | " + vroomInfo,
+    "Succès", 10
+  );
 }
+
+
+// Wrappers : Apps Script n'autorise pas d'argument depuis une entrée de menu.
+function runKmeans()           { runOptimisation("kmeans"); }
+function runOrtoolsHaversine() { runOptimisation("ortools_haversine"); }
+function runOrtoolsOrsMatrix() { runOptimisation("ortools_ors_matrix"); }
 
 
 // =========================
 // MENU PERSONNALISÉ
 // =========================
 function onOpen() {
-  SpreadsheetApp.getUi()
-    .createMenu("Tournées")
+  const ui = SpreadsheetApp.getUi();
+  ui.createMenu("Tournées")
     .addItem("Optimisation", "runOptimisation")
+    .addSubMenu(
+      ui.createMenu("Optimiser avec")
+        .addItem("K-Means (baseline)", "runKmeans")
+        .addItem("OR-Tools Haversine", "runOrtoolsHaversine")
+        .addItem("OR-Tools ORS Matrix", "runOrtoolsOrsMatrix")
+    )
     .addSeparator()
     .addItem("Effacer tournées", "clearResults")
     .addItem("Réinitialiser la sélection", "resetSelection")
@@ -334,6 +518,8 @@ function onOpen() {
 // =========================
 // EFFACER TOURNÉES
 // =========================
+// N'efface que "Résultats". La feuille "Benchmark" est volontairement épargnée :
+// c'est l'historique de comparaison des stratégies.
 function clearResults() {
   const sheet = SpreadsheetApp.getActive().getSheetByName("Résultats");
   if (sheet) {
