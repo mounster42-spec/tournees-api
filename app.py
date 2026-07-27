@@ -546,10 +546,8 @@ def _resequence_single(points, vehicle_pts, start_idx, end_idx, headers):
                 ordered.append(step["id"])
         ordered.append(end_idx)
         dur = data["routes"][0].get("duration", 0)
-        dist = data["routes"][0].get("distance")
-        if dist is None:
-            print(f"_resequence_single: champ 'distance' absent, cles route={sorted(data['routes'][0].keys())}", flush=True)
-            dist = 0
+        # NB: Vroom ne renvoie pas 'distance' dans les routes -> km calcules via matrice ORS (voir post_process_swaps)
+        dist = data["routes"][0].get("distance") or 0
         return ordered, dur, dist
 
     except Exception:
@@ -685,9 +683,18 @@ def post_process_swaps(points, routes_idx, start_idx, end_idx, max_per_vehicle):
     else:
         print(f"Post-processing: aucun echange ameliorant ({total_tested} testes)", flush=True)
 
+    # Distance routiere des routes finales : Vroom ne renvoie pas 'distance',
+    # on la calcule via la matrice ORS (2 appels).
+    final_dists = [best_dists[0], best_dists[1]]
+    for v in range(2):
+        dist_matrix, _ = _fetch_ors_matrix(points, best_routes[v], headers)
+        if dist_matrix:
+            final_dists[v] = _matrix_route_cost(dist_matrix, list(range(len(best_routes[v]))))
+        print(f"  T{v+1} finale: {final_dists[v]/1000:.2f}km, ~{best_durs[v]/60:.1f}min", flush=True)
+
     metrics = [
-        {"km": round(best_dists[0] / 1000, 2), "min": round(best_durs[0] / 60, 1)},
-        {"km": round(best_dists[1] / 1000, 2), "min": round(best_durs[1] / 60, 1)},
+        {"km": round(final_dists[0] / 1000, 2), "min": round(best_durs[0] / 60, 1)},
+        {"km": round(final_dists[1] / 1000, 2), "min": round(best_durs[1] / 60, 1)},
     ]
     return best_routes, metrics
 
