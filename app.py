@@ -1,4 +1,6 @@
 from flask import Flask, request, jsonify
+import hashlib
+import json
 import math
 import os
 import time
@@ -29,6 +31,44 @@ def haversine(a, b):
 # =========================
 ORS_KEY = os.environ.get("ORS_KEY", "")
 ORS_VROOM_URL = "https://api.openrouteservice.org/optimization"
+ORS_MATRIX_URL = "https://api.openrouteservice.org/v2/matrix/driving-car"
+
+
+# =========================
+# 2b. INSTRUMENTATION (compteur d'appels API + strategies)
+# =========================
+VALID_STRATEGIES = ("kmeans", "ortools_haversine", "ortools_ors_matrix")
+IMPLEMENTED_STRATEGIES = {"kmeans"}  # s'elargit aux lots 3 et 4
+
+_API_STATS = {"vroom": 0, "matrix": 0}
+
+
+def _reset_api_stats():
+    _API_STATS["vroom"] = 0
+    _API_STATS["matrix"] = 0
+
+
+def _api_calls_total():
+    return _API_STATS["vroom"] + _API_STATS["matrix"]
+
+
+def _post_vroom(payload, headers, timeout):
+    """Unique point de sortie vers l'endpoint Vroom/Optimization (compte les appels)."""
+    _API_STATS["vroom"] += 1
+    return requests.post(ORS_VROOM_URL, json=payload, headers=headers, timeout=timeout)
+
+
+def _post_matrix(payload, headers, timeout):
+    """Unique point de sortie vers l'endpoint ORS Matrix (compte les appels)."""
+    _API_STATS["matrix"] += 1
+    return requests.post(ORS_MATRIX_URL, json=payload, headers=headers, timeout=timeout)
+
+
+def _points_signature(points):
+    """Empreinte courte du jeu de points (IDs tries). Prouve que deux runs
+    portent sur exactement les memes donnees."""
+    ids = sorted(str(p.get("id", "")) for p in points)
+    return hashlib.md5("|".join(ids).encode("utf-8")).hexdigest()[:8]
 
 
 # =========================
@@ -37,10 +77,9 @@ ORS_VROOM_URL = "https://api.openrouteservice.org/optimization"
 def _call_vroom_multi(jobs, vehicles, headers):
     """Un appel Vroom multi-vehicules. Retourne (routes_by_vehicle, total_duration) ou (None, err)."""
     try:
-        response = requests.post(
-            ORS_VROOM_URL,
-            json={"jobs": jobs, "vehicles": vehicles},
-            headers=headers,
+        response = _post_vroom(
+            {"jobs": jobs, "vehicles": vehicles},
+            headers,
             timeout=15
         )
         data = response.json()
@@ -310,10 +349,9 @@ def _sequence_groups(points, groups, start_idx, end_idx, headers):
 
         try:
             time.sleep(0.5)  # delay between Vroom calls
-            response = requests.post(
-                ORS_VROOM_URL,
-                json={"jobs": jobs, "vehicles": [vehicle]},
-                headers=headers,
+            response = _post_vroom(
+                {"jobs": jobs, "vehicles": [vehicle]},
+                headers,
                 timeout=20
             )
             data = response.json()
@@ -530,10 +568,9 @@ def _resequence_single(points, vehicle_pts, start_idx, end_idx, headers):
             for idx in vehicle_pts]
 
     try:
-        response = requests.post(
-            ORS_VROOM_URL,
-            json={"jobs": jobs, "vehicles": [vehicle]},
-            headers=headers,
+        response = _post_vroom(
+            {"jobs": jobs, "vehicles": [vehicle]},
+            headers,
             timeout=20
         )
         data = response.json()
@@ -624,6 +661,13 @@ def post_process_swaps(points, routes_idx, start_idx, end_idx, max_per_vehicle):
                     if gain > 0:
                         print(f"    Deplacement pt {pt_a} T{v_from+1}->T{v_to+1}: +{gain}s", flush=True)
                         best_total = d_from + d_to
+                        # D-1 : sans ces 4 lignes, best_durs/best_dists restaient sur les
+                        # valeurs d'avant le deplacement et les minutes renvoyees etaient
+                        # perimees (symetrie avec le MODE 2 ci-dessous).
+                        best_durs[v_from]  = d_from
+                        best_durs[v_to]    = d_to
+                        best_dists[v_from] = dist_from
+                        best_dists[v_to]   = dist_to
                         best_routes[v_from] = r_from
                         best_routes[v_to] = r_to
                         best_pts[v_from] = new_pts_from
@@ -794,10 +838,9 @@ def _fetch_ors_matrix(points, route_indices, headers):
     Retourne (dist_matrix, dur_matrix) ou (None, None) en cas d'erreur."""
     locations = [[points[i]["lon"], points[i]["lat"]] for i in route_indices]
     try:
-        response = requests.post(
-            "https://api.openrouteservice.org/v2/matrix/driving-car",
-            json={"locations": locations, "metrics": ["distance", "duration"]},
-            headers=headers,
+        response = _post_matrix(
+            {"locations": locations, "metrics": ["distance", "duration"]},
+            headers,
             timeout=20
         )
         data = response.json()
@@ -922,6 +965,9 @@ def apply_or_opt_and_routing_2opt(points, routes_idx):
 @app.route("/optimize", methods=["POST"])
 def optimize():
 
+    t_start = time.time()
+    _reset_api_stats()
+
     data = request.json
     points = data.get("points", [])
     num_vehicles = data.get("num_vehicles", 2)
@@ -931,6 +977,23 @@ def optimize():
 
     if not points:
         return jsonify({"error": "no points"}), 400
+
+    # Capture du payload pour figer une fixture de benchmark (DUMP_PAYLOAD=1)
+    if os.environ.get("DUMP_PAYLOAD", "") == "1":
+        print("PAYLOAD_DUMP " + json.dumps(data, ensure_ascii=False), flush=True)
+
+    # --- Selecteur de strategie ---
+    # Lot 1 : seul 'kmeans' est implemente. Une strategie non disponible renvoie 501,
+    # JAMAIS un repli silencieux sur kmeans : sinon la feuille Benchmark accumulerait
+    # des lignes etiquetees ortools_* qui contiennent en realite du K-Means.
+    strategy = str(data.get("strategy") or "kmeans").strip().lower()
+    if strategy not in VALID_STRATEGIES:
+        return jsonify({"error": f"unknown strategy '{strategy}'",
+                        "valid": list(VALID_STRATEGIES)}), 400
+    if strategy not in IMPLEMENTED_STRATEGIES:
+        return jsonify({"error": f"strategy '{strategy}' not implemented yet",
+                        "implemented": sorted(IMPLEMENTED_STRATEGIES)}), 501
+    strategy_used = strategy  # divergera si un repli survient (lots 3-4)
 
     # Resoudre les index depart / arrivee
     start_idx = 0
@@ -951,6 +1014,11 @@ def optimize():
         end_idx = start_idx
 
     print(f"Optimisation: {len(points)} points, {num_vehicles} vehicules, max={max_per_vehicle}", flush=True)
+    print(f"Strategie: {strategy} | signature jeu: {_points_signature(points)}", flush=True)
+
+    # --- LOT 3/4 : l'aiguillage vers les partitions OR-Tools s'inserera ici.
+    #     Tant que seul 'kmeans' est implemente, le pipeline ci-dessous reste
+    #     strictement inchange (aucune reindentation, aucune reorganisation).
 
     # 1. VROOM MULTI-VEHICULES (affectation + sequencement sur reseau routier reel)
     routes_idx, vroom_ok, vroom_error = optimize_with_vroom(
@@ -974,14 +1042,30 @@ def optimize():
 
     # 4. Or-opt + 2-opt routier
     road_metrics = []
+    d2_probe = None                 # D-2 : mesure seule, aucun changement de comportement
+    routes_after_or2opt = None
     if routes_idx:
         print("Or-opt + 2-opt routier...", flush=True)
+        _d2_t0 = time.time()
+        _d2_calls0 = _api_calls_total()
+        routes_before_or2opt = [list(r) for r in routes_idx]
         try:
             routes_idx, road_metrics = apply_or_opt_and_routing_2opt(points, routes_idx)
             if optimization_path is not None:
                 optimization_path += "_or2opt"
         except Exception as e:
             print(f"Or-opt + 2-opt routier: erreur ignoree ({e}), on continue", flush=True)
+        routes_after_or2opt = [list(r) for r in routes_idx]
+        d2_probe = {
+            "elapsed_ms": int((time.time() - _d2_t0) * 1000),
+            "api_calls": _api_calls_total() - _d2_calls0,
+            # l'etape 4 a-t-elle reellement modifie l'ordre des routes ?
+            "reordered_by_or2opt": [a != b for a, b in zip(routes_before_or2opt, routes_after_or2opt)],
+            # renseignes apres l'etape 5
+            "swaps_ran": False,
+            "order_survived_swaps": None,
+            "pointsets_changed_by_swaps": None,
+        }
 
     # 5. POST-PROCESSING : swap des points frontiere
     if routes_idx and vroom_ok:
@@ -993,15 +1077,42 @@ def optimize():
         if optimization_path is not None:
             optimization_path += "_swaps"
 
+        if d2_probe is not None and routes_after_or2opt is not None:
+            d2_probe["swaps_ran"] = True
+            d2_probe["order_survived_swaps"] = [
+                a == b for a, b in zip(routes_after_or2opt, routes_idx)
+            ]
+            # si l'ensemble des points n'a pas bouge mais que l'ordre a change,
+            # c'est que l'etape 5 a rejete puis reconstruit l'ordre de l'etape 4.
+            d2_probe["pointsets_changed_by_swaps"] = [
+                set(a) != set(b) for a, b in zip(routes_after_or2opt, routes_idx)
+            ]
+
     print(f"Chemin emprunte: {optimization_path}, vroom_ok={vroom_ok}, erreur={vroom_error}", flush=True)
     print(f"Metriques routes finales: {road_metrics}", flush=True)
+    print(f"Appels API: vroom={_API_STATS['vroom']} matrix={_API_STATS['matrix']} "
+          f"total={_api_calls_total()} | duree calcul={int((time.time()-t_start)*1000)}ms", flush=True)
+    print(f"Sonde D-2: {d2_probe}", flush=True)
 
     # 6. FORMAT RESPONSE (compatible code.js)
     response = {
         "num_clusters_dbscan": num_vehicles,
         "vroom_used": vroom_ok,
         "vroom_error": vroom_error,
-        "optimization_path": optimization_path
+        "optimization_path": optimization_path,
+
+        # --- champs additifs lot 1 (aucune cle existante modifiee) ---
+        "strategy_requested": strategy,
+        "strategy_used": strategy_used,
+        "elapsed_ms": int((time.time() - t_start) * 1000),
+        "api_calls": {
+            "vroom": _API_STATS["vroom"],
+            "matrix": _API_STATS["matrix"],
+            "total": _api_calls_total(),
+        },
+        "partition_sizes": [max(0, len(r) - 2) for r in routes_idx] if routes_idx else [],
+        "points_signature": _points_signature(points),
+        "d2_probe": d2_probe,
     }
 
     for v in range(num_vehicles):
