@@ -513,9 +513,9 @@ def _find_border_points(points, routes_idx, start_idx, end_idx):
 
 
 def _resequence_single(points, vehicle_pts, start_idx, end_idx, headers):
-    """Re-sequence un vehicule avec Vroom. Retourne (route, duration) ou (None, None)."""
+    """Re-sequence un vehicule avec Vroom. Retourne (route, duration, distance) ou (None, None, None)."""
     if not vehicle_pts:
-        return [start_idx, end_idx], 0
+        return [start_idx, end_idx], 0, 0
 
     start_coord = [points[start_idx]["lon"], points[start_idx]["lat"]]
     end_coord = [points[end_idx]["lon"], points[end_idx]["lat"]]
@@ -538,7 +538,7 @@ def _resequence_single(points, vehicle_pts, start_idx, end_idx, headers):
         )
         data = response.json()
         if "routes" not in data:
-            return None, None
+            return None, None, None
 
         ordered = [start_idx]
         for step in data["routes"][0]["steps"]:
@@ -546,10 +546,11 @@ def _resequence_single(points, vehicle_pts, start_idx, end_idx, headers):
                 ordered.append(step["id"])
         ordered.append(end_idx)
         dur = data["routes"][0].get("duration", 0)
-        return ordered, dur
+        dist = data["routes"][0].get("distance", 0)
+        return ordered, dur, dist
 
     except Exception:
-        return None, None
+        return None, None, None
 
 
 def post_process_swaps(points, routes_idx, start_idx, end_idx, max_per_vehicle):
@@ -560,7 +561,7 @@ def post_process_swaps(points, routes_idx, start_idx, end_idx, max_per_vehicle):
     Relance la detection de frontiere apres chaque amelioration (max 5 iterations, 50 appels Vroom).
     """
     if len(routes_idx) != 2:
-        return routes_idx
+        return routes_idx, None
 
     headers = {
         "Authorization": ORS_KEY,
@@ -571,16 +572,18 @@ def post_process_swaps(points, routes_idx, start_idx, end_idx, max_per_vehicle):
     pts0 = [p for p in routes_idx[0] if p not in depot]
     pts1 = [p for p in routes_idx[1] if p not in depot]
 
-    route0, dur0 = _resequence_single(points, pts0, start_idx, end_idx, headers)
-    route1, dur1 = _resequence_single(points, pts1, start_idx, end_idx, headers)
+    route0, dur0, dist0 = _resequence_single(points, pts0, start_idx, end_idx, headers)
+    route1, dur1, dist1 = _resequence_single(points, pts1, start_idx, end_idx, headers)
 
     if dur0 is None or dur1 is None:
         print("Post-processing: impossible de calculer durees initiales", flush=True)
-        return routes_idx
+        return routes_idx, None
 
     best_total = dur0 + dur1
     best_routes = [route0, route1]
     best_pts = [list(pts0), list(pts1)]
+    best_durs = [dur0, dur1]
+    best_dists = [dist0, dist1]
     total_swaps = 0
     total_tested = 0
     MAX_ITER = 5
@@ -611,8 +614,8 @@ def post_process_swaps(points, routes_idx, start_idx, end_idx, max_per_vehicle):
                 new_pts_from = [p for p in best_pts[v_from] if p != pt_a]
                 new_pts_to = best_pts[v_to] + [pt_a]
 
-                r_from, d_from = _resequence_single(points, new_pts_from, start_idx, end_idx, headers)
-                r_to, d_to = _resequence_single(points, new_pts_to, start_idx, end_idx, headers)
+                r_from, d_from, dist_from = _resequence_single(points, new_pts_from, start_idx, end_idx, headers)
+                r_to, d_to, dist_to = _resequence_single(points, new_pts_to, start_idx, end_idx, headers)
                 total_tested += 1
 
                 if d_from is not None and d_to is not None:
@@ -644,8 +647,8 @@ def post_process_swaps(points, routes_idx, start_idx, end_idx, max_per_vehicle):
                 new_pts_from = [pt_b if p == pt_a else p for p in best_pts[v_from]]
                 new_pts_to = [pt_a if p == pt_b else p for p in best_pts[v_to]]
 
-                r_from, d_from = _resequence_single(points, new_pts_from, start_idx, end_idx, headers)
-                r_to, d_to = _resequence_single(points, new_pts_to, start_idx, end_idx, headers)
+                r_from, d_from, dist_from = _resequence_single(points, new_pts_from, start_idx, end_idx, headers)
+                r_to, d_to, dist_to = _resequence_single(points, new_pts_to, start_idx, end_idx, headers)
                 total_tested += 1
 
                 if d_from is None or d_to is None:
@@ -655,6 +658,10 @@ def post_process_swaps(points, routes_idx, start_idx, end_idx, max_per_vehicle):
                 if gain > 0:
                     print(f"    Echange pt {pt_a}(T{v_from+1}) <-> pt {pt_b}(T{v_to+1}): +{gain}s", flush=True)
                     best_total = d_from + d_to
+                    best_durs[v_from] = d_from
+                    best_durs[v_to] = d_to
+                    best_dists[v_from] = dist_from
+                    best_dists[v_to] = dist_to
                     best_routes[v_from] = r_from
                     best_routes[v_to] = r_to
                     best_pts[v_from] = new_pts_from
@@ -675,7 +682,11 @@ def post_process_swaps(points, routes_idx, start_idx, end_idx, max_per_vehicle):
     else:
         print(f"Post-processing: aucun echange ameliorant ({total_tested} testes)", flush=True)
 
-    return best_routes
+    metrics = [
+        {"km": round(best_dists[0] / 1000, 2), "min": round(best_durs[0] / 60, 1)},
+        {"km": round(best_dists[1] / 1000, 2), "min": round(best_durs[1] / 60, 1)},
+    ]
+    return best_routes, metrics
 
 
 # =========================
@@ -963,9 +974,11 @@ def optimize():
 
     # 5. POST-PROCESSING : swap des points frontiere
     if routes_idx and vroom_ok:
-        routes_idx = post_process_swaps(
+        routes_idx, swap_metrics = post_process_swaps(
             points, routes_idx, start_idx, end_idx, max_per_vehicle
         )
+        if swap_metrics is not None:
+            road_metrics = swap_metrics
         if optimization_path is not None:
             optimization_path += "_swaps"
 
