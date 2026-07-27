@@ -92,10 +92,13 @@ def optimize_with_vroom(points, num_vehicles, max_per_vehicle, start_idx, end_id
        Nombre de runs auto-ajuste selon la taille : plus le probleme est petit, plus on teste d'ordres."""
 
     # ORS free tier : max 3500 routes = ~59 locations
-    # locations = nb_jobs + nb_depots_uniques
-    num_locations = len(points) + 1  # jobs + 1 depot (start=end)
-    if num_locations > 59:
-        print(f"Vroom multi-vehicules: {num_locations} locations > 59 (limite ORS 3500), skip", flush=True)
+    # locations = nb_jobs + nb_depots_uniques (start et/ou end)
+    unique_locations = len({
+        (round(float(p["lon"]), 6), round(float(p["lat"]), 6))
+        for p in points
+    })
+    if unique_locations > 59:
+        print(f"Vroom multi-vehicules: {unique_locations} locations distinctes > 59 (limite ORS 3500), skip", flush=True)
         return None, False, "ORS limit: too many locations for multi-vehicle"
 
     start_coord = [points[start_idx]["lon"], points[start_idx]["lat"]]
@@ -931,6 +934,7 @@ def optimize():
     routes_idx, vroom_ok, vroom_error = optimize_with_vroom(
         points, num_vehicles, max_per_vehicle, start_idx, end_idx
     )
+    optimization_path = "vroom_multi" if routes_idx is not None else None
 
     # 2. FALLBACK: K-Means + Vroom par vehicule
     if routes_idx is None:
@@ -938,11 +942,13 @@ def optimize():
         routes_idx, vroom_ok, vroom_error = kmeans_partition(
             points, num_vehicles, max_per_vehicle, start_idx, end_idx
         )
+        optimization_path = "kmeans_fallback" if routes_idx is not None else None
 
     # 3. 2-OPT haversine : seulement si Vroom a echoue (Vroom deja optimal pour la duree ORS)
     if routes_idx and not vroom_ok:
         print("2-opt par tournee (fallback haversine)...", flush=True)
         routes_idx = apply_two_opt(points, routes_idx)
+        optimization_path = "haversine_2opt"
 
     # 4. Or-opt + 2-opt routier
     road_metrics = []
@@ -950,6 +956,8 @@ def optimize():
         print("Or-opt + 2-opt routier...", flush=True)
         try:
             routes_idx, road_metrics = apply_or_opt_and_routing_2opt(points, routes_idx)
+            if optimization_path is not None:
+                optimization_path += "_or2opt"
         except Exception as e:
             print(f"Or-opt + 2-opt routier: erreur ignoree ({e}), on continue", flush=True)
 
@@ -958,12 +966,17 @@ def optimize():
         routes_idx = post_process_swaps(
             points, routes_idx, start_idx, end_idx, max_per_vehicle
         )
+        if optimization_path is not None:
+            optimization_path += "_swaps"
+
+    print(f"Chemin emprunte: {optimization_path}, vroom_ok={vroom_ok}, erreur={vroom_error}", flush=True)
 
     # 6. FORMAT RESPONSE (compatible code.js)
     response = {
         "num_clusters_dbscan": num_vehicles,
         "vroom_used": vroom_ok,
-        "vroom_error": vroom_error
+        "vroom_error": vroom_error,
+        "optimization_path": optimization_path
     }
 
     for v in range(num_vehicles):

@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Analyse Tournées J1+J2</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  body{margin:0;font-family:Arial,sans-serif}
+  #map{height:100vh;width:100%}
+  .t1-label{background:#eaf0ff;border:2px solid #2980b9;border-radius:50%;width:22px;height:22px;text-align:center;line-height:22px;font-weight:bold;font-size:10px;box-shadow:0 1px 4px rgba(0,0,0,.3);color:#2980b9}
+  .t2-label{background:#fff5ea;border:2px solid #e67e22;border-radius:50%;width:22px;height:22px;text-align:center;line-height:22px;font-weight:bold;font-size:10px;box-shadow:0 1px 4px rgba(0,0,0,.3);color:#e67e22}
+  .prob{border-color:#e74c3c!important;background:#ffeaea!important;color:#e74c3c!important}
+  .depot-label{background:#eafff2;border:2px solid #27ae60;border-radius:50%;width:26px;height:26px;text-align:center;line-height:26px;font-weight:bold;font-size:9px;box-shadow:0 2px 6px rgba(0,0,0,.3);color:#27ae60}
+  .legend{position:fixed;bottom:16px;left:16px;background:#fff;padding:12px 16px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.25);z-index:1000;font-size:12px;line-height:1.7;max-width:320px}
+  .legend b{display:block;margin-bottom:2px;font-size:13px}
+  .sw{display:inline-block;width:12px;height:12px;border-radius:3px;vertical-align:middle;margin-right:5px}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div class="legend">
+  <b>Analyse Tournées — Nouveau patch</b>
+  <span class="sw" style="background:#2980b9"></span> Tournée 1 (normale)<br>
+  <span class="sw" style="background:#e67e22"></span> Tournée 2 (normale)<br>
+  <span class="sw" style="background:#e74c3c"></span> Segment problématique<br>
+  <span class="sw" style="background:#27ae60"></span> Dépôt<br>
+  <small>Cliquez sur un segment ou point pour les détails</small>
+</div>
+<script>
+var t1 = [
+  {p:"D",id:"DEP",a:"Rue Pierre Coubertin",lat:45.466624,lon:4.390320,d:0,t:0},
+  {p:1,id:350,a:"3 rue Bourgneuf",lat:45.445751,lon:4.384389,d:2.98,t:6.00},
+  {p:2,id:349,a:"33 rue Etienne Boisson",lat:45.445077,lon:4.383186,d:0.17,t:0.70},
+  {p:3,id:356,a:"25 rue Bourgneuf",lat:45.445437,lon:4.382038,d:0.41,t:1.70},
+  {p:4,id:337,a:"6 Impasse Bourgneuf",lat:45.446190,lon:4.381500,d:0.09,t:0.40},
+  {p:5,id:344,a:"39 rue Jules Ledin",lat:45.445083,lon:4.381666,d:0.17,t:0.70},
+  {p:6,id:339,a:"3 rue du Midi",lat:45.444645,lon:4.381590,d:0.62,t:2.50},
+  {p:7,id:346,a:"29 rue Jules Ledin",lat:45.444559,lon:4.382007,d:0.05,t:0.20},
+  {p:8,id:366,a:"Parking Célestin Monnier",lat:45.442909,lon:4.379541,d:0.56,t:2.10},
+  {p:9,id:374,a:"Parking rue du Midi",lat:45.444130,lon:4.380101,d:0.19,t:0.40},
+  {p:10,id:338,a:"15 rue du Midi",lat:45.444231,lon:4.380269,d:0.03,t:0.10},
+  {p:11,id:347,a:"36 rue Benoît Malon",lat:45.444534,lon:4.380774,d:0.06,t:0.30},
+  {p:12,id:370,a:"7 rue Étienne Boisson",lat:45.443731,lon:4.383645,d:0.49,t:1.90},
+  {p:13,id:335,a:"14 rue Praire",lat:45.441482,lon:4.383138,d:0.47,t:1.90},
+  {p:14,id:363,a:"10 rue Praire",lat:45.441588,lon:4.383843,d:0.06,t:0.20},
+  {p:15,id:341,a:"14 rue Buisson",lat:45.441609,lon:4.379769,d:0.91,t:3.40},
+  {p:16,id:358,a:"30 rue d'Arcole",lat:45.440134,lon:4.382281,d:0.35,t:1.30},
+  {p:17,id:351,a:"9 rue Pierre et Marie Curie",lat:45.438173,lon:4.382311,d:0.31,t:1.20},
+  {p:18,id:348,a:"11 rue Auguste Rateau",lat:45.438013,lon:4.379646,d:0.33,t:1.30},
+  {p:19,id:334,a:"29 rue Aristide Briand",lat:45.438835,lon:4.382335,d:0.29,t:1.20},
+  {p:20,id:333,a:"Place Louis Comte",lat:45.431781,lon:4.387763,d:1.36,t:5.40},
+  {p:21,id:362,a:"28 rue Émile Littré",lat:45.429228,lon:4.387661,d:0.29,t:1.20},
+  {p:22,id:438,a:"11 rue de la Vapeur",lat:45.428467,lon:4.392262,d:0.97,t:3.70},
+  {p:23,id:440,a:"3 rue Jacques Barbier",lat:45.428251,lon:4.390812,d:0.12,t:0.50},
+  {p:24,id:342,a:"26 rue Désiré Claude",lat:45.428397,lon:4.389043,d:0.17,t:0.70},
+  {p:25,id:352,a:"15B rue Désiré Claude",lat:45.429957,lon:4.388741,d:0.18,t:0.60},
+  {p:26,id:359,a:"Rue Jean Baptiste Rivollier",lat:45.431109,lon:4.391005,d:0.44,t:1.50},
+  {p:27,id:336,a:"15 Allée Chantegrillet",lat:45.438348,lon:4.397276,d:1.56,t:3.90},
+  {p:28,id:357,a:"10 av Denfert Rochereau",lat:45.440882,lon:4.398153,d:0.42,t:1.40},
+  {p:29,id:437,a:"Angle Pierre Dupont/Moissons Desroches",lat:45.445111,lon:4.395977,d:0.69,t:2.40},
+  {p:30,id:364,a:"43 rue Royet",lat:45.442367,lon:4.390112,d:1.84,t:6.70},
+  {p:"A",id:"ARR",a:"Rue Pierre Coubertin",lat:45.466624,lon:4.390320,d:3.14,t:7.60}
+];
+var t2 = [
+  {p:"D",id:"DEP",a:"Rue Pierre Coubertin",lat:45.466624,lon:4.390320,d:0,t:0},
+  {p:1,id:418,a:"Pharmacie Centre Deux (Pourcel)",lat:45.423492,lon:4.394004,d:6.38,t:11.90},
+  {p:2,id:419,a:"8 rue Thiollière",lat:45.424086,lon:4.394067,d:0.63,t:2.90},
+  {p:3,id:417,a:"15 rue Alexandre Pourcel",lat:45.423720,lon:4.394003,d:0.35,t:1.90},
+  {p:4,id:353,a:"64 rue Docteurs Charcot",lat:45.419185,lon:4.392721,d:0.66,t:1.50},
+  {p:5,id:340,a:"Rue Branly – Gare Bellevue",lat:45.417566,lon:4.392636,d:0.30,t:0.70},
+  {p:6,id:416,a:"21 rue Alexandre Pourcel",lat:45.423786,lon:4.394734,d:1.21,t:3.50},
+  {p:7,id:420,a:"16 rue Tréfilerie",lat:45.424055,lon:4.393237,d:0.46,t:1.50},
+  {p:8,id:425,a:"6 rue Chevreul",lat:45.424399,lon:4.392719,d:0.08,t:0.30},
+  {p:9,id:429,a:"5 rue Chevreul",lat:45.424298,lon:4.392362,d:0.03,t:0.10},
+  {p:10,id:415,a:"67 rue Désiré Claude",lat:45.425366,lon:4.390049,d:0.31,t:1.10},
+  {p:11,id:436,a:"9 rue Edouard Vaillant",lat:45.427774,lon:4.392469,d:0.46,t:1.80},
+  {p:12,id:423,a:"23 rue Chevreul",lat:45.424604,lon:4.394601,d:0.47,t:1.90},
+  {p:13,id:430,a:"Rue Aimée Malécot 1er Droite",lat:45.425207,lon:4.394231,d:0.07,t:0.30},
+  {p:14,id:431,a:"5 rue Aimée Malécot",lat:45.425613,lon:4.394014,d:0.05,t:0.20},
+  {p:15,id:424,a:"12 rue Chevreul",lat:45.424564,lon:4.393587,d:0.35,t:1.40},
+  {p:16,id:421,a:"15-19 rue Tréfilerie",lat:45.424807,lon:4.393006,d:0.08,t:0.30},
+  {p:17,id:422,a:"13 rue Tréfilerie",lat:45.425424,lon:4.392892,d:0.07,t:0.30},
+  {p:18,id:428,a:"Rue Richard Face Consulat",lat:45.425713,lon:4.391911,d:0.11,t:0.40},
+  {p:19,id:427,a:"Rue Richard Mur bleu",lat:45.425894,lon:4.393189,d:0.10,t:0.40},
+  {p:20,id:426,a:"Rue Richard/Aimé Malécot",lat:45.425924,lon:4.393716,d:0.04,t:0.20},
+  {p:21,id:410,a:"37 rue Clément Forissier",lat:45.426417,lon:4.394203,d:0.09,t:0.40},
+  {p:22,id:411,a:"30 rue Clément Forissier",lat:45.426839,lon:4.394175,d:0.05,t:0.20},
+  {p:23,id:412,a:"24 rue Clément Forissier",lat:45.427287,lon:4.393852,d:0.05,t:0.20},
+  {p:24,id:413,a:"13 rue Clément Forissier",lat:45.427646,lon:4.393839,d:0.04,t:0.20},
+  {p:25,id:414,a:"10B rue Clément Forissier",lat:45.428233,lon:4.393465,d:0.07,t:0.30},
+  {p:26,id:435,a:"16 rue Edouard Vaillant",lat:45.427988,lon:4.394089,d:0.23,t:0.90},
+  {p:27,id:434,a:"10 rue Edouard Vaillant",lat:45.427832,lon:4.393451,d:0.05,t:0.20},
+  {p:28,id:441,a:"6 rue Léon Portier",lat:45.427835,lon:4.391023,d:0.30,t:1.20},
+  {p:29,id:432,a:"30-32 rue Voltaire",lat:45.427902,lon:4.391500,d:0.12,t:0.50},
+  {p:30,id:345,a:"24 rue Voltaire",lat:45.428773,lon:4.391219,d:0.10,t:0.40},
+  {p:"A",id:"ARR",a:"Rue Pierre Coubertin",lat:45.466624,lon:4.390320,d:5.63,t:13.20}
+];
+
+function geo(a,b){var dy=(a.lat-b.lat)*111320,dx=(a.lon-b.lon)*111320*Math.cos(a.lat*Math.PI/180);return Math.sqrt(dy*dy+dx*dx)}
+
+var map=L.map('map').setView([45.436,4.390],14);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'&copy; OSM',maxZoom:19}).addTo(map);
+
+function drawRoute(pts,color,cls,offset){
+  var allLatLng=[];
+  for(var i=0;i<pts.length-1;i++){
+    var a=pts[i],b=pts[i+1];
+    var straight=geo(a,b);
+    var ratio=straight>0?(b.d*1000)/straight:0;
+    var isProblem=ratio>4||(b.d>0.7&&straight<300);
+    var c=isProblem?'#e74c3c':color;
+    var w=isProblem?5:3;
+    var da=isProblem?null:(b.d>1.0?'8,6':null);
+    var oLat=offset*0.00008;
+    var line=L.polyline([[a.lat+oLat,a.lon],[b.lat+oLat,b.lon]],{color:c,weight:w,opacity:0.8,dashArray:da}).addTo(map);
+    var info='<b>'+cls+' seg '+a.p+' → '+b.p+'</b><br>'+b.a+'<br>Route: '+b.d+'km / '+b.t+'min<br>Vol oiseau: '+Math.round(straight)+'m';
+    if(ratio>3)info+='<br><b style="color:red">Ratio: '+ratio.toFixed(1)+'×</b>';
+    if(isProblem)info='<span style="color:red">⚠ PROBLÈME</span><br>'+info;
+    line.bindPopup(info);
+    allLatLng.push([a.lat,a.lon],[b.lat,b.lon]);
+  }
+  for(var i=0;i<pts.length;i++){
+    var p=pts[i];
+    var isDepot=p.p==='D'||p.p==='A';
+    var isProbPt=false;
+    if(i>0){var s=geo(pts[i-1],p);var r=s>0?(p.d*1000)/s:0;isProbPt=r>4||(p.d>0.7&&s<300)}
+    if(i<pts.length-1){var s2=geo(p,pts[i+1]);var r2=s2>0?(pts[i+1].d*1000)/s2:0;if(r2>4||(pts[i+1].d>0.7&&s2<300))isProbPt=true}
+    var cc=isDepot?'depot-label':(cls.indexOf('T1')>=0?'t1-label':'t2-label');
+    if(isProbPt&&!isDepot)cc+=' prob';
+    var lbl=isDepot?(p.p==='D'?'DEP':'ARR'):(cls.charAt(1)+p.p);
+    var icon=L.divIcon({className:cc,html:lbl,iconSize:[22,22],iconAnchor:[11,11]});
+    L.marker([p.lat,p.lon],{icon:icon}).addTo(map).bindPopup(
+      '<b>'+cls+' Point '+p.p+'</b><br>'+p.a+'<br><small>ID:'+p.id+' | '+p.lat.toFixed(5)+','+p.lon.toFixed(5)+'</small>'+(p.d>0?'<br>Depuis préc: '+p.d+'km/'+p.t+'min':'')
+    );
+  }
+  return allLatLng;
+}
+
+var ll1=drawRoute(t1,'#2980b9','T1',0.0001);
+var ll2=drawRoute(t2,'#e67e22','T2',-0.0001);
+map.fitBounds(L.latLngBounds(ll1.concat(ll2)).pad(0.08));
+</script>
+</body>
+</html>
