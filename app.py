@@ -48,9 +48,23 @@ ORS_MATRIX_URL = "https://api.openrouteservice.org/v2/matrix/driving-car"
 # 2b. INSTRUMENTATION (compteur d'appels API + strategies)
 # =========================
 VALID_STRATEGIES = ("kmeans", "ortools_haversine", "ortools_ors_matrix")
-IMPLEMENTED_STRATEGIES = {"kmeans"}  # s'elargit au lot 4
+IMPLEMENTED_STRATEGIES = {"kmeans"}
 if ORTOOLS_AVAILABLE:
     IMPLEMENTED_STRATEGIES.add("ortools_haversine")
+    IMPLEMENTED_STRATEGIES.add("ortools_ors_matrix")
+
+# Matrice ORS complete (strategie ortools_ors_matrix).
+# 62 x 62 = 3844 routes depasse le plafond free tier : on decoupe par blocs
+# de sources. Les n locations sont envoyees a chaque appel, sources et
+# destinations servant d'index dans ce tableau.
+ORS_MATRIX_MAX_ROUTES = 3500      # plafond free tier : sources x destinations
+ORS_MATRIX_MAX_LOCATIONS = 0      # 0 = aucun plafond connu sur le nb de locations
+ORS_MATRIX_RETRIES = 3            # tentatives sur 429 / 5xx
+ORS_MATRIX_BACKOFF_S = 2          # 2s, puis 4s, puis 8s
+ORS_MATRIX_NULL_SPEED_KMH = 30    # vitesse de repli pour une paire inatteignable
+
+_MATRIX_CACHE = {}
+_MATRIX_CACHE_MAX = 8
 
 # Criteres d'arret du solveur OR-Tools.
 # solution_limit est le critere REEL : il est deterministe, contrairement a
@@ -651,6 +665,218 @@ def ortools_partition_haversine(points, num_vehicles, max_per_vehicle, start_idx
 
 
 # =========================
+# 4c. MATRICE ORS COMPLETE DECOUPEE (strategie ortools_ors_matrix)
+# =========================
+def _matrix_cache_key(points, profile="driving-car"):
+    """Cle de cache : liste ORDONNEE des coordonnees arrondies. L'ordre compte,
+    la matrice etant indexee par position."""
+    coords = ";".join(
+        f"{round(float(p['lon']), 6)},{round(float(p['lat']), 6)}" for p in points
+    )
+    raw = f"{profile}|duration+distance|{coords}"
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def _matrix_cache_put(key, value):
+    """Cache borne, eviction FIFO (les dict Python conservent l'ordre d'insertion)."""
+    if key in _MATRIX_CACHE:
+        return
+    if len(_MATRIX_CACHE) >= _MATRIX_CACHE_MAX:
+        _MATRIX_CACHE.pop(next(iter(_MATRIX_CACHE)))
+    _MATRIX_CACHE[key] = value
+
+
+def _post_matrix_retry(payload, headers, timeout=30):
+    """Appel ORS Matrix avec retry sur 429 et 5xx.
+    CHAQUE tentative passe par _post_matrix et est donc comptee : le compteur
+    doit refleter la consommation reelle de quota, pas les appels reussis.
+    Un 4xx autre que 429 n'est pas rejouable : le message ORS brut est remonte
+    tel quel (c'est lui qui revelera un eventuel plafond sur les locations).
+    Retourne (data, None) ou (None, message)."""
+    last_err = None
+
+    for attempt in range(ORS_MATRIX_RETRIES):
+        if attempt > 0:
+            wait = ORS_MATRIX_BACKOFF_S * (2 ** (attempt - 1))
+            print(f"    Matrix retry {attempt + 1}/{ORS_MATRIX_RETRIES} "
+                  f"dans {wait}s ({last_err})", flush=True)
+            time.sleep(wait)
+
+        try:
+            response = _post_matrix(payload, headers, timeout=timeout)
+
+            if response.status_code == 429 or response.status_code >= 500:
+                last_err = f"HTTP {response.status_code}"
+                continue
+
+            data = response.json()
+
+            if response.status_code != 200:
+                err = data.get("error", data)
+                if isinstance(err, dict):
+                    err = err.get("message", str(err))
+                return None, f"HTTP {response.status_code}: {err}"
+
+            return data, None
+
+        except Exception as e:
+            last_err = str(e)
+
+    return None, f"failed after {ORS_MATRIX_RETRIES} attempts: {last_err}"
+
+
+def _matrix_block_plan(n):
+    """Decoupe les n sources en blocs de lignes respectant le plafond de routes.
+    Retourne (blocs, None) ou (None, message)."""
+    if n <= 0:
+        return [], None
+
+    if ORS_MATRIX_MAX_LOCATIONS and n > ORS_MATRIX_MAX_LOCATIONS:
+        # Chaque appel envoie les n locations (obtenir cout(i,j) exige i et j
+        # dans le meme tableau). Un plafond sur les locations imposerait un
+        # decoupage en damier lignes x colonnes, non implemente ici.
+        return None, (f"{n} locations > ORS_MATRIX_MAX_LOCATIONS="
+                      f"{ORS_MATRIX_MAX_LOCATIONS}: checkerboard split required")
+
+    rows_max = max(1, ORS_MATRIX_MAX_ROUTES // n)
+    n_calls = math.ceil(n / rows_max)
+    block = math.ceil(n / n_calls)
+    return [(s, min(s + block, n)) for s in range(0, n, block)], None
+
+
+def _build_full_matrix_chunked(points, headers):
+    """Matrice complete n x n des durees (s) et distances (m) ORS, en entiers.
+    Retourne (dur_matrix, dist_matrix, meta, None) ou (None, None, meta, err)."""
+    n = len(points)
+    meta = {"n": n, "calls": 0, "blocks": 0, "cached": False, "nulls": 0}
+
+    key = _matrix_cache_key(points)
+    if key in _MATRIX_CACHE:
+        dur_m, dist_m, nulls = _MATRIX_CACHE[key]
+        meta.update({"cached": True, "nulls": nulls})
+        print(f"  Matrice ORS {n}x{n}: cache HIT ({key[:8]}), 0 appel", flush=True)
+        return dur_m, dist_m, meta, None
+
+    blocks, err = _matrix_block_plan(n)
+    if blocks is None:
+        return None, None, meta, err
+
+    meta["blocks"] = len(blocks)
+    locations = [[float(p["lon"]), float(p["lat"])] for p in points]
+    all_dest = list(range(n))
+    calls_before = _API_STATS["matrix"]
+
+    print(f"  Matrice ORS {n}x{n}: {len(blocks)} appel(s), blocs de "
+          f"{[b[1] - b[0] for b in blocks]} lignes x {n} colonnes "
+          f"({[(b[1] - b[0]) * n for b in blocks]} routes)", flush=True)
+
+    dur_rows = []
+    dist_rows = []
+
+    for (s0, s1) in blocks:
+        payload = {
+            "locations": locations,
+            "sources": list(range(s0, s1)),
+            "destinations": all_dest,
+            "metrics": ["distance", "duration"],
+        }
+        data, err = _post_matrix_retry(payload, headers)
+        if data is None:
+            meta["calls"] = _API_STATS["matrix"] - calls_before
+            return None, None, meta, f"block {s0}-{s1}: {err}"
+
+        durs = data.get("durations")
+        dists = data.get("distances")
+
+        # Un bloc manquant ou de forme inattendue = echec global. Assembler une
+        # matrice partiellement a zero produirait une partition absurde sans
+        # le moindre signal.
+        if not durs or len(durs) != (s1 - s0):
+            meta["calls"] = _API_STATS["matrix"] - calls_before
+            return None, None, meta, (f"block {s0}-{s1}: unexpected shape "
+                                      f"({len(durs) if durs else 0} rows for {s1 - s0})")
+
+        dur_rows.extend(durs)
+        dist_rows.extend(dists if dists else [[None] * n for _ in range(s1 - s0)])
+
+    meta["calls"] = _API_STATS["matrix"] - calls_before
+
+    if len(dur_rows) != n:
+        return None, None, meta, f"assembled {len(dur_rows)} rows, expected {n}"
+
+    # Conversion en entiers. Une cellule nulle (paire inatteignable) est
+    # remplacee par une estimation haversine, comptee et remontee : echouer sur
+    # une seule paire serait fragile, le faire en silence serait pire.
+    coords = [(float(p["lat"]), float(p["lon"])) for p in points]
+    dur_matrix = [[0] * n for _ in range(n)]
+    dist_matrix = [[0] * n for _ in range(n)]
+    nulls = 0
+
+    for i in range(n):
+        row_d = dur_rows[i]
+        row_k = dist_rows[i] if i < len(dist_rows) and dist_rows[i] else [None] * n
+        for j in range(n):
+            d = row_d[j] if j < len(row_d) else None
+            m = row_k[j] if j < len(row_k) else None
+            if d is None:
+                nulls += 1
+                hav_km = haversine(coords[i], coords[j])
+                d = hav_km / ORS_MATRIX_NULL_SPEED_KMH * 3600.0
+                if m is None:
+                    m = hav_km * 1000.0
+            dur_matrix[i][j] = int(round(d))
+            dist_matrix[i][j] = int(round(m)) if m is not None else 0
+
+    for i in range(n):
+        dur_matrix[i][i] = 0
+        dist_matrix[i][i] = 0
+
+    meta["nulls"] = nulls
+    if nulls:
+        print(f"  Matrice ORS: {nulls} cellule(s) nulle(s) remplacee(s) par "
+              f"une estimation haversine a {ORS_MATRIX_NULL_SPEED_KMH} km/h", flush=True)
+
+    _matrix_cache_put(key, (dur_matrix, dist_matrix, nulls))
+    print(f"  Matrice ORS {n}x{n} assemblee en {meta['calls']} appel(s), "
+          f"mise en cache ({key[:8]})", flush=True)
+
+    return dur_matrix, dist_matrix, meta, None
+
+
+def ortools_partition_ors_matrix(points, num_vehicles, max_per_vehicle,
+                                 start_idx, end_idx, headers):
+    """Affectation OR-Tools sur les DUREES routieres reelles ORS.
+    Le cout du solveur est la duree, pas la distance : c'est l'objectif de Vroom
+    et celui des metriques finales. Retourne (groups, err, meta)."""
+    meta = {}
+    depot_indices = {start_idx, end_idx}
+    delivery_indices = [i for i in range(len(points)) if i not in depot_indices]
+
+    if not delivery_indices:
+        return [[] for _ in range(num_vehicles)], None, meta
+
+    if num_vehicles * max_per_vehicle < len(delivery_indices):
+        return None, (f"capacity too small: {num_vehicles} x {max_per_vehicle} "
+                      f"< {len(delivery_indices)} points"), meta
+
+    print(f"OR-Tools matrice ORS: {len(delivery_indices)} points, {num_vehicles} vehicules, "
+          f"capacite {max_per_vehicle}", flush=True)
+
+    dur_matrix, dist_matrix, meta, err = _build_full_matrix_chunked(points, headers)
+    if dur_matrix is None:
+        return None, f"ORS matrix failed: {err}", meta
+
+    groups, err = _solve_cvrp_ortools(
+        dur_matrix, num_vehicles, max_per_vehicle, start_idx, end_idx
+    )
+    if groups is None:
+        return None, err, meta
+
+    print(f"  Partition: {[len(g) for g in groups]} pts", flush=True)
+    return groups, None, meta
+
+
+# =========================
 # 5. NEAREST-NEIGHBOR FALLBACK
 # =========================
 def _nearest_neighbor_route(points, vehicle_points, start_idx, end_idx):
@@ -1201,6 +1427,10 @@ def optimize():
     # deux methodes differentes sous la meme etiquette de strategie.
     partition_engine = None
 
+    # Diagnostics de la matrice ORS (strategie ortools_ors_matrix uniquement) :
+    # appels reellement consommes, cache touche ou non, cellules nulles.
+    matrix_meta = None
+
     if strategy == "kmeans":
         # 1. VROOM MULTI-VEHICULES (affectation + sequencement sur reseau routier reel)
         routes_idx, vroom_ok, vroom_error = optimize_with_vroom(
@@ -1231,6 +1461,10 @@ def optimize():
             groups, part_err = ortools_partition_haversine(
                 points, num_vehicles, max_per_vehicle, start_idx, end_idx
             )
+        elif strategy == "ortools_ors_matrix":
+            groups, part_err, matrix_meta = ortools_partition_ors_matrix(
+                points, num_vehicles, max_per_vehicle, start_idx, end_idx, headers
+            )
         else:
             groups, part_err = None, f"no partition function for '{strategy}'"
 
@@ -1243,6 +1477,12 @@ def optimize():
                 "error": f"partition failed for strategy '{strategy}': {part_err}",
                 "strategy_requested": strategy,
                 "elapsed_ms": int((time.time() - t_start) * 1000),
+                "api_calls": {
+                    "vroom": _API_STATS["vroom"],
+                    "matrix": _API_STATS["matrix"],
+                    "total": _api_calls_total(),
+                },
+                "ors_matrix": matrix_meta,
             }), 500
 
         partition_engine = strategy
@@ -1324,6 +1564,7 @@ def optimize():
         "strategy_used": strategy_used,
         "partition_engine": partition_engine,
         "post_processing": post_processing,
+        "ors_matrix": matrix_meta,
         "elapsed_ms": int((time.time() - t_start) * 1000),
         "api_calls": {
             "vroom": _API_STATS["vroom"],
