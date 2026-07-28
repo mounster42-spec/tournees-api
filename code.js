@@ -9,6 +9,25 @@ const DEFAULT_STRATEGY = "kmeans";
 // Ligne de la feuille "Paramètres" portant la stratégie
 const STRATEGY_ROW = 6;
 
+// Libelles du champ "Mode" de la feuille Résultats.
+// Indexes par partition_engine, qui est la source la plus precise : sous
+// strategy_used = kmeans, il distingue l'affectation faite par Vroom multi
+// de celle faite par K-Means.
+// Vroom séquence dans les quatre cas ; seul le moteur d'affectation change.
+const ENGINE_LABELS = {
+  "vroom_multi":        "Vroom (affectation + séquencement)",
+  "kmeans_fallback":    "K-Means (affectation) + Vroom (séquencement)",
+  "ortools_haversine":  "OR-Tools Haversine (affectation) + Vroom (séquencement)",
+  "ortools_ors_matrix": "OR-Tools ORS Matrix (affectation) + Vroom (séquencement)"
+};
+
+// Repli si partition_engine est absent (backend antérieur au lot 3).
+const STRATEGY_LABELS = {
+  "kmeans":             "K-Means (affectation) + Vroom (séquencement)",
+  "ortools_haversine":  "OR-Tools Haversine (affectation) + Vroom (séquencement)",
+  "ortools_ors_matrix": "OR-Tools ORS Matrix (affectation) + Vroom (séquencement)"
+};
+
 const BENCH_SHEET = "Benchmark";
 const BENCH_HEADERS = [
   "Date", "Stratégie exécutée", "Stratégie demandée", "Nb pts", "Signature jeu", "Nb véh",
@@ -252,6 +271,47 @@ function callAPI(points, params) {
 
 
 // =========================
+// LIBELLÉ DU MODE
+// =========================
+/**
+ * Construit le texte de la cellule "Mode" de la feuille Résultats.
+ *
+ * L'ancienne version se déduisait uniquement de vroom_used, ce qui produisait
+ * deux libellés faux depuis l'arrivée du sélecteur de stratégie :
+ *   - vroom_used = false affichait "K-Means (affectation)" quelle que soit la
+ *     stratégie, y compris sous ortools_haversine / ortools_ors_matrix ;
+ *   - vroom_used = true affichait "Vroom (affectation + séquencement)" alors
+ *     que sur 62 points l'affectation vient de K-Means.
+ *
+ * Le libellé ne suppose donc plus rien : il vient de partition_engine, sinon
+ * de strategy_used, et reste explicitement indéterminé si aucun des deux n'est
+ * renseigné. Un échec de séquencement Vroom est signalé à part, car il ne
+ * change jamais la stratégie d'affectation.
+ */
+function buildModeText(result) {
+
+  var label = ENGINE_LABELS[result.partition_engine]
+           || STRATEGY_LABELS[result.strategy_used]
+           || "Mode indéterminé (réponse sans partition_engine ni strategy_used)";
+
+  var text = label;
+
+  var steps = result.post_processing;
+  if (steps && steps.length) {
+    text += " | post-traitement : " + steps.join(", ");
+  }
+
+  // === et non !result.vroom_used : une réponse sans le champ ne doit pas
+  // être interprétée comme un échec de séquencement.
+  if (result.vroom_used === false) {
+    text += " | fallback séquencement : " + (result.vroom_error || "raison inconnue");
+  }
+
+  return text;
+}
+
+
+// =========================
 // ÉCRIRE RÉSULTATS
 // =========================
 function writeResult(result, params, points) {
@@ -345,10 +405,7 @@ function writeResult(result, params, points) {
   sheet.getRange(infoRow, 2).setValue(result.num_clusters_dbscan || "");
   sheet.getRange(infoRow, 1).setFontWeight("bold");
 
-  var modeText = result.vroom_used ? "Vroom (affectation + séquencement)" : "K-Means (affectation) + Vroom (séquencement)";
-  if (!result.vroom_used && result.vroom_error) {
-    modeText += " | fallback: " + result.vroom_error;
-  }
+  var modeText = buildModeText(result);
   sheet.getRange(infoRow + 1, 1).setValue("Mode");
   sheet.getRange(infoRow + 1, 2).setValue(modeText);
   sheet.getRange(infoRow + 1, 1).setFontWeight("bold");
