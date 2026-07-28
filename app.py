@@ -1028,15 +1028,31 @@ def _resequence_single(points, vehicle_pts, start_idx, end_idx, headers):
         return None, None, None
 
 
-def post_process_swaps(points, routes_idx, start_idx, end_idx, max_per_vehicle):
+def post_process_swaps(points, routes_idx, start_idx, end_idx, max_per_vehicle,
+                       entry_metrics=None):
     """Post-processing iteratif : echanges de points frontiere jusqu'a convergence.
     Deux modes :
     - Deplacement : point A (T1) -> T2, si T2 n'est pas plein
     - Echange    : point A (T1) <-> point B (T2), maintient l'equilibre (fonctionne meme 30/30)
     Relance la detection de frontiere apres chaque amelioration (max 5 iterations, 50 appels Vroom).
+
+    D-2 : trois etats strictement distincts, jamais confondus sous un meme nom.
+
+      A. ENTREE PROTEGEE  entry_routes / entry_metrics / entry_duration_s
+         L'ordre issu d'Or-opt et ses metriques ORS Matrix exactes.
+         Jamais modifie, restaure en cas de doute.
+
+      B. NOTATION         current_pts / current_vroom_durs / current_vroom_dists
+                          + current_vroom_total
+         Echelle Vroom homogene servant uniquement a departager les candidats
+         entre eux. Les deux appels Vroom initiaux n'existent que pour fournir
+         cette base : leurs ROUTES sont volontairement ignorees.
+
+      C. SORTIE           accepted_routes / accepted_swaps
+         Ecrit uniquement lorsqu'un echange est reellement accepte.
     """
     if len(routes_idx) != 2:
-        return routes_idx, None
+        return routes_idx, entry_metrics
 
     headers = {
         "Authorization": ORS_KEY,
@@ -1044,33 +1060,50 @@ def post_process_swaps(points, routes_idx, start_idx, end_idx, max_per_vehicle):
     }
     depot = {start_idx, end_idx}
 
-    pts0 = [p for p in routes_idx[0] if p not in depot]
-    pts1 = [p for p in routes_idx[1] if p not in depot]
+    # ---------- A. ETAT D'ENTREE PROTEGE ----------
+    entry_routes = [list(routes_idx[0]), list(routes_idx[1])]
 
-    route0, dur0, dist0 = _resequence_single(points, pts0, start_idx, end_idx, headers)
-    route1, dur1, dist1 = _resequence_single(points, pts1, start_idx, end_idx, headers)
+    entry_duration_s = None
+    if entry_metrics and len(entry_metrics) == 2:
+        e0 = entry_metrics[0].get("duration_s")
+        e1 = entry_metrics[1].get("duration_s")
+        if e0 is not None and e1 is not None:
+            entry_duration_s = e0 + e1
+
+    pts0 = [p for p in entry_routes[0] if p not in depot]
+    pts1 = [p for p in entry_routes[1] if p not in depot]
+
+    # ---------- B. ETAT DE NOTATION ----------
+    # Ces deux appels Vroom donnent une base de comparaison homogene avec les
+    # candidats, tous mesures par Vroom. Leurs routes sont jetees : les adopter
+    # ecraserait l'ordre optimise par Or-opt, c'est la cause exacte du defaut D-2.
+    _vroom_route0, dur0, dist0 = _resequence_single(points, pts0, start_idx, end_idx, headers)
+    _vroom_route1, dur1, dist1 = _resequence_single(points, pts1, start_idx, end_idx, headers)
 
     if dur0 is None or dur1 is None:
         print("Post-processing: impossible de calculer durees initiales", flush=True)
-        return routes_idx, None
+        return entry_routes, entry_metrics
 
-    best_total = dur0 + dur1
-    best_routes = [route0, route1]
-    best_pts = [list(pts0), list(pts1)]
-    best_durs = [dur0, dur1]
-    best_dists = [dist0, dist1]
-    total_swaps = 0
+    current_pts = [list(pts0), list(pts1)]
+    current_vroom_durs = [dur0, dur1]
+    current_vroom_dists = [dist0, dist1]
+    current_vroom_total = dur0 + dur1
+
+    # ---------- C. ETAT DE SORTIE ----------
+    accepted_routes = [list(entry_routes[0]), list(entry_routes[1])]
+    accepted_swaps = 0
+
     total_tested = 0
     MAX_ITER = 5
     MAX_CALLS = 50
 
-    print(f"Post-processing: duree initiale = {dur0}s + {dur1}s = {best_total}s", flush=True)
+    print(f"Post-processing: base Vroom = {dur0}s + {dur1}s = {current_vroom_total}s", flush=True)
 
     for iteration in range(MAX_ITER):
         if total_tested >= MAX_CALLS:
             break
 
-        border = _find_border_points(points, best_routes, start_idx, end_idx)
+        border = _find_border_points(points, accepted_routes, start_idx, end_idx)
         print(f"  Iteration {iteration+1}: {len(border)} points frontiere (seuil 500m)", flush=True)
 
         if not border:
@@ -1085,37 +1118,39 @@ def post_process_swaps(points, routes_idx, start_idx, end_idx, max_per_vehicle):
             v_to = 1 - v_from
 
             # --- MODE 1 : deplacement si l'autre route a de la place ---
-            if len(best_pts[v_to]) < max_per_vehicle:
-                new_pts_from = [p for p in best_pts[v_from] if p != pt_a]
-                new_pts_to = best_pts[v_to] + [pt_a]
+            if len(current_pts[v_to]) < max_per_vehicle:
+                new_pts_from = [p for p in current_pts[v_from] if p != pt_a]
+                new_pts_to = current_pts[v_to] + [pt_a]
 
                 r_from, d_from, dist_from = _resequence_single(points, new_pts_from, start_idx, end_idx, headers)
                 r_to, d_to, dist_to = _resequence_single(points, new_pts_to, start_idx, end_idx, headers)
                 total_tested += 1
 
                 if d_from is not None and d_to is not None:
-                    gain = best_total - (d_from + d_to)
+                    gain = current_vroom_total - (d_from + d_to)
+                    # Candidat refuse (gain <= 0) : aucun etat n'est ecrit,
+                    # new_pts_* et r_* sont des listes neuves devenues inatteignables.
                     if gain > 0:
                         print(f"    Deplacement pt {pt_a} T{v_from+1}->T{v_to+1}: +{gain}s", flush=True)
-                        best_total = d_from + d_to
-                        # D-1 : sans ces 4 lignes, best_durs/best_dists restaient sur les
-                        # valeurs d'avant le deplacement et les minutes renvoyees etaient
-                        # perimees (symetrie avec le MODE 2 ci-dessous).
-                        best_durs[v_from]  = d_from
-                        best_durs[v_to]    = d_to
-                        best_dists[v_from] = dist_from
-                        best_dists[v_to]   = dist_to
-                        best_routes[v_from] = r_from
-                        best_routes[v_to] = r_to
-                        best_pts[v_from] = new_pts_from
-                        best_pts[v_to] = new_pts_to
-                        total_swaps += 1
+                        current_vroom_total = d_from + d_to
+                        # D-1 : sans ces 4 lignes, les durees/distances restaient sur
+                        # les valeurs d'avant le deplacement et les minutes renvoyees
+                        # etaient perimees (symetrie avec le MODE 2 ci-dessous).
+                        current_vroom_durs[v_from]  = d_from
+                        current_vroom_durs[v_to]    = d_to
+                        current_vroom_dists[v_from] = dist_from
+                        current_vroom_dists[v_to]   = dist_to
+                        accepted_routes[v_from] = r_from
+                        accepted_routes[v_to] = r_to
+                        current_pts[v_from] = new_pts_from
+                        current_pts[v_to] = new_pts_to
+                        accepted_swaps += 1
                         improved = True
                         break  # relancer la detection
 
             # --- MODE 2 : echange pt_a (v_from) <-> pt_b (v_to) ---
             candidates_b = sorted(
-                best_pts[v_to],
+                current_pts[v_to],
                 key=lambda p: haversine(
                     (points[pt_a]["lat"], points[pt_a]["lon"]),
                     (points[p]["lat"], points[p]["lon"])
@@ -1126,8 +1161,8 @@ def post_process_swaps(points, routes_idx, start_idx, end_idx, max_per_vehicle):
                 if total_tested >= MAX_CALLS:
                     break
 
-                new_pts_from = [pt_b if p == pt_a else p for p in best_pts[v_from]]
-                new_pts_to = [pt_a if p == pt_b else p for p in best_pts[v_to]]
+                new_pts_from = [pt_b if p == pt_a else p for p in current_pts[v_from]]
+                new_pts_to = [pt_a if p == pt_b else p for p in current_pts[v_to]]
 
                 r_from, d_from, dist_from = _resequence_single(points, new_pts_from, start_idx, end_idx, headers)
                 r_to, d_to, dist_to = _resequence_single(points, new_pts_to, start_idx, end_idx, headers)
@@ -1136,19 +1171,20 @@ def post_process_swaps(points, routes_idx, start_idx, end_idx, max_per_vehicle):
                 if d_from is None or d_to is None:
                     continue
 
-                gain = best_total - (d_from + d_to)
+                gain = current_vroom_total - (d_from + d_to)
+                # Candidat refuse (gain <= 0) : aucun etat n'est ecrit.
                 if gain > 0:
                     print(f"    Echange pt {pt_a}(T{v_from+1}) <-> pt {pt_b}(T{v_to+1}): +{gain}s", flush=True)
-                    best_total = d_from + d_to
-                    best_durs[v_from] = d_from
-                    best_durs[v_to] = d_to
-                    best_dists[v_from] = dist_from
-                    best_dists[v_to] = dist_to
-                    best_routes[v_from] = r_from
-                    best_routes[v_to] = r_to
-                    best_pts[v_from] = new_pts_from
-                    best_pts[v_to] = new_pts_to
-                    total_swaps += 1
+                    current_vroom_total = d_from + d_to
+                    current_vroom_durs[v_from] = d_from
+                    current_vroom_durs[v_to] = d_to
+                    current_vroom_dists[v_from] = dist_from
+                    current_vroom_dists[v_to] = dist_to
+                    accepted_routes[v_from] = r_from
+                    accepted_routes[v_to] = r_to
+                    current_pts[v_from] = new_pts_from
+                    current_pts[v_to] = new_pts_to
+                    accepted_swaps += 1
                     improved = True
                     break
 
@@ -1159,25 +1195,70 @@ def post_process_swaps(points, routes_idx, start_idx, end_idx, max_per_vehicle):
             print(f"  Convergence atteinte a l'iteration {iteration+1}", flush=True)
             break
 
-    if total_swaps > 0:
-        print(f"Post-processing: {total_swaps} echange(s), {total_tested} appels, duree finale = {best_total}s", flush=True)
-    else:
+    # ---------- CAS 1 : aucun swap accepte ----------
+    # On rend l'etat d'entree tel quel. Les deux appels Matrix finaux ne sont
+    # pas emis : ils ne mesureraient que des routes qu'on ne renvoie pas.
+    if accepted_swaps == 0:
         print(f"Post-processing: aucun echange ameliorant ({total_tested} testes)", flush=True)
+        print("Post-processing: aucun swap accepte : routes initiales conservees", flush=True)
+        return entry_routes, entry_metrics
 
-    # Distance routiere des routes finales : Vroom ne renvoie pas 'distance',
-    # on la calcule via la matrice ORS (2 appels).
-    final_dists = [best_dists[0], best_dists[1]]
+    # ---------- CAS 2 : au moins un swap accepte ----------
+    print(f"Post-processing: {accepted_swaps} echange(s), {total_tested} appels, "
+          f"duree Vroom = {current_vroom_total}s", flush=True)
+
+    # Distance ET duree routieres des routes acceptees : Vroom ne renvoie pas
+    # 'distance', on les calcule via la matrice ORS (2 appels). La matrice de
+    # durees est deja dans la meme reponse : la lire ne coute aucun appel.
+    final_dists = [current_vroom_dists[0], current_vroom_dists[1]]
+    final_durs_s = [None, None]
     for v in range(2):
-        dist_matrix, _ = _fetch_ors_matrix(points, best_routes[v], headers)
+        dist_matrix, dur_matrix = _fetch_ors_matrix(points, accepted_routes[v], headers)
+        local = list(range(len(accepted_routes[v])))
         if dist_matrix:
-            final_dists[v] = _matrix_route_cost(dist_matrix, list(range(len(best_routes[v]))))
-        print(f"  T{v+1} finale: {final_dists[v]/1000:.2f}km, ~{best_durs[v]/60:.1f}min", flush=True)
+            final_dists[v] = _matrix_route_cost(dist_matrix, local)
+        if dur_matrix:
+            # MEME estimateur que duration_s cote Or-opt : matrice de DUREES ORS.
+            final_durs_s[v] = _matrix_route_cost(dur_matrix, local)
+        print(f"  T{v+1} finale: {final_dists[v]/1000:.2f}km, ~{current_vroom_durs[v]/60:.1f}min", flush=True)
 
-    metrics = [
-        {"km": round(final_dists[0] / 1000, 2), "min": round(best_durs[0] / 60, 1)},
-        {"km": round(final_dists[1] / 1000, 2), "min": round(best_durs[1] / 60, 1)},
+    final_metrics = [
+        {"km": round(final_dists[0] / 1000, 2), "min": round(current_vroom_durs[0] / 60, 1),
+         "duration_s": final_durs_s[0]},
+        {"km": round(final_dists[1] / 1000, 2), "min": round(current_vroom_durs[1] / 60, 1),
+         "duration_s": final_durs_s[1]},
     ]
-    return best_routes, metrics
+
+    final_duration_s = None
+    if final_durs_s[0] is not None and final_durs_s[1] is not None:
+        final_duration_s = final_durs_s[0] + final_durs_s[1]
+
+    # ---------- GARDE-FOU D-2 ----------
+    # Les deux durees comparees viennent du MEME estimateur (matrice de durees
+    # ORS) et sont en secondes non arrondies. Aucun melange Vroom / Matrix,
+    # aucune minute arrondie.
+    if entry_duration_s is None or final_duration_s is None:
+        # Pas d'element de comparaison commun. On ne compare pas des unites
+        # differentes : on restaure l'entree. C'est le comportement le plus sur,
+        # d'autant que sans matrice ORS les distances finales retomberaient sur
+        # current_vroom_dists, que Vroom laisse a 0 : les km seraient faux.
+        print("Post-processing: durees exactes ORS indisponibles, "
+              "garde-fou D-2 sans element de comparaison : "
+              "restauration des routes initiales", flush=True)
+        return entry_routes, entry_metrics
+
+    if final_duration_s >= entry_duration_s:
+        # Egalite incluse : on conserve l'entree. Meme convention que le critere
+        # d'acceptation existant, qui exige une amelioration STRICTE (gain > 0).
+        print(f"Post-processing: resultat swaps non meilleur : restauration des "
+              f"routes initiales ({final_duration_s:.0f}s >= {entry_duration_s:.0f}s)",
+              flush=True)
+        return entry_routes, entry_metrics
+
+    print(f"Post-processing: {accepted_swaps} swap(s) accepte(s), duree totale ORS "
+          f"{entry_duration_s:.0f}s -> {final_duration_s:.0f}s "
+          f"(-{entry_duration_s - final_duration_s:.0f}s)", flush=True)
+    return accepted_routes, final_metrics
 
 
 # =========================
@@ -1385,11 +1466,18 @@ def apply_or_opt_and_routing_2opt(points, routes_idx):
             road_km  = round(_matrix_route_cost(dist_matrix, best_local) / 1000, 2)
             road_min = round(best_s / 60, 1) if dur_matrix else None
             print(f"  T{v+1}: {road_km}km routiers, ~{road_min}min", flush=True)
-            road_metrics.append({"km": road_km, "min": road_min})
+            # duration_s : secondes exactes NON arrondies, issues de la matrice de
+            # DUREES ORS. None si seule la matrice de distances etait disponible :
+            # best_s serait alors un metrage, jamais a placer dans une duree.
+            # Champ interne, transporte jusqu'a post_process_swaps, jamais expose
+            # dans la reponse JSON publique.
+            road_metrics.append({"km": road_km, "min": road_min,
+                                 "duration_s": best_s if dur_matrix else None})
         else:
             print(f"  Matrice ORS T{v+1} indisponible, fallback haversine", flush=True)
             route = _or_opt(points, route)
-            road_metrics.append({"km": _compute_route_distance(points, route), "min": None})
+            road_metrics.append({"km": _compute_route_distance(points, route),
+                                 "min": None, "duration_s": None})
 
         improved_routes.append(route)
 
@@ -1448,6 +1536,21 @@ def optimize():
             return jsonify({"error": "ortools_solution_limit must be an integer"}), 400
         if not (1 <= ortools_solution_limit <= 10000):
             return jsonify({"error": "ortools_solution_limit out of range (1..10000)"}), 400
+
+    # Le reporting doit annoncer la limite REELLEMENT utilisee par le solveur,
+    # pas celle demandee : une ligne de Benchmark batie sur ce champ serait
+    # sinon fausse pour ortools_haversine, qui ignore la surcharge.
+    #   kmeans             -> None, aucun solveur OR-Tools n'a tourne
+    #   ortools_haversine  -> constante globale, la surcharge ne l'atteint pas
+    #   ortools_ors_matrix -> surcharge si fournie, sinon constante globale
+    ortools_limit_override_applied = (strategy == "ortools_ors_matrix"
+                                      and ortools_solution_limit is not None)
+    if strategy == "kmeans":
+        ortools_limit_effective = None
+    elif ortools_limit_override_applied:
+        ortools_limit_effective = ortools_solution_limit
+    else:
+        ortools_limit_effective = ORTOOLS_SOLUTION_LIMIT
 
     # Resoudre les index depart / arrivee
     start_idx = 0
@@ -1588,7 +1691,8 @@ def optimize():
     # 5. POST-PROCESSING : swap des points frontiere
     if routes_idx and vroom_ok:
         routes_idx, swap_metrics = post_process_swaps(
-            points, routes_idx, start_idx, end_idx, max_per_vehicle
+            points, routes_idx, start_idx, end_idx, max_per_vehicle,
+            entry_metrics=road_metrics
         )
         if swap_metrics is not None:
             road_metrics = swap_metrics
@@ -1626,7 +1730,9 @@ def optimize():
         "partition_engine": partition_engine,
         "post_processing": post_processing,
         "ors_matrix": matrix_meta,
-        "ortools_solution_limit": ortools_solution_limit or ORTOOLS_SOLUTION_LIMIT,
+        "ortools_solution_limit": ortools_limit_effective,
+        "ortools_solution_limit_requested": ortools_solution_limit,
+        "ortools_solution_limit_override_applied": ortools_limit_override_applied,
         "elapsed_ms": int((time.time() - t_start) * 1000),
         "api_calls": {
             "vroom": _API_STATS["vroom"],
