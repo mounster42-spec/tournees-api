@@ -70,7 +70,7 @@ _MATRIX_CACHE_MAX = 8
 # solution_limit est le critere REEL : il est deterministe, contrairement a
 # time_limit qui depend de la charge CPU. time_limit n'est qu'un garde-fou ;
 # s'il se declenche, le determinisme est perdu et on le journalise.
-ORTOOLS_SOLUTION_LIMIT = 75
+ORTOOLS_SOLUTION_LIMIT = 250
 ORTOOLS_TIME_LIMIT_S = 25
 
 _API_STATS = {"vroom": 0, "matrix": 0}
