@@ -577,7 +577,8 @@ def _ortools_solver_stats(routing):
     return stats
 
 
-def _solve_cvrp_ortools(cost_matrix, num_vehicles, capacity, start_idx, end_idx):
+def _solve_cvrp_ortools(cost_matrix, num_vehicles, capacity, start_idx, end_idx,
+                        solution_limit=None):
     """Resout un CVRP localement et retourne UNIQUEMENT l'affectation.
 
     L'ordre trouve par OR-Tools est volontairement jete : c'est Vroom qui
@@ -591,6 +592,11 @@ def _solve_cvrp_ortools(cost_matrix, num_vehicles, capacity, start_idx, end_idx)
     """
     if not ORTOOLS_AVAILABLE:
         return None, "ortools not installed"
+
+    # LOT 4.1-C : solution_limit pilotable par requete pour l'experimentation.
+    # None -> ORTOOLS_SOLUTION_LIMIT, donc un appel sans l'argument reproduit
+    # exactement le comportement actuel.
+    effective_limit = solution_limit if solution_limit else ORTOOLS_SOLUTION_LIMIT
 
     n = len(cost_matrix)
     depots = {start_idx, end_idx}
@@ -633,7 +639,7 @@ def _solve_cvrp_ortools(cost_matrix, num_vehicles, capacity, start_idx, end_idx)
             routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC)
         params.local_search_metaheuristic = (
             routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH)
-        params.solution_limit = ORTOOLS_SOLUTION_LIMIT
+        params.solution_limit = effective_limit
         params.time_limit.FromSeconds(ORTOOLS_TIME_LIMIT_S)
         params.log_search = False
 
@@ -663,7 +669,7 @@ def _solve_cvrp_ortools(cost_matrix, num_vehicles, capacity, start_idx, end_idx)
         # ne peut pas savoir s'il s'agit de metres (haversine) ou de secondes
         # (durees ORS). Le "m" qui figurait ici etait faux pour ortools_ors_matrix.
         print(f"  OR-Tools: status={_ortools_status(routing)}, objectif={solution.ObjectiveValue()}, "
-              f"{elapsed:.1f}s, {ORTOOLS_SOLUTION_LIMIT} solutions max", flush=True)
+              f"{elapsed:.1f}s, solution_limit={effective_limit}", flush=True)
 
         stats = _ortools_solver_stats(routing)
         print(f"  OR-Tools stats: solutions={stats['solutions']} "
@@ -883,7 +889,8 @@ def _build_full_matrix_chunked(points, headers):
 
 
 def ortools_partition_ors_matrix(points, num_vehicles, max_per_vehicle,
-                                 start_idx, end_idx, headers):
+                                 start_idx, end_idx, headers,
+                                 solution_limit=None):
     """Affectation OR-Tools sur les DUREES routieres reelles ORS.
     Le cout du solveur est la duree, pas la distance : c'est l'objectif de Vroom
     et celui des metriques finales. Retourne (groups, err, meta)."""
@@ -906,7 +913,8 @@ def ortools_partition_ors_matrix(points, num_vehicles, max_per_vehicle,
         return None, f"ORS matrix failed: {err}", meta
 
     groups, err = _solve_cvrp_ortools(
-        dur_matrix, num_vehicles, max_per_vehicle, start_idx, end_idx
+        dur_matrix, num_vehicles, max_per_vehicle, start_idx, end_idx,
+        solution_limit=solution_limit
     )
     if groups is None:
         return None, err, meta
@@ -1428,6 +1436,19 @@ def optimize():
                         "implemented": sorted(IMPLEMENTED_STRATEGIES)}), 501
     strategy_used = strategy  # divergerait en cas de repli (jamais silencieux)
 
+    # LOT 4.1-C : surcharge experimentale de solution_limit, par requete.
+    # Absent -> ORTOOLS_SOLUTION_LIMIT (250), comportement actuel inchange.
+    # N'agit que sur ortools_ors_matrix ; kmeans et ortools_haversine
+    # ne lisent pas ce parametre.
+    ortools_solution_limit = data.get("ortools_solution_limit")
+    if ortools_solution_limit is not None:
+        try:
+            ortools_solution_limit = int(ortools_solution_limit)
+        except (TypeError, ValueError):
+            return jsonify({"error": "ortools_solution_limit must be an integer"}), 400
+        if not (1 <= ortools_solution_limit <= 10000):
+            return jsonify({"error": "ortools_solution_limit out of range (1..10000)"}), 400
+
     # Resoudre les index depart / arrivee
     start_idx = 0
     end_idx = 0
@@ -1502,7 +1523,8 @@ def optimize():
             )
         elif strategy == "ortools_ors_matrix":
             groups, part_err, matrix_meta = ortools_partition_ors_matrix(
-                points, num_vehicles, max_per_vehicle, start_idx, end_idx, headers
+                points, num_vehicles, max_per_vehicle, start_idx, end_idx, headers,
+                solution_limit=ortools_solution_limit
             )
         else:
             groups, part_err = None, f"no partition function for '{strategy}'"
@@ -1604,6 +1626,7 @@ def optimize():
         "partition_engine": partition_engine,
         "post_processing": post_processing,
         "ors_matrix": matrix_meta,
+        "ortools_solution_limit": ortools_solution_limit or ORTOOLS_SOLUTION_LIMIT,
         "elapsed_ms": int((time.time() - t_start) * 1000),
         "api_calls": {
             "vroom": _API_STATS["vroom"],
