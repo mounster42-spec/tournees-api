@@ -546,6 +546,37 @@ def _ortools_status(routing):
         return "n/a"
 
 
+def _ortools_solver_stats(routing):
+    """Compteurs du solveur CP sous-jacent, lus defensivement.
+    Leurs noms ont change selon les versions d'OR-Tools et ces valeurs ne
+    servent qu'aux logs : une lecture impossible vaut -1 et ne doit jamais
+    faire echouer une tournee. Ne leve aucune exception.
+
+    solutions    : nombre de solutions trouvees. Egal a solution_limit =>
+                   l'arret vient du critere deterministe. Inferieur =>
+                   c'est time_limit qui a tranche.
+    branches     : points de decision explores.
+    failures     : retours arriere.
+    wall_time_ms : temps solveur mesure par OR-Tools lui-meme.
+    """
+    stats = {"solutions": -1, "branches": -1, "failures": -1, "wall_time_ms": -1}
+    try:
+        solver = routing.solver()
+    except Exception:
+        return stats
+
+    for key, getter in (("solutions", "Solutions"),
+                        ("branches", "Branches"),
+                        ("failures", "Failures"),
+                        ("wall_time_ms", "WallTime")):
+        try:
+            stats[key] = getattr(solver, getter)()
+        except Exception:
+            pass
+
+    return stats
+
+
 def _solve_cvrp_ortools(cost_matrix, num_vehicles, capacity, start_idx, end_idx):
     """Resout un CVRP localement et retourne UNIQUEMENT l'affectation.
 
@@ -628,8 +659,16 @@ def _solve_cvrp_ortools(cost_matrix, num_vehicles, capacity, start_idx, end_idx)
                     groups[v].append(node)
                 index = solution.Value(routing.NextVar(index))
 
-        print(f"  OR-Tools: status={_ortools_status(routing)}, objectif={solution.ObjectiveValue()}m, "
+        # Objectif sans unite : cette fonction recoit une matrice d'entiers et
+        # ne peut pas savoir s'il s'agit de metres (haversine) ou de secondes
+        # (durees ORS). Le "m" qui figurait ici etait faux pour ortools_ors_matrix.
+        print(f"  OR-Tools: status={_ortools_status(routing)}, objectif={solution.ObjectiveValue()}, "
               f"{elapsed:.1f}s, {ORTOOLS_SOLUTION_LIMIT} solutions max", flush=True)
+
+        stats = _ortools_solver_stats(routing)
+        print(f"  OR-Tools stats: solutions={stats['solutions']} "
+              f"branches={stats['branches']} failures={stats['failures']} "
+              f"wall_time_ms={stats['wall_time_ms']}", flush=True)
 
         return groups, None
 
