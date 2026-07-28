@@ -40,8 +40,8 @@ def haversine(a, b):
 # 2. ORS / VROOM CONFIG
 # =========================
 ORS_KEY = os.environ.get("ORS_KEY", "")
-ORS_VROOM_URL = "https://api.openrouteservice.org/optimization"
-ORS_MATRIX_URL = "https://api.openrouteservice.org/v2/matrix/driving-car"
+ORS_VROOM_URL = "https://api.heigit.org/vroom/v0"
+ORS_MATRIX_URL = "https://api.heigit.org/openrouteservice/v2/matrix/driving-car"
 
 
 # =========================
