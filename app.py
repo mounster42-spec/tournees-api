@@ -1083,6 +1083,11 @@ def post_process_swaps(points, routes_idx, start_idx, end_idx, max_per_vehicle,
     max_consecutive_fails = (SWAP_MAX_CONSECUTIVE_FAILS
                              if max_consecutive_fails is None else max_consecutive_fails)
 
+    # Trace de configuration : c'est elle qui prouve ce que le backend a
+    # reellement recu. Aucune donnee sensible, uniquement deux entiers.
+    print(f"Post-processing config: max_candidates={max_candidates}, "
+          f"max_consecutive_fails={max_consecutive_fails}", flush=True)
+
     total_tested = 0
     accepted_swaps = 0
     swap_stats = {
@@ -1855,6 +1860,15 @@ def optimize():
             d2_probe["pointsets_changed_by_swaps"] = [
                 set(a) != set(b) for a, b in zip(routes_after_or2opt, routes_idx)
             ]
+
+    else:
+        # Swaps non executes : Vroom indisponible ou aucune route. Sans cette
+        # ligne, swap_stop_reason restait vide et se confondait avec un run
+        # complet sans echange accepte -- c'est exactement ce qui a masque
+        # l'indisponibilite Vroom pendant la campagne D-3.
+        swap_stats["swap_stop_reason"] = "vroom_error"
+        print(f"Post-processing: NON EXECUTE (routes={bool(routes_idx)}, "
+              f"vroom_ok={vroom_ok}, erreur={vroom_error})", flush=True)
 
     print(f"Partition: {optimization_path} (moteur: {partition_engine}) | "
           f"post-traitement: {post_processing} | "

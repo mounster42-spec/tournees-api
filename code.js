@@ -66,6 +66,13 @@ const D3_RUNS = [
 // plutôt que de se faire interrompre au milieu d'un run.
 const D3_DEADLINE_MS = 5 * 60 * 1000;
 
+// Pause entre deux runs. Le premier run peut émettre ~90 appels VROOM en
+// ~40 s, soit bien au-delà du débit toléré par ORS. Sans cette pause, les
+// runs suivants repartent sur un service encore saturé : _sequence_groups
+// échoue, vroom_ok passe à faux et les swaps ne sont jamais exécutés — la
+// campagne rend alors trois lignes identiques et sans valeur.
+const D3_PAUSE_MS = 30000;
+
 
 function setupSheets() {
 
@@ -703,6 +710,12 @@ function lancerCampagneD3() {
       continue;
     }
 
+    if (i > 0) {
+      ss.toast("Pause " + (D3_PAUSE_MS / 1000) + "s (débit ORS) avant " + cfg.label,
+               "Campagne D-3", 10);
+      Utilities.sleep(D3_PAUSE_MS);
+    }
+
     ss.toast("Run " + (i + 1) + "/" + D3_RUNS.length + " : " + cfg.label,
              "Campagne D-3", 30);
 
@@ -743,8 +756,21 @@ function lancerCampagneD3() {
       break;
     }
 
-    appendBenchmark(result, params, points, { d3_label: cfg.label, run_error: "" });
-    results.push({ label: cfg.label, result: result });
+    // Un run peut renvoyer 200 tout en ayant été dégradé côté backend :
+    // VROOM indisponible => vroom_ok faux => swaps jamais exécutés. Sans
+    // cette remontée, la ligne Benchmark paraît normale alors qu'elle ne
+    // mesure rien. C'est ce qui a invalidé la première campagne D-3.
+    var degraded = "";
+    if (result.vroom_used === false) {
+      degraded = "VROOM indisponible (" + (result.vroom_error || "raison inconnue")
+               + ") : swaps non exécutés, ligne non comparable";
+    } else if (result.swap_stop_reason === "vroom_error") {
+      degraded = "swaps non exécutés (vroom_error) : ligne non comparable";
+    }
+
+    appendBenchmark(result, params, points,
+                    { d3_label: cfg.label, run_error: degraded });
+    results.push({ label: cfg.label, result: result, degraded: degraded });
   }
 
   _afficherResumeD3(results, reference_signature, aborted);
@@ -806,7 +832,7 @@ function _afficherResumeD3(results, signature, aborted) {
       + "<td>" + esc(b.swap_resequence_cache_hits) + "</td>"
       + "<td>" + esc(calls.vroom) + "</td>"
       + "<td class='l'>" + esc(b.swap_stop_reason) + "</td>"
-      + "<td></td></tr>";
+      + "<td class='err'>" + esc(r.degraded || "") + "</td></tr>";
   }
   html += "</table>";
 
