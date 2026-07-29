@@ -52,32 +52,6 @@ const BENCH_HEADERS_D3 = [
 const BENCH_HEADERS = BENCH_HEADERS_BASE.concat(BENCH_HEADERS_D3);
 
 
-// --- Campagne D-3 : trois configurations, un seul clic ---
-const D3_STRATEGY = "ortools_ors_matrix";
-const D3_SOLUTION_LIMIT = 75;
-
-// Ordre volontaire, du moins gourmand au plus gourmand en appels VROOM.
-// D3_CACHE_ONLY en émet le plus (~90) : le placer en dernier évite qu'il
-// sature le service et rende indisponibles les deux runs plus légers, ce
-// qui avait invalidé la première campagne.
-const D3_RUNS = [
-  { label: "D3_SWAPS_DISABLED",  max_swap_candidates: 0,  swap_max_consecutive_fails: 0  },
-  { label: "D3_EARLY_STOP_12",   max_swap_candidates: 50, swap_max_consecutive_fails: 12 },
-  { label: "D3_CACHE_ONLY",      max_swap_candidates: 50, swap_max_consecutive_fails: 0  }
-];
-
-// Apps Script coupe une exécution de menu à 6 minutes. On s'arrête avant
-// plutôt que de se faire interrompre au milieu d'un run.
-const D3_DEADLINE_MS = 5 * 60 * 1000;
-
-// Pause entre deux runs, jamais après le dernier. Un run peut émettre ~90
-// appels VROOM en ~40 s, bien au-delà du débit toléré par ORS. Sans pause
-// suffisante, le run suivant repart sur un service encore saturé :
-// _sequence_groups échoue, vroom_ok passe à faux et les swaps ne sont
-// jamais exécutés — la campagne rend alors des lignes non comparables.
-// 65 s dépassent la fenêtre d'une minute des limiteurs de débit.
-const D3_PAUSE_MS = 65000;
-
 
 function setupSheets() {
 
@@ -255,11 +229,7 @@ function getPoints() {
 // =========================
 // APPEL API
 // =========================
-/**
- * @param {Object=} extraPayload  Champs additionnels fusionnés dans le corps.
- *                                Absent -> comportement historique inchangé.
- */
-function callAPI(points, params, extraPayload) {
+function callAPI(points, params) {
 
   const url = API_BASE + "/optimize";
 
@@ -271,14 +241,6 @@ function callAPI(points, params, extraPayload) {
     end_id: params.end_id,
     strategy: params.strategy
   };
-
-  if (extraPayload) {
-    for (var k in extraPayload) {
-      if (Object.prototype.hasOwnProperty.call(extraPayload, k)) {
-        payload[k] = extraPayload[k];
-      }
-    }
-  }
 
   // Réveil du serveur (Render free tier s'endort, peut prendre 30-60s)
   for (var attempt = 0; attempt < 6; attempt++) {
@@ -551,9 +513,11 @@ function ensureBenchmarkSheet() {
  * Ajoute une ligne à la feuille "Benchmark". Ne nettoie jamais, ne réécrit
  * jamais les lignes précédentes : c'est l'historique de comparaison.
  *
- * @param {Object=} extra  {d3_label, run_error} pour les runs de campagne.
- *                         Absent -> ces deux cellules restent vides, les
- *                         optimisations normales fonctionnent à l'identique.
+ * Les métriques de swaps sont lues directement dans la réponse du backend :
+ * une optimisation normale les enregistre donc sans dépendre d'un label.
+ *
+ * @param {Object=} extra  {d3_label, run_error}. Absent ou partiel -> les
+ *                         cellules correspondantes restent vides.
  */
 function appendBenchmark(result, params, points, extra) {
 
@@ -654,7 +618,19 @@ function runOptimisation(strategyOverride) {
   }
 
   writeResult(result, params, points);
-  appendBenchmark(result, params, points);
+
+  // Une réponse 200 peut masquer une dégradation backend : VROOM indisponible
+  // => vroom_ok faux => swaps jamais exécutés. Sans cette remontée, la ligne
+  // Benchmark paraît normale alors qu'elle ne mesure pas la même chose.
+  var degraded = "";
+  if (result.vroom_used === false) {
+    degraded = "VROOM indisponible (" + (result.vroom_error || "raison inconnue")
+             + ") : swaps non exécutés";
+  } else if (result.swap_stop_reason === "vroom_error") {
+    degraded = "swaps non exécutés (vroom_error)";
+  }
+
+  appendBenchmark(result, params, points, { run_error: degraded });
 
   var vroomInfo = result.vroom_used ? "Vroom direct" : "K-Means + Vroom (fallback)";
   var stratLabel = result.strategy_used || params.strategy;
@@ -671,184 +647,6 @@ function runOrtoolsHaversine() { runOptimisation("ortools_haversine"); }
 function runOrtoolsOrsMatrix() { runOptimisation("ortools_ors_matrix"); }
 
 
-// =========================
-// CAMPAGNE D-3
-// =========================
-/**
- * Lance les trois configurations de validation D-3 en une seule action.
- *
- * Les trois requêtes partent d'un UNIQUE snapshot de points lu au début :
- * une case décochée en cours de campagne ne peut donc pas fausser la
- * comparaison. Les requêtes sont strictement séquentielles — jamais
- * fetchAll, jamais de parallélisme — chacune consommant du quota ORS et
- * devant être mesurée isolément.
- *
- * N'est jamais déclenchée automatiquement : uniquement depuis le menu.
- */
-function lancerCampagneD3() {
-
-  const ss = SpreadsheetApp.getActive();
-  ensureStrategyCell();
-
-  const params = getParams();
-  params.strategy = D3_STRATEGY;
-
-  // Snapshot unique, lu une seule fois pour les trois runs.
-  const points = getPoints();
-  if (points.length === 0) {
-    ss.toast("Aucun point sélectionné !", "Campagne D-3", 5);
-    return;
-  }
-
-  const started = Date.now();
-  const results = [];
-  let reference_signature = null;
-  let aborted = null;
-
-  for (var i = 0; i < D3_RUNS.length; i++) {
-    const cfg = D3_RUNS[i];
-
-    // La pause à venir est comptée dans le budget : sans cela on pourrait
-    // franchir le contrôle, dormir 65 s, puis dépasser la limite pendant le run.
-    const pauseNeeded = (i > 0) ? D3_PAUSE_MS : 0;
-
-    if (Date.now() - started + pauseNeeded > D3_DEADLINE_MS) {
-      aborted = "Limite de 6 minutes d'Apps Script approchée : runs restants annulés.";
-      results.push({ label: cfg.label, error: "non exécuté — " + aborted });
-      appendBenchmark({}, params, points, { d3_label: cfg.label, run_error: aborted });
-      continue;
-    }
-
-    if (pauseNeeded) {
-      ss.toast("Pause " + (pauseNeeded / 1000) + "s (débit ORS) avant " + cfg.label,
-               "Campagne D-3", 15);
-      Utilities.sleep(pauseNeeded);
-    }
-
-    ss.toast("Run " + (i + 1) + "/" + D3_RUNS.length + " : " + cfg.label,
-             "Campagne D-3", 30);
-
-    var result = null;
-    var errMsg = "";
-
-    try {
-      result = callAPI(points, params, {
-        ortools_solution_limit: D3_SOLUTION_LIMIT,
-        max_swap_candidates: cfg.max_swap_candidates,
-        swap_max_consecutive_fails: cfg.swap_max_consecutive_fails
-      });
-      if (result && result.error) {
-        errMsg = String(result.error);
-        result = null;
-      }
-    } catch (e) {
-      errMsg = String(e && e.message ? e.message : e);
-    }
-
-    if (!result) {
-      // Échec isolé : enregistré sans être masqué, on poursuit avec le suivant.
-      results.push({ label: cfg.label, error: errMsg });
-      appendBenchmark({}, params, points, { d3_label: cfg.label, run_error: errMsg });
-      continue;
-    }
-
-    // Contrôle d'identité du jeu de points : sans lui la comparaison est nulle.
-    const sig = result.points_signature || "";
-    if (reference_signature === null) {
-      reference_signature = sig;
-    } else if (sig !== reference_signature) {
-      const msg = "Signature différente (" + sig + " au lieu de "
-                + reference_signature + ") : campagne interrompue.";
-      results.push({ label: cfg.label, error: msg });
-      appendBenchmark(result, params, points, { d3_label: cfg.label, run_error: msg });
-      aborted = msg;
-      break;
-    }
-
-    // Un run peut renvoyer 200 tout en ayant été dégradé côté backend :
-    // VROOM indisponible => vroom_ok faux => swaps jamais exécutés. Sans
-    // cette remontée, la ligne Benchmark paraît normale alors qu'elle ne
-    // mesure rien. C'est ce qui a invalidé la première campagne D-3.
-    var degraded = "";
-    if (result.vroom_used === false) {
-      degraded = "VROOM indisponible (" + (result.vroom_error || "raison inconnue")
-               + ") : swaps non exécutés, ligne non comparable";
-    } else if (result.swap_stop_reason === "vroom_error") {
-      degraded = "swaps non exécutés (vroom_error) : ligne non comparable";
-    }
-
-    appendBenchmark(result, params, points,
-                    { d3_label: cfg.label, run_error: degraded });
-    results.push({ label: cfg.label, result: result, degraded: degraded });
-  }
-
-  _afficherResumeD3(results, reference_signature, aborted);
-}
-
-
-function _afficherResumeD3(results, signature, aborted) {
-
-  const esc = function (v) {
-    return String(v === null || v === undefined ? "" : v)
-      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  };
-
-  var html = ""
-    + "<style>"
-    + "body{font-family:Arial,sans-serif;font-size:13px;margin:12px}"
-    + "table{border-collapse:collapse;width:100%}"
-    + "th,td{border:1px solid #ccc;padding:5px 7px;text-align:right;white-space:nowrap}"
-    + "th{background:#434343;color:#fff;text-align:center}"
-    + "td.l{text-align:left}"
-    + ".err{color:#b00;text-align:left}"
-    + ".warn{background:#fff4e5;border:1px solid #e0a800;padding:8px;margin-bottom:10px}"
-    + "</style>";
-
-  if (aborted) {
-    html += '<div class="warn"><b>Campagne interrompue.</b><br>' + esc(aborted) + "</div>";
-  }
-  html += "<p>Signature du jeu : <b>" + esc(signature || "n/a") + "</b></p>";
-
-  html += "<table><tr>"
-    + "<th>Label</th><th>Km tot.</th><th>Min tot.</th><th>Calcul (s)</th>"
-    + "<th>Candidats</th><th>Swaps</th><th>Cache hits</th><th>Vroom</th>"
-    + "<th>Stop</th><th>Erreur</th></tr>";
-
-  for (var i = 0; i < results.length; i++) {
-    const r = results[i];
-
-    if (r.error) {
-      html += "<tr><td class='l'>" + esc(r.label) + "</td>"
-            + "<td colspan='8'></td>"
-            + "<td class='err'>" + esc(r.error) + "</td></tr>";
-      continue;
-    }
-
-    const b = r.result;
-    const km1 = _num(b.tournee_1_km), km2 = _num(b.tournee_2_km);
-    const mn1 = _num(b.tournee_1_min), mn2 = _num(b.tournee_2_min);
-    const kmT = (km1 !== "" && km2 !== "") ? Math.round((km1 + km2) * 100) / 100 : "";
-    const mnT = (mn1 !== "" && mn2 !== "") ? Math.round((mn1 + mn2) * 10) / 10 : "";
-    const calls = b.api_calls || {};
-
-    html += "<tr>"
-      + "<td class='l'>" + esc(r.label) + "</td>"
-      + "<td>" + esc(kmT) + "</td>"
-      + "<td>" + esc(mnT) + "</td>"
-      + "<td>" + esc(b.elapsed_ms != null ? Math.round(b.elapsed_ms / 100) / 10 : "") + "</td>"
-      + "<td>" + esc(b.swap_candidates_tested) + "</td>"
-      + "<td>" + esc(b.swaps_accepted) + "</td>"
-      + "<td>" + esc(b.swap_resequence_cache_hits) + "</td>"
-      + "<td>" + esc(calls.vroom) + "</td>"
-      + "<td class='l'>" + esc(b.swap_stop_reason) + "</td>"
-      + "<td class='err'>" + esc(r.degraded || "") + "</td></tr>";
-  }
-  html += "</table>";
-
-  const out = HtmlService.createHtmlOutput(html).setWidth(900).setHeight(340);
-  SpreadsheetApp.getUi().showModalDialog(out, "Campagne D-3 — résumé");
-}
-
 
 // =========================
 // MENU PERSONNALISÉ
@@ -863,8 +661,6 @@ function onOpen() {
         .addItem("OR-Tools Haversine", "runOrtoolsHaversine")
         .addItem("OR-Tools ORS Matrix", "runOrtoolsOrsMatrix")
     )
-    .addSeparator()
-    .addItem("Campagne D-3 swaps", "lancerCampagneD3")
     .addSeparator()
     .addItem("Effacer tournées", "clearResults")
     .addItem("Réinitialiser la sélection", "resetSelection")
