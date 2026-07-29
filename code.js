@@ -56,22 +56,27 @@ const BENCH_HEADERS = BENCH_HEADERS_BASE.concat(BENCH_HEADERS_D3);
 const D3_STRATEGY = "ortools_ors_matrix";
 const D3_SOLUTION_LIMIT = 75;
 
+// Ordre volontaire, du moins gourmand au plus gourmand en appels VROOM.
+// D3_CACHE_ONLY en émet le plus (~90) : le placer en dernier évite qu'il
+// sature le service et rende indisponibles les deux runs plus légers, ce
+// qui avait invalidé la première campagne.
 const D3_RUNS = [
-  { label: "D3_CACHE_ONLY",      max_swap_candidates: 50, swap_max_consecutive_fails: 0  },
+  { label: "D3_SWAPS_DISABLED",  max_swap_candidates: 0,  swap_max_consecutive_fails: 0  },
   { label: "D3_EARLY_STOP_12",   max_swap_candidates: 50, swap_max_consecutive_fails: 12 },
-  { label: "D3_SWAPS_DISABLED",  max_swap_candidates: 0,  swap_max_consecutive_fails: 0  }
+  { label: "D3_CACHE_ONLY",      max_swap_candidates: 50, swap_max_consecutive_fails: 0  }
 ];
 
 // Apps Script coupe une exécution de menu à 6 minutes. On s'arrête avant
 // plutôt que de se faire interrompre au milieu d'un run.
 const D3_DEADLINE_MS = 5 * 60 * 1000;
 
-// Pause entre deux runs. Le premier run peut émettre ~90 appels VROOM en
-// ~40 s, soit bien au-delà du débit toléré par ORS. Sans cette pause, les
-// runs suivants repartent sur un service encore saturé : _sequence_groups
-// échoue, vroom_ok passe à faux et les swaps ne sont jamais exécutés — la
-// campagne rend alors trois lignes identiques et sans valeur.
-const D3_PAUSE_MS = 30000;
+// Pause entre deux runs, jamais après le dernier. Un run peut émettre ~90
+// appels VROOM en ~40 s, bien au-delà du débit toléré par ORS. Sans pause
+// suffisante, le run suivant repart sur un service encore saturé :
+// _sequence_groups échoue, vroom_ok passe à faux et les swaps ne sont
+// jamais exécutés — la campagne rend alors des lignes non comparables.
+// 65 s dépassent la fenêtre d'une minute des limiteurs de débit.
+const D3_PAUSE_MS = 65000;
 
 
 function setupSheets() {
@@ -703,17 +708,21 @@ function lancerCampagneD3() {
   for (var i = 0; i < D3_RUNS.length; i++) {
     const cfg = D3_RUNS[i];
 
-    if (Date.now() - started > D3_DEADLINE_MS) {
+    // La pause à venir est comptée dans le budget : sans cela on pourrait
+    // franchir le contrôle, dormir 65 s, puis dépasser la limite pendant le run.
+    const pauseNeeded = (i > 0) ? D3_PAUSE_MS : 0;
+
+    if (Date.now() - started + pauseNeeded > D3_DEADLINE_MS) {
       aborted = "Limite de 6 minutes d'Apps Script approchée : runs restants annulés.";
       results.push({ label: cfg.label, error: "non exécuté — " + aborted });
       appendBenchmark({}, params, points, { d3_label: cfg.label, run_error: aborted });
       continue;
     }
 
-    if (i > 0) {
-      ss.toast("Pause " + (D3_PAUSE_MS / 1000) + "s (débit ORS) avant " + cfg.label,
-               "Campagne D-3", 10);
-      Utilities.sleep(D3_PAUSE_MS);
+    if (pauseNeeded) {
+      ss.toast("Pause " + (pauseNeeded / 1000) + "s (débit ORS) avant " + cfg.label,
+               "Campagne D-3", 15);
+      Utilities.sleep(pauseNeeded);
     }
 
     ss.toast("Run " + (i + 1) + "/" + D3_RUNS.length + " : " + cfg.label,
