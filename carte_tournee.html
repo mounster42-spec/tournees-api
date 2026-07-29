@@ -3,32 +3,68 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Analyse Tournées J1+J2</title>
+<title>Tournées 1 et 2 — carte unique</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
-  body{margin:0;font-family:Arial,sans-serif}
-  #map{height:100vh;width:100%}
-  .t1-label{background:#eaf0ff;border:2px solid #2980b9;border-radius:50%;width:22px;height:22px;text-align:center;line-height:22px;font-weight:bold;font-size:10px;box-shadow:0 1px 4px rgba(0,0,0,.3);color:#2980b9}
-  .t2-label{background:#fff5ea;border:2px solid #e67e22;border-radius:50%;width:22px;height:22px;text-align:center;line-height:22px;font-weight:bold;font-size:10px;box-shadow:0 1px 4px rgba(0,0,0,.3);color:#e67e22}
-  .prob{border-color:#e74c3c!important;background:#ffeaea!important;color:#e74c3c!important}
-  .depot-label{background:#eafff2;border:2px solid #27ae60;border-radius:50%;width:26px;height:26px;text-align:center;line-height:26px;font-weight:bold;font-size:9px;box-shadow:0 2px 6px rgba(0,0,0,.3);color:#27ae60}
-  .legend{position:fixed;bottom:16px;left:16px;background:#fff;padding:12px 16px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.25);z-index:1000;font-size:12px;line-height:1.7;max-width:320px}
-  .legend b{display:block;margin-bottom:2px;font-size:13px}
-  .sw{display:inline-block;width:12px;height:12px;border-radius:3px;vertical-align:middle;margin-right:5px}
+  html,body{height:100%;margin:0;font-family:Arial,Helvetica,sans-serif;color:#222}
+
+  /* Colonne : panneau en haut, carte qui prend le reste. Evite qu'une carte
+     en 100vh depasse sous le panneau. */
+  #layout{display:flex;flex-direction:column;height:100%}
+  #panel{flex:0 0 auto;background:#fafafa;border-bottom:1px solid #ddd;
+         padding:10px 14px;display:flex;flex-wrap:wrap;gap:18px;align-items:flex-start}
+
+  /* min-height : filet de securite si le conteneur parent n'a aucune hauteur,
+     sans quoi Leaflet rendrait une carte vide. */
+  #map{flex:1 1 auto;width:100%;min-height:320px}
+
+  .block{font-size:12px;line-height:1.6}
+  .block h2{margin:0 0 4px;font-size:13px}
+  table.sum{border-collapse:collapse;font-size:12px}
+  table.sum th,table.sum td{padding:2px 8px 2px 0;text-align:left;white-space:nowrap}
+  table.sum th{font-weight:bold}
+  table.sum td.num{text-align:right}
+  .sw{display:inline-block;width:12px;height:12px;border-radius:3px;
+      vertical-align:middle;margin-right:5px;border:1px solid rgba(0,0,0,.2)}
+  .dash{display:inline-block;width:22px;border-top:3px dashed #666;
+        vertical-align:middle;margin-right:5px}
+  .toggles label{margin-right:12px;cursor:pointer;white-space:nowrap}
+  .toggles button{font-size:12px;padding:3px 9px;cursor:pointer}
+  .warn{color:#b00;font-size:12px}
+
+  /* Marqueurs : pastille ronde portant le rang de passage. */
+  .pin{border-radius:50%;width:22px;height:22px;text-align:center;line-height:20px;
+       font-weight:bold;font-size:10px;box-shadow:0 1px 4px rgba(0,0,0,.35);
+       border:2px solid;background:#fff}
+  .pin-depot{width:30px;height:30px;line-height:28px;font-size:9px}
+  .pin-prob{border-color:#e74c3c!important;background:#ffeaea!important;color:#e74c3c!important}
+
+  @media (max-width:640px){
+    #panel{gap:10px;padding:8px 10px}
+    .block,table.sum th,table.sum td{font-size:11px}
+  }
 </style>
 </head>
 <body>
-<div id="map"></div>
-<div class="legend">
-  <b>Analyse Tournées — Nouveau patch</b>
-  <span class="sw" style="background:#2980b9"></span> Tournée 1 (normale)<br>
-  <span class="sw" style="background:#e67e22"></span> Tournée 2 (normale)<br>
-  <span class="sw" style="background:#e74c3c"></span> Segment problématique<br>
-  <span class="sw" style="background:#27ae60"></span> Dépôt<br>
-  <small>Cliquez sur un segment ou point pour les détails</small>
+<div id="layout">
+
+  <div id="panel">
+    <div class="block" id="summary"></div>
+    <div class="block" id="legend"></div>
+    <div class="block toggles" id="toggles"></div>
+  </div>
+
+  <div id="map"></div>
 </div>
+
 <script>
+/* ============================================================
+   DONNÉES — bloc à remplacer pour cartographier un autre run.
+   Format par point : p = rang de passage ("D" depart, "A" arrivee),
+   id, a = libelle, lat, lon, d = km routiers depuis le point precedent,
+   t = minutes depuis le point precedent.
+   ============================================================ */
 var t1 = [
   {p:"D",id:"DEP",a:"Rue Pierre Coubertin",lat:45.466624,lon:4.390320,d:0,t:0},
   {p:1,id:350,a:"3 rue Bourgneuf",lat:45.445751,lon:4.384389,d:2.98,t:6.00},
@@ -98,49 +134,345 @@ var t2 = [
   {p:"A",id:"ARR",a:"Rue Pierre Coubertin",lat:45.466624,lon:4.390320,d:5.63,t:13.20}
 ];
 
-function geo(a,b){var dy=(a.lat-b.lat)*111320,dx=(a.lon-b.lon)*111320*Math.cos(a.lat*Math.PI/180);return Math.sqrt(dy*dy+dx*dx)}
+/* Descripteur des tournees. geometry : optionnel, coordonnees GeoJSON
+   [lon, lat] du trace routier reel. Absent ici -> trace indicatif. */
+var ROUTES = [
+  {label:"Tournée 1", color:"#1f5fa9", points:t1, offset: 0.0001, geometry:null},
+  {label:"Tournée 2", color:"#d35400", points:t2, offset:-0.0001, geometry:null}
+];
 
-var map=L.map('map').setView([45.436,4.390],14);
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'&copy; OSM',maxZoom:19}).addTo(map);
+var COLOR_START   = "#1e8449";   // vert
+var COLOR_END     = "#6c3483";   // violet
+var COLOR_PROBLEM = "#e74c3c";   // segment au detour anormal
+/* ==================== FIN DES DONNÉES ==================== */
 
-function drawRoute(pts,color,cls,offset){
-  var allLatLng=[];
-  for(var i=0;i<pts.length-1;i++){
-    var a=pts[i],b=pts[i+1];
-    var straight=geo(a,b);
-    var ratio=straight>0?(b.d*1000)/straight:0;
-    var isProblem=ratio>4||(b.d>0.7&&straight<300);
-    var c=isProblem?'#e74c3c':color;
-    var w=isProblem?5:3;
-    var da=isProblem?null:(b.d>1.0?'8,6':null);
-    var oLat=offset*0.00008;
-    var line=L.polyline([[a.lat+oLat,a.lon],[b.lat+oLat,b.lon]],{color:c,weight:w,opacity:0.8,dashArray:da}).addTo(map);
-    var info='<b>'+cls+' seg '+a.p+' → '+b.p+'</b><br>'+b.a+'<br>Route: '+b.d+'km / '+b.t+'min<br>Vol oiseau: '+Math.round(straight)+'m';
-    if(ratio>3)info+='<br><b style="color:red">Ratio: '+ratio.toFixed(1)+'×</b>';
-    if(isProblem)info='<span style="color:red">⚠ PROBLÈME</span><br>'+info;
-    line.bindPopup(info);
-    allLatLng.push([a.lat,a.lon],[b.lat,b.lon]);
-  }
-  for(var i=0;i<pts.length;i++){
-    var p=pts[i];
-    var isDepot=p.p==='D'||p.p==='A';
-    var isProbPt=false;
-    if(i>0){var s=geo(pts[i-1],p);var r=s>0?(p.d*1000)/s:0;isProbPt=r>4||(p.d>0.7&&s<300)}
-    if(i<pts.length-1){var s2=geo(p,pts[i+1]);var r2=s2>0?(pts[i+1].d*1000)/s2:0;if(r2>4||(pts[i+1].d>0.7&&s2<300))isProbPt=true}
-    var cc=isDepot?'depot-label':(cls.indexOf('T1')>=0?'t1-label':'t2-label');
-    if(isProbPt&&!isDepot)cc+=' prob';
-    var lbl=isDepot?(p.p==='D'?'DEP':'ARR'):(cls.charAt(1)+p.p);
-    var icon=L.divIcon({className:cc,html:lbl,iconSize:[22,22],iconAnchor:[11,11]});
-    L.marker([p.lat,p.lon],{icon:icon}).addTo(map).bindPopup(
-      '<b>'+cls+' Point '+p.p+'</b><br>'+p.a+'<br><small>ID:'+p.id+' | '+p.lat.toFixed(5)+','+p.lon.toFixed(5)+'</small>'+(p.d>0?'<br>Depuis préc: '+p.d+'km/'+p.t+'min':'')
-    );
-  }
-  return allLatLng;
+
+/* ---------- utilitaires ---------- */
+
+/** Échappe tout texte injecté dans du HTML ou une popup. */
+function esc(v){
+  return String(v === null || v === undefined ? "" : v)
+    .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
+    .replace(/"/g,"&quot;").replace(/'/g,"&#39;");
 }
 
-var ll1=drawRoute(t1,'#2980b9','T1',0.0001);
-var ll2=drawRoute(t2,'#e67e22','T2',-0.0001);
-map.fitBounds(L.latLngBounds(ll1.concat(ll2)).pad(0.08));
+/** Coordonnées valides : deux nombres finis dans les bornes terrestres. */
+function hasValidCoords(p){
+  return !!p && typeof p.lat === "number" && typeof p.lon === "number"
+      && isFinite(p.lat) && isFinite(p.lon)
+      && p.lat >= -90 && p.lat <= 90 && p.lon >= -180 && p.lon <= 180;
+}
+
+/** Leaflet attend [latitude, longitude]. Conversion explicite, jamais implicite. */
+function toLatLng(p){ return [p.lat, p.lon]; }
+
+/** GeoJSON fournit [longitude, latitude] : l'ordre DOIT être inversé pour Leaflet. */
+function geoJsonToLatLng(coord){ return [coord[1], coord[0]]; }
+
+/** Rend "—" plutôt qu'une valeur inventée lorsque la métrique manque. */
+function fmt(v, digits, unit){
+  if (v === null || v === undefined || (typeof v === "number" && !isFinite(v))) return "—";
+  var n = Number(v);
+  if (!isFinite(n)) return "—";
+  return n.toFixed(digits) + (unit ? " " + unit : "");
+}
+
+function isDepot(p){ return p.p === "D" || p.p === "A"; }
+
+/** Distance à vol d'oiseau en mètres, approximation locale suffisante ici. */
+function straightMeters(a,b){
+  var dy = (a.lat - b.lat) * 111320;
+  var dx = (a.lon - b.lon) * 111320 * Math.cos(a.lat * Math.PI / 180);
+  return Math.sqrt(dy*dy + dx*dx);
+}
+
+/** Détour anormal : distance routière très supérieure au vol d'oiseau. */
+function isProblemLeg(prev, cur){
+  if (!prev || typeof cur.d !== "number") return false;
+  var s = straightMeters(prev, cur);
+  var ratio = s > 0 ? (cur.d * 1000) / s : 0;
+  return ratio > 4 || (cur.d > 0.7 && s < 300);
+}
+
+
+/* ---------- carte ---------- */
+
+var map = L.map("map");
+L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+            {attribution:"&copy; OpenStreetMap", maxZoom:19}).addTo(map);
+
+// Pane dédié aux lignes, sous markerPane (600) : les marqueurs restent cliquables
+// et visibles par-dessus les tracés.
+map.createPane("routeLines");
+map.getPane("routeLines").style.zIndex = 350;
+
+var allLatLngs = [];
+var skipped = [];
+var layers = [];          // un layerGroup par tournée, pour les cases à cocher
+var usesRoadGeometry = false;
+
+/* Dédoublonnage des dépôts : les deux tournées partagent souvent le même
+   départ et la même arrivée. Clé = coordonnées arrondies. */
+var depotSeen = {};
+
+function depotKey(p){ return p.lat.toFixed(6) + "," + p.lon.toFixed(6); }
+
+function registerDepot(p, role){
+  var k = depotKey(p);
+  if (!depotSeen[k]) depotSeen[k] = {point:p, roles:{}};
+  depotSeen[k].roles[role] = true;
+}
+
+
+/* ---------- tracé d'une tournée ---------- */
+
+function drawRoute(route, index){
+  var group = L.layerGroup();
+  var pts = Array.isArray(route.points) ? route.points : [];
+  var valid = [];
+
+  for (var i = 0; i < pts.length; i++){
+    if (hasValidCoords(pts[i])) {
+      valid.push(pts[i]);
+    } else {
+      var ident = pts[i] && pts[i].id !== undefined ? pts[i].id : "(sans id)";
+      skipped.push(route.label + " / " + ident);
+      console.warn("Point ignoré, coordonnées invalides — tournée: "
+                   + route.label + ", id: " + ident, pts[i]);
+    }
+  }
+
+  // Tournée vide ou réduite à un point : aucun tracé, pas d'erreur.
+  if (valid.length === 0){
+    layers.push({label:route.label, group:group, count:0});
+    return;
+  }
+
+  // --- lignes ---
+  if (route.geometry && route.geometry.length > 1){
+    // Géométrie routière réelle, fournie en GeoJSON [lon, lat] : trait plein.
+    usesRoadGeometry = true;
+    var latlngs = [];
+    for (var g = 0; g < route.geometry.length; g++){
+      latlngs.push(geoJsonToLatLng(route.geometry[g]));
+    }
+    L.polyline(latlngs, {pane:"routeLines", color:route.color,
+                         weight:5, opacity:0.85}).addTo(group);
+    allLatLngs = allLatLngs.concat(latlngs);
+  } else {
+    // Aucune géométrie routière : segments droits, en POINTILLÉS, pour ne
+    // jamais faire passer une ligne droite pour un itinéraire réel.
+    var offLat = (typeof route.offset === "number" ? route.offset : 0);
+    for (var j = 0; j < valid.length - 1; j++){
+      var a = valid[j], b = valid[j+1];
+      var problem = isProblemLeg(a, b);
+      var line = L.polyline(
+        [[a.lat + offLat, a.lon], [b.lat + offLat, b.lon]],
+        {pane:"routeLines",
+         color: problem ? COLOR_PROBLEM : route.color,
+         weight: problem ? 6 : 4,
+         opacity: 0.85,
+         dashArray: "7,7"}
+      ).addTo(group);
+
+      var s = Math.round(straightMeters(a,b));
+      var info = "<b>" + esc(route.label) + " — segment " + esc(a.p) + " → " + esc(b.p)
+               + "</b><br>" + esc(b.a)
+               + "<br>Route : " + fmt(b.d,2,"km") + " / " + fmt(b.t,1,"min")
+               + "<br>Vol d'oiseau : " + s + " m"
+               + "<br><i>tracé indicatif, non routier</i>";
+      if (problem) info = '<span style="color:#e74c3c">&#9888; détour anormal</span><br>' + info;
+      line.bindPopup(info);
+    }
+  }
+
+  // --- marqueurs ---
+  for (var k = 0; k < valid.length; k++){
+    var p = valid[k];
+
+    if (isDepot(p)){
+      registerDepot(p, p.p === "D" ? "start" : "end");
+      allLatLngs.push(toLatLng(p));
+      continue;                        // marqueurs de dépôt posés une seule fois
+    }
+
+    var prev = k > 0 ? valid[k-1] : null;
+    var next = k < valid.length - 1 ? valid[k+1] : null;
+    var prob = isProblemLeg(prev, p) || (next ? isProblemLeg(p, next) : false);
+
+    var cls = "pin" + (prob ? " pin-prob" : "");
+    var style = prob ? "" : "border-color:" + route.color + ";color:" + route.color;
+    var icon = L.divIcon({
+      className: "",
+      html: '<div class="' + cls + '" style="' + style + '">' + esc(p.p) + "</div>",
+      iconSize: [22,22], iconAnchor: [11,11]
+    });
+
+    L.marker(toLatLng(p), {icon:icon, title:route.label + " — " + String(p.p)})
+      .addTo(group)
+      .bindPopup(
+        "<b>" + esc(route.label) + " — passage n&deg;" + esc(p.p) + "</b><br>"
+        + esc(p.a || "(sans libellé)")
+        + "<br><small>ID : " + esc(p.id)
+        + " | " + p.lat.toFixed(5) + ", " + p.lon.toFixed(5) + "</small>"
+        + "<br>Depuis le précédent : " + fmt(p.d,2,"km") + " / " + fmt(p.t,1,"min")
+      );
+
+    allLatLngs.push(toLatLng(p));
+  }
+
+  group.addTo(map);
+  layers.push({label:route.label, group:group, count:valid.length});
+}
+
+
+/* ---------- dépôts : un seul marqueur par coordonnée ---------- */
+
+function drawDepots(){
+  for (var key in depotSeen){
+    if (!Object.prototype.hasOwnProperty.call(depotSeen, key)) continue;
+
+    var entry = depotSeen[key];
+    var roles = entry.roles;
+    var isStart = !!roles.start, isEnd = !!roles.end;
+
+    var label, color, short;
+    if (isStart && isEnd){ label = "Départ / Arrivée"; color = COLOR_START; short = "D/A"; }
+    else if (isStart)    { label = "Départ";           color = COLOR_START; short = "DEP"; }
+    else                 { label = "Arrivée";          color = COLOR_END;   short = "ARR"; }
+
+    var icon = L.divIcon({
+      className: "",
+      html: '<div class="pin pin-depot" style="border-color:' + color
+          + ";color:" + color + '">' + short + "</div>",
+      iconSize: [30,30], iconAnchor: [15,15]
+    });
+
+    L.marker([entry.point.lat, entry.point.lon], {icon:icon, title:label})
+      .addTo(map)
+      .bindPopup("<b>" + esc(label) + "</b><br>" + esc(entry.point.a || "")
+                 + "<br><small>" + entry.point.lat.toFixed(5) + ", "
+                 + entry.point.lon.toFixed(5) + "</small>");
+  }
+}
+
+
+/* ---------- panneau récapitulatif ---------- */
+
+function buildSummary(){
+  var rows = "", totalKm = 0, totalMin = 0, kmKnown = false, minKnown = false;
+
+  for (var i = 0; i < ROUTES.length; i++){
+    var r = ROUTES[i];
+    var pts = Array.isArray(r.points) ? r.points : [];
+    var n = 0, km = 0, mn = 0, anyKm = false, anyMin = false;
+
+    for (var j = 0; j < pts.length; j++){
+      if (!hasValidCoords(pts[j])) continue;
+      if (!isDepot(pts[j])) n++;
+      if (typeof pts[j].d === "number" && isFinite(pts[j].d)){ km += pts[j].d; anyKm = true; }
+      if (typeof pts[j].t === "number" && isFinite(pts[j].t)){ mn += pts[j].t; anyMin = true; }
+    }
+
+    if (anyKm){ totalKm += km; kmKnown = true; }
+    if (anyMin){ totalMin += mn; minKnown = true; }
+
+    rows += "<tr><td><span class='sw' style='background:" + r.color + "'></span>"
+          + esc(r.label) + "</td>"
+          + "<td class='num'>" + n + " pts</td>"
+          + "<td class='num'>" + (anyKm ? fmt(km,2,"km") : "—") + "</td>"
+          + "<td class='num'>" + (anyMin ? fmt(mn,1,"min") : "—") + "</td></tr>";
+  }
+
+  rows += "<tr><th>Total</th><th></th>"
+        + "<th class='num'>" + (kmKnown ? fmt(totalKm,2,"km") : "—") + "</th>"
+        + "<th class='num'>" + (minKnown ? fmt(totalMin,1,"min") : "—") + "</th></tr>";
+
+  document.getElementById("summary").innerHTML =
+    "<h2>Récapitulatif</h2><table class='sum'>" + rows + "</table>";
+}
+
+
+/* ---------- légende ---------- */
+
+function buildLegend(){
+  var html = "<h2>Légende</h2>";
+  for (var i = 0; i < ROUTES.length; i++){
+    html += "<span class='sw' style='background:" + ROUTES[i].color + "'></span>"
+          + esc(ROUTES[i].label) + "<br>";
+  }
+  html += "<span class='sw' style='background:" + COLOR_START + "'></span>Départ<br>"
+        + "<span class='sw' style='background:" + COLOR_END + "'></span>Arrivée<br>"
+        + "<span class='sw' style='background:" + COLOR_PROBLEM + "'></span>Détour anormal<br>";
+
+  html += usesRoadGeometry
+    ? "<span class='sw' style='background:#666'></span><b>tracé routier réel</b>"
+    : "<span class='dash'></span><b>tracé indicatif entre les points</b>"
+      + "<br><small>les segments ne suivent pas la voirie</small>";
+
+  if (skipped.length){
+    html += "<div class='warn'>" + skipped.length
+          + " point(s) ignoré(s), coordonnées invalides — détail en console</div>";
+  }
+  document.getElementById("legend").innerHTML = html;
+}
+
+
+/* ---------- cases à cocher ---------- */
+
+function buildToggles(){
+  var host = document.getElementById("toggles");
+  var html = "<h2>Affichage</h2>";
+
+  for (var i = 0; i < layers.length; i++){
+    html += "<label><input type='checkbox' data-layer='" + i + "' checked> "
+          + esc(layers[i].label) + "</label>";
+  }
+  html += "<br><button type='button' id='showAll'>Afficher les deux</button>";
+  host.innerHTML = html;
+
+  var boxes = host.querySelectorAll("input[data-layer]");
+  for (var b = 0; b < boxes.length; b++){
+    boxes[b].addEventListener("change", function(){
+      var idx = Number(this.getAttribute("data-layer"));
+      var g = layers[idx].group;
+      if (this.checked) { map.addLayer(g); } else { map.removeLayer(g); }
+    });
+  }
+
+  document.getElementById("showAll").addEventListener("click", function(){
+    for (var i = 0; i < layers.length; i++){
+      if (!map.hasLayer(layers[i].group)) map.addLayer(layers[i].group);
+    }
+    var bx = host.querySelectorAll("input[data-layer]");
+    for (var j = 0; j < bx.length; j++) bx[j].checked = true;
+  });
+}
+
+
+/* ---------- initialisation ---------- */
+
+for (var r = 0; r < ROUTES.length; r++) drawRoute(ROUTES[r], r);
+drawDepots();
+buildSummary();
+buildLegend();
+buildToggles();
+
+// Cadrage : englobe les deux tournées et les dépôts. Repli sur une vue par
+// défaut si aucune coordonnée exploitable, pour ne pas laisser une carte vide.
+if (allLatLngs.length > 1){
+  map.fitBounds(L.latLngBounds(allLatLngs).pad(0.08));
+} else if (allLatLngs.length === 1){
+  map.setView(allLatLngs[0], 15);
+} else {
+  map.setView([45.436, 4.390], 13);
+  console.warn("Aucune coordonnée exploitable : vue par défaut appliquée.");
+}
+
+// Le panneau peut changer de hauteur au retour à la ligne (mobile) : on
+// réaligne la carte après le premier rendu.
+window.addEventListener("resize", function(){ map.invalidateSize(); });
+setTimeout(function(){ map.invalidateSize(); }, 0);
 </script>
 </body>
 </html>
