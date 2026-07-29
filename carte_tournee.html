@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Tournées 1 et 2 — carte unique</title>
+<title>Carte des deux tournées</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
@@ -19,12 +19,15 @@
      sans quoi Leaflet rendrait une carte vide. */
   #map{flex:1 1 auto;width:100%;min-height:320px}
 
+  #empty{display:none;flex:1 1 auto;align-items:center;justify-content:center;
+         text-align:center;padding:40px 20px;color:#555;font-size:15px;line-height:1.6}
+
   .block{font-size:12px;line-height:1.6}
   .block h2{margin:0 0 4px;font-size:13px}
   table.sum{border-collapse:collapse;font-size:12px}
   table.sum th,table.sum td{padding:2px 8px 2px 0;text-align:left;white-space:nowrap}
   table.sum th{font-weight:bold}
-  table.sum td.num{text-align:right}
+  table.sum td.num,table.sum th.num{text-align:right}
   .sw{display:inline-block;width:12px;height:12px;border-radius:3px;
       vertical-align:middle;margin-right:5px;border:1px solid rgba(0,0,0,.2)}
   .dash{display:inline-block;width:22px;border-top:3px dashed #666;
@@ -32,13 +35,13 @@
   .toggles label{margin-right:12px;cursor:pointer;white-space:nowrap}
   .toggles button{font-size:12px;padding:3px 9px;cursor:pointer}
   .warn{color:#b00;font-size:12px}
+  .meta{color:#666;font-size:11px}
 
   /* Marqueurs : pastille ronde portant le rang de passage. */
   .pin{border-radius:50%;width:22px;height:22px;text-align:center;line-height:20px;
        font-weight:bold;font-size:10px;box-shadow:0 1px 4px rgba(0,0,0,.35);
        border:2px solid;background:#fff}
   .pin-depot{width:30px;height:30px;line-height:28px;font-size:9px}
-  .pin-prob{border-color:#e74c3c!important;background:#ffeaea!important;color:#e74c3c!important}
 
   @media (max-width:640px){
     #panel{gap:10px;padding:8px 10px}
@@ -55,96 +58,31 @@
     <div class="block toggles" id="toggles"></div>
   </div>
 
+  <div id="empty"></div>
   <div id="map"></div>
 </div>
 
 <script>
 /* ============================================================
-   DONNÉES — bloc à remplacer pour cartographier un autre run.
-   Format par point : p = rang de passage ("D" depart, "A" arrivee),
-   id, a = libelle, lat, lon, d = km routiers depuis le point precedent,
-   t = minutes depuis le point precedent.
+   Carte des deux tournees du run courant.
+
+   AUCUNE donnee n'est codee en dur ici. Le payload provient d'Apps
+   Script via google.script.run.getCarteTourneesPayload(), qui relit le
+   dernier resultat d'optimisation. Aucun appel ORS, aucun recalcul,
+   aucune reoptimisation : ce fichier ne fait que dessiner.
+
+   Forme attendue du payload :
+     { generated_at, strategy, points_signature, skipped:[],
+       routes:[ { label, color, distance_km, duration_min,
+                  points:[ {order, id, label, lat, lon, role} ] } ] }
+   role : "start" | "collection" | "end"
    ============================================================ */
-var t1 = [
-  {p:"D",id:"DEP",a:"Rue Pierre Coubertin",lat:45.466624,lon:4.390320,d:0,t:0},
-  {p:1,id:350,a:"3 rue Bourgneuf",lat:45.445751,lon:4.384389,d:2.98,t:6.00},
-  {p:2,id:349,a:"33 rue Etienne Boisson",lat:45.445077,lon:4.383186,d:0.17,t:0.70},
-  {p:3,id:356,a:"25 rue Bourgneuf",lat:45.445437,lon:4.382038,d:0.41,t:1.70},
-  {p:4,id:337,a:"6 Impasse Bourgneuf",lat:45.446190,lon:4.381500,d:0.09,t:0.40},
-  {p:5,id:344,a:"39 rue Jules Ledin",lat:45.445083,lon:4.381666,d:0.17,t:0.70},
-  {p:6,id:339,a:"3 rue du Midi",lat:45.444645,lon:4.381590,d:0.62,t:2.50},
-  {p:7,id:346,a:"29 rue Jules Ledin",lat:45.444559,lon:4.382007,d:0.05,t:0.20},
-  {p:8,id:366,a:"Parking Célestin Monnier",lat:45.442909,lon:4.379541,d:0.56,t:2.10},
-  {p:9,id:374,a:"Parking rue du Midi",lat:45.444130,lon:4.380101,d:0.19,t:0.40},
-  {p:10,id:338,a:"15 rue du Midi",lat:45.444231,lon:4.380269,d:0.03,t:0.10},
-  {p:11,id:347,a:"36 rue Benoît Malon",lat:45.444534,lon:4.380774,d:0.06,t:0.30},
-  {p:12,id:370,a:"7 rue Étienne Boisson",lat:45.443731,lon:4.383645,d:0.49,t:1.90},
-  {p:13,id:335,a:"14 rue Praire",lat:45.441482,lon:4.383138,d:0.47,t:1.90},
-  {p:14,id:363,a:"10 rue Praire",lat:45.441588,lon:4.383843,d:0.06,t:0.20},
-  {p:15,id:341,a:"14 rue Buisson",lat:45.441609,lon:4.379769,d:0.91,t:3.40},
-  {p:16,id:358,a:"30 rue d'Arcole",lat:45.440134,lon:4.382281,d:0.35,t:1.30},
-  {p:17,id:351,a:"9 rue Pierre et Marie Curie",lat:45.438173,lon:4.382311,d:0.31,t:1.20},
-  {p:18,id:348,a:"11 rue Auguste Rateau",lat:45.438013,lon:4.379646,d:0.33,t:1.30},
-  {p:19,id:334,a:"29 rue Aristide Briand",lat:45.438835,lon:4.382335,d:0.29,t:1.20},
-  {p:20,id:333,a:"Place Louis Comte",lat:45.431781,lon:4.387763,d:1.36,t:5.40},
-  {p:21,id:362,a:"28 rue Émile Littré",lat:45.429228,lon:4.387661,d:0.29,t:1.20},
-  {p:22,id:438,a:"11 rue de la Vapeur",lat:45.428467,lon:4.392262,d:0.97,t:3.70},
-  {p:23,id:440,a:"3 rue Jacques Barbier",lat:45.428251,lon:4.390812,d:0.12,t:0.50},
-  {p:24,id:342,a:"26 rue Désiré Claude",lat:45.428397,lon:4.389043,d:0.17,t:0.70},
-  {p:25,id:352,a:"15B rue Désiré Claude",lat:45.429957,lon:4.388741,d:0.18,t:0.60},
-  {p:26,id:359,a:"Rue Jean Baptiste Rivollier",lat:45.431109,lon:4.391005,d:0.44,t:1.50},
-  {p:27,id:336,a:"15 Allée Chantegrillet",lat:45.438348,lon:4.397276,d:1.56,t:3.90},
-  {p:28,id:357,a:"10 av Denfert Rochereau",lat:45.440882,lon:4.398153,d:0.42,t:1.40},
-  {p:29,id:437,a:"Angle Pierre Dupont/Moissons Desroches",lat:45.445111,lon:4.395977,d:0.69,t:2.40},
-  {p:30,id:364,a:"43 rue Royet",lat:45.442367,lon:4.390112,d:1.84,t:6.70},
-  {p:"A",id:"ARR",a:"Rue Pierre Coubertin",lat:45.466624,lon:4.390320,d:3.14,t:7.60}
-];
-var t2 = [
-  {p:"D",id:"DEP",a:"Rue Pierre Coubertin",lat:45.466624,lon:4.390320,d:0,t:0},
-  {p:1,id:418,a:"Pharmacie Centre Deux (Pourcel)",lat:45.423492,lon:4.394004,d:6.38,t:11.90},
-  {p:2,id:419,a:"8 rue Thiollière",lat:45.424086,lon:4.394067,d:0.63,t:2.90},
-  {p:3,id:417,a:"15 rue Alexandre Pourcel",lat:45.423720,lon:4.394003,d:0.35,t:1.90},
-  {p:4,id:353,a:"64 rue Docteurs Charcot",lat:45.419185,lon:4.392721,d:0.66,t:1.50},
-  {p:5,id:340,a:"Rue Branly – Gare Bellevue",lat:45.417566,lon:4.392636,d:0.30,t:0.70},
-  {p:6,id:416,a:"21 rue Alexandre Pourcel",lat:45.423786,lon:4.394734,d:1.21,t:3.50},
-  {p:7,id:420,a:"16 rue Tréfilerie",lat:45.424055,lon:4.393237,d:0.46,t:1.50},
-  {p:8,id:425,a:"6 rue Chevreul",lat:45.424399,lon:4.392719,d:0.08,t:0.30},
-  {p:9,id:429,a:"5 rue Chevreul",lat:45.424298,lon:4.392362,d:0.03,t:0.10},
-  {p:10,id:415,a:"67 rue Désiré Claude",lat:45.425366,lon:4.390049,d:0.31,t:1.10},
-  {p:11,id:436,a:"9 rue Edouard Vaillant",lat:45.427774,lon:4.392469,d:0.46,t:1.80},
-  {p:12,id:423,a:"23 rue Chevreul",lat:45.424604,lon:4.394601,d:0.47,t:1.90},
-  {p:13,id:430,a:"Rue Aimée Malécot 1er Droite",lat:45.425207,lon:4.394231,d:0.07,t:0.30},
-  {p:14,id:431,a:"5 rue Aimée Malécot",lat:45.425613,lon:4.394014,d:0.05,t:0.20},
-  {p:15,id:424,a:"12 rue Chevreul",lat:45.424564,lon:4.393587,d:0.35,t:1.40},
-  {p:16,id:421,a:"15-19 rue Tréfilerie",lat:45.424807,lon:4.393006,d:0.08,t:0.30},
-  {p:17,id:422,a:"13 rue Tréfilerie",lat:45.425424,lon:4.392892,d:0.07,t:0.30},
-  {p:18,id:428,a:"Rue Richard Face Consulat",lat:45.425713,lon:4.391911,d:0.11,t:0.40},
-  {p:19,id:427,a:"Rue Richard Mur bleu",lat:45.425894,lon:4.393189,d:0.10,t:0.40},
-  {p:20,id:426,a:"Rue Richard/Aimé Malécot",lat:45.425924,lon:4.393716,d:0.04,t:0.20},
-  {p:21,id:410,a:"37 rue Clément Forissier",lat:45.426417,lon:4.394203,d:0.09,t:0.40},
-  {p:22,id:411,a:"30 rue Clément Forissier",lat:45.426839,lon:4.394175,d:0.05,t:0.20},
-  {p:23,id:412,a:"24 rue Clément Forissier",lat:45.427287,lon:4.393852,d:0.05,t:0.20},
-  {p:24,id:413,a:"13 rue Clément Forissier",lat:45.427646,lon:4.393839,d:0.04,t:0.20},
-  {p:25,id:414,a:"10B rue Clément Forissier",lat:45.428233,lon:4.393465,d:0.07,t:0.30},
-  {p:26,id:435,a:"16 rue Edouard Vaillant",lat:45.427988,lon:4.394089,d:0.23,t:0.90},
-  {p:27,id:434,a:"10 rue Edouard Vaillant",lat:45.427832,lon:4.393451,d:0.05,t:0.20},
-  {p:28,id:441,a:"6 rue Léon Portier",lat:45.427835,lon:4.391023,d:0.30,t:1.20},
-  {p:29,id:432,a:"30-32 rue Voltaire",lat:45.427902,lon:4.391500,d:0.12,t:0.50},
-  {p:30,id:345,a:"24 rue Voltaire",lat:45.428773,lon:4.391219,d:0.10,t:0.40},
-  {p:"A",id:"ARR",a:"Rue Pierre Coubertin",lat:45.466624,lon:4.390320,d:5.63,t:13.20}
-];
 
-/* Descripteur des tournees. geometry : optionnel, coordonnees GeoJSON
-   [lon, lat] du trace routier reel. Absent ici -> trace indicatif. */
-var ROUTES = [
-  {label:"Tournée 1", color:"#1f5fa9", points:t1, offset: 0.0001, geometry:null},
-  {label:"Tournée 2", color:"#d35400", points:t2, offset:-0.0001, geometry:null}
-];
+var COLOR_START = "#1e8449";   // vert
+var COLOR_END   = "#6c3483";   // violet
+var FALLBACK_COLORS = ["#1f5fa9", "#d35400"];
 
-var COLOR_START   = "#1e8449";   // vert
-var COLOR_END     = "#6c3483";   // violet
-var COLOR_PROBLEM = "#e74c3c";   // segment au detour anormal
-/* ==================== FIN DES DONNÉES ==================== */
+var MSG_EMPTY = "Aucune tournée récente disponible. Lancez une optimisation.";
 
 
 /* ---------- utilitaires ---------- */
@@ -171,13 +109,13 @@ function geoJsonToLatLng(coord){ return [coord[1], coord[0]]; }
 
 /** Rend "—" plutôt qu'une valeur inventée lorsque la métrique manque. */
 function fmt(v, digits, unit){
-  if (v === null || v === undefined || (typeof v === "number" && !isFinite(v))) return "—";
+  if (v === null || v === undefined || v === "") return "—";
   var n = Number(v);
   if (!isFinite(n)) return "—";
   return n.toFixed(digits) + (unit ? " " + unit : "");
 }
 
-function isDepot(p){ return p.p === "D" || p.p === "A"; }
+function isDepotRole(role){ return role === "start" || role === "end"; }
 
 /** Distance à vol d'oiseau en mètres, approximation locale suffisante ici. */
 function straightMeters(a,b){
@@ -186,34 +124,48 @@ function straightMeters(a,b){
   return Math.sqrt(dy*dy + dx*dx);
 }
 
-/** Détour anormal : distance routière très supérieure au vol d'oiseau. */
-function isProblemLeg(prev, cur){
-  if (!prev || typeof cur.d !== "number") return false;
-  var s = straightMeters(prev, cur);
-  var ratio = s > 0 ? (cur.d * 1000) / s : 0;
-  return ratio > 4 || (cur.d > 0.7 && s < 300);
+
+/* ---------- état ---------- */
+
+var map = null;
+var layers = [];
+var allLatLngs = [];
+var skipped = [];
+var depotSeen = {};
+var usesRoadGeometry = false;
+
+
+/* ---------- message « pas de données » ---------- */
+
+function showEmpty(message){
+  document.getElementById("panel").style.display = "none";
+  document.getElementById("map").style.display = "none";
+  var box = document.getElementById("empty");
+  box.style.display = "flex";
+  box.innerHTML = "<div><b>" + esc(message || MSG_EMPTY) + "</b></div>";
+}
+
+/** Rétablit l'affichage de la carte : le message vide peut avoir été montré
+    avant l'arrivée des données (réponse asynchrone de google.script.run). */
+function showMap(){
+  document.getElementById("empty").style.display = "none";
+  document.getElementById("panel").style.display = "flex";
+  document.getElementById("map").style.display = "block";
 }
 
 
 /* ---------- carte ---------- */
 
-var map = L.map("map");
-L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
-            {attribution:"&copy; OpenStreetMap", maxZoom:19}).addTo(map);
+function initMap(){
+  map = L.map("map");
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+              {attribution:"&copy; OpenStreetMap", maxZoom:19}).addTo(map);
 
-// Pane dédié aux lignes, sous markerPane (600) : les marqueurs restent cliquables
-// et visibles par-dessus les tracés.
-map.createPane("routeLines");
-map.getPane("routeLines").style.zIndex = 350;
-
-var allLatLngs = [];
-var skipped = [];
-var layers = [];          // un layerGroup par tournée, pour les cases à cocher
-var usesRoadGeometry = false;
-
-/* Dédoublonnage des dépôts : les deux tournées partagent souvent le même
-   départ et la même arrivée. Clé = coordonnées arrondies. */
-var depotSeen = {};
+  // Pane dédié aux lignes, sous markerPane (600) : les marqueurs restent
+  // cliquables et visibles par-dessus les tracés.
+  map.createPane("routeLines");
+  map.getPane("routeLines").style.zIndex = 350;
+}
 
 function depotKey(p){ return p.lat.toFixed(6) + "," + p.lon.toFixed(6); }
 
@@ -224,9 +176,9 @@ function registerDepot(p, role){
 }
 
 
-/* ---------- tracé d'une tournée ---------- */
-
 function drawRoute(route, index){
+  var color = route.color || FALLBACK_COLORS[index % FALLBACK_COLORS.length];
+  var label = route.label || ("Tournée " + (index + 1));
   var group = L.layerGroup();
   var pts = Array.isArray(route.points) ? route.points : [];
   var valid = [];
@@ -236,53 +188,46 @@ function drawRoute(route, index){
       valid.push(pts[i]);
     } else {
       var ident = pts[i] && pts[i].id !== undefined ? pts[i].id : "(sans id)";
-      skipped.push(route.label + " / " + ident);
-      console.warn("Point ignoré, coordonnées invalides — tournée: "
-                   + route.label + ", id: " + ident, pts[i]);
+      skipped.push(label + " / " + ident);
+      console.warn("Point ignoré, coordonnées invalides — tournée: " + label
+                   + ", id: " + ident, pts[i]);
     }
   }
 
-  // Tournée vide ou réduite à un point : aucun tracé, pas d'erreur.
+  // Tournée vide : aucun tracé, aucune erreur. La seconde tournée s'affiche seule.
   if (valid.length === 0){
-    layers.push({label:route.label, group:group, count:0});
+    layers.push({label:label, color:color, group:group, count:0});
     return;
   }
 
   // --- lignes ---
   if (route.geometry && route.geometry.length > 1){
-    // Géométrie routière réelle, fournie en GeoJSON [lon, lat] : trait plein.
+    // Géométrie routière réelle, en GeoJSON [lon, lat] : trait plein.
     usesRoadGeometry = true;
     var latlngs = [];
     for (var g = 0; g < route.geometry.length; g++){
       latlngs.push(geoJsonToLatLng(route.geometry[g]));
     }
-    L.polyline(latlngs, {pane:"routeLines", color:route.color,
+    L.polyline(latlngs, {pane:"routeLines", color:color,
                          weight:5, opacity:0.85}).addTo(group);
     allLatLngs = allLatLngs.concat(latlngs);
   } else {
-    // Aucune géométrie routière : segments droits, en POINTILLÉS, pour ne
-    // jamais faire passer une ligne droite pour un itinéraire réel.
-    var offLat = (typeof route.offset === "number" ? route.offset : 0);
+    // Aucune géométrie routière disponible : segments droits, en POINTILLÉS,
+    // pour ne jamais faire passer une ligne droite pour un itinéraire réel.
+    var offLat = (index === 0 ? 0.0001 : -0.0001);
     for (var j = 0; j < valid.length - 1; j++){
       var a = valid[j], b = valid[j+1];
-      var problem = isProblemLeg(a, b);
       var line = L.polyline(
         [[a.lat + offLat, a.lon], [b.lat + offLat, b.lon]],
-        {pane:"routeLines",
-         color: problem ? COLOR_PROBLEM : route.color,
-         weight: problem ? 6 : 4,
-         opacity: 0.85,
-         dashArray: "7,7"}
+        {pane:"routeLines", color:color, weight:4, opacity:0.85, dashArray:"7,7"}
       ).addTo(group);
 
-      var s = Math.round(straightMeters(a,b));
-      var info = "<b>" + esc(route.label) + " — segment " + esc(a.p) + " → " + esc(b.p)
-               + "</b><br>" + esc(b.a)
-               + "<br>Route : " + fmt(b.d,2,"km") + " / " + fmt(b.t,1,"min")
-               + "<br>Vol d'oiseau : " + s + " m"
-               + "<br><i>tracé indicatif, non routier</i>";
-      if (problem) info = '<span style="color:#e74c3c">&#9888; détour anormal</span><br>' + info;
-      line.bindPopup(info);
+      line.bindPopup(
+        "<b>" + esc(label) + " — segment " + esc(a.order) + " &rarr; " + esc(b.order)
+        + "</b><br>" + esc(b.label || "")
+        + "<br>Vol d'oiseau : " + Math.round(straightMeters(a,b)) + " m"
+        + "<br><i>tracé indicatif, non routier</i>"
+      );
     }
   }
 
@@ -290,39 +235,33 @@ function drawRoute(route, index){
   for (var k = 0; k < valid.length; k++){
     var p = valid[k];
 
-    if (isDepot(p)){
-      registerDepot(p, p.p === "D" ? "start" : "end");
+    if (isDepotRole(p.role)){
+      registerDepot(p, p.role);
       allLatLngs.push(toLatLng(p));
       continue;                        // marqueurs de dépôt posés une seule fois
     }
 
-    var prev = k > 0 ? valid[k-1] : null;
-    var next = k < valid.length - 1 ? valid[k+1] : null;
-    var prob = isProblemLeg(prev, p) || (next ? isProblemLeg(p, next) : false);
-
-    var cls = "pin" + (prob ? " pin-prob" : "");
-    var style = prob ? "" : "border-color:" + route.color + ";color:" + route.color;
     var icon = L.divIcon({
       className: "",
-      html: '<div class="' + cls + '" style="' + style + '">' + esc(p.p) + "</div>",
+      html: '<div class="pin" style="border-color:' + color + ";color:" + color
+          + '">' + esc(p.order) + "</div>",
       iconSize: [22,22], iconAnchor: [11,11]
     });
 
-    L.marker(toLatLng(p), {icon:icon, title:route.label + " — " + String(p.p)})
+    L.marker(toLatLng(p), {icon:icon, title:label + " — " + String(p.order)})
       .addTo(group)
       .bindPopup(
-        "<b>" + esc(route.label) + " — passage n&deg;" + esc(p.p) + "</b><br>"
-        + esc(p.a || "(sans libellé)")
+        "<b>" + esc(label) + " — passage n&deg;" + esc(p.order) + "</b><br>"
+        + esc(p.label || "(sans libellé)")
         + "<br><small>ID : " + esc(p.id)
         + " | " + p.lat.toFixed(5) + ", " + p.lon.toFixed(5) + "</small>"
-        + "<br>Depuis le précédent : " + fmt(p.d,2,"km") + " / " + fmt(p.t,1,"min")
       );
 
     allLatLngs.push(toLatLng(p));
   }
 
   group.addTo(map);
-  layers.push({label:route.label, group:group, count:valid.length});
+  layers.push({label:label, color:color, group:group, count:valid.length});
 }
 
 
@@ -333,8 +272,7 @@ function drawDepots(){
     if (!Object.prototype.hasOwnProperty.call(depotSeen, key)) continue;
 
     var entry = depotSeen[key];
-    var roles = entry.roles;
-    var isStart = !!roles.start, isEnd = !!roles.end;
+    var isStart = !!entry.roles.start, isEnd = !!entry.roles.end;
 
     var label, color, short;
     if (isStart && isEnd){ label = "Départ / Arrivée"; color = COLOR_START; short = "D/A"; }
@@ -350,7 +288,7 @@ function drawDepots(){
 
     L.marker([entry.point.lat, entry.point.lon], {icon:icon, title:label})
       .addTo(map)
-      .bindPopup("<b>" + esc(label) + "</b><br>" + esc(entry.point.a || "")
+      .bindPopup("<b>" + esc(label) + "</b><br>" + esc(entry.point.label || "")
                  + "<br><small>" + entry.point.lat.toFixed(5) + ", "
                  + entry.point.lon.toFixed(5) + "</small>");
   }
@@ -359,37 +297,46 @@ function drawDepots(){
 
 /* ---------- panneau récapitulatif ---------- */
 
-function buildSummary(){
+function buildSummary(payload){
   var rows = "", totalKm = 0, totalMin = 0, kmKnown = false, minKnown = false;
 
-  for (var i = 0; i < ROUTES.length; i++){
-    var r = ROUTES[i];
+  for (var i = 0; i < payload.routes.length; i++){
+    var r = payload.routes[i];
+    var color = r.color || FALLBACK_COLORS[i % FALLBACK_COLORS.length];
     var pts = Array.isArray(r.points) ? r.points : [];
-    var n = 0, km = 0, mn = 0, anyKm = false, anyMin = false;
 
+    var n = 0;
     for (var j = 0; j < pts.length; j++){
-      if (!hasValidCoords(pts[j])) continue;
-      if (!isDepot(pts[j])) n++;
-      if (typeof pts[j].d === "number" && isFinite(pts[j].d)){ km += pts[j].d; anyKm = true; }
-      if (typeof pts[j].t === "number" && isFinite(pts[j].t)){ mn += pts[j].t; anyMin = true; }
+      if (pts[j].role === "collection" && hasValidCoords(pts[j])) n++;
     }
 
-    if (anyKm){ totalKm += km; kmKnown = true; }
-    if (anyMin){ totalMin += mn; minKnown = true; }
+    var km = r.distance_km, mn = r.duration_min;
+    if (km !== null && km !== undefined && km !== "" && isFinite(Number(km))){
+      totalKm += Number(km); kmKnown = true;
+    }
+    if (mn !== null && mn !== undefined && mn !== "" && isFinite(Number(mn))){
+      totalMin += Number(mn); minKnown = true;
+    }
 
-    rows += "<tr><td><span class='sw' style='background:" + r.color + "'></span>"
-          + esc(r.label) + "</td>"
+    rows += "<tr><td><span class='sw' style='background:" + color + "'></span>"
+          + esc(r.label || ("Tournée " + (i+1))) + "</td>"
           + "<td class='num'>" + n + " pts</td>"
-          + "<td class='num'>" + (anyKm ? fmt(km,2,"km") : "—") + "</td>"
-          + "<td class='num'>" + (anyMin ? fmt(mn,1,"min") : "—") + "</td></tr>";
+          + "<td class='num'>" + fmt(km,2,"km") + "</td>"
+          + "<td class='num'>" + fmt(mn,1,"min") + "</td></tr>";
   }
 
   rows += "<tr><th>Total</th><th></th>"
         + "<th class='num'>" + (kmKnown ? fmt(totalKm,2,"km") : "—") + "</th>"
         + "<th class='num'>" + (minKnown ? fmt(totalMin,1,"min") : "—") + "</th></tr>";
 
+  var meta = "";
+  if (payload.strategy) meta += "Stratégie : " + esc(payload.strategy);
+  if (payload.points_signature) meta += " | jeu " + esc(payload.points_signature);
+  if (payload.generated_at) meta += "<br>" + esc(payload.generated_at);
+
   document.getElementById("summary").innerHTML =
-    "<h2>Récapitulatif</h2><table class='sum'>" + rows + "</table>";
+    "<h2>Récapitulatif</h2><table class='sum'>" + rows + "</table>"
+    + (meta ? "<div class='meta'>" + meta + "</div>" : "");
 }
 
 
@@ -397,13 +344,12 @@ function buildSummary(){
 
 function buildLegend(){
   var html = "<h2>Légende</h2>";
-  for (var i = 0; i < ROUTES.length; i++){
-    html += "<span class='sw' style='background:" + ROUTES[i].color + "'></span>"
-          + esc(ROUTES[i].label) + "<br>";
+  for (var i = 0; i < layers.length; i++){
+    html += "<span class='sw' style='background:" + layers[i].color + "'></span>"
+          + esc(layers[i].label) + "<br>";
   }
   html += "<span class='sw' style='background:" + COLOR_START + "'></span>Départ<br>"
-        + "<span class='sw' style='background:" + COLOR_END + "'></span>Arrivée<br>"
-        + "<span class='sw' style='background:" + COLOR_PROBLEM + "'></span>Détour anormal<br>";
+        + "<span class='sw' style='background:" + COLOR_END + "'></span>Arrivée<br>";
 
   html += usesRoadGeometry
     ? "<span class='sw' style='background:#666'></span><b>tracé routier réel</b>"
@@ -434,8 +380,7 @@ function buildToggles(){
   var boxes = host.querySelectorAll("input[data-layer]");
   for (var b = 0; b < boxes.length; b++){
     boxes[b].addEventListener("change", function(){
-      var idx = Number(this.getAttribute("data-layer"));
-      var g = layers[idx].group;
+      var g = layers[Number(this.getAttribute("data-layer"))].group;
       if (this.checked) { map.addLayer(g); } else { map.removeLayer(g); }
     });
   }
@@ -450,29 +395,97 @@ function buildToggles(){
 }
 
 
-/* ---------- initialisation ---------- */
+/* ---------- rendu complet ---------- */
 
-for (var r = 0; r < ROUTES.length; r++) drawRoute(ROUTES[r], r);
-drawDepots();
-buildSummary();
-buildLegend();
-buildToggles();
+function renderCarte(payload){
+  if (!payload || !Array.isArray(payload.routes) || payload.routes.length === 0){
+    showEmpty();
+    return;
+  }
 
-// Cadrage : englobe les deux tournées et les dépôts. Repli sur une vue par
-// défaut si aucune coordonnée exploitable, pour ne pas laisser une carte vide.
-if (allLatLngs.length > 1){
-  map.fitBounds(L.latLngBounds(allLatLngs).pad(0.08));
-} else if (allLatLngs.length === 1){
-  map.setView(allLatLngs[0], 15);
-} else {
-  map.setView([45.436, 4.390], 13);
-  console.warn("Aucune coordonnée exploitable : vue par défaut appliquée.");
+  var total = 0;
+  for (var i = 0; i < payload.routes.length; i++){
+    var pts = payload.routes[i].points;
+    if (Array.isArray(pts)) total += pts.length;
+  }
+  if (total === 0){
+    showEmpty();
+    return;
+  }
+
+  showMap();
+
+  // Points écartés en amont par Apps Script (coordonnées absentes du Sheet).
+  if (Array.isArray(payload.skipped) && payload.skipped.length){
+    skipped = skipped.concat(payload.skipped);
+    console.warn("Points écartés avant la carte : " + payload.skipped.join(", "));
+  }
+
+  initMap();
+  for (var r = 0; r < payload.routes.length; r++) drawRoute(payload.routes[r], r);
+  drawDepots();
+  buildSummary(payload);
+  buildLegend();
+  buildToggles();
+
+  // invalidateSize AVANT le cadrage : le conteneur vient d'être affiché et
+  // Leaflet peut encore en connaître une taille périmée. Avec une mauvaise
+  // taille, fitBounds choisit un zoom trop serré et laisse des points hors
+  // cadre — constaté sur un jeu de 60 points.
+  map.invalidateSize();
+
+  if (allLatLngs.length > 1){
+    map.fitBounds(L.latLngBounds(allLatLngs).pad(0.08));
+  } else if (allLatLngs.length === 1){
+    map.setView(allLatLngs[0], 15);
+  } else {
+    showEmpty("Aucune coordonnée exploitable dans le dernier résultat.");
+    return;
+  }
+
+  // Le dialogue Apps Script peut encore se redimensionner après le premier
+  // rendu : on réaligne, puis on recadre pour rester exact.
+  window.addEventListener("resize", function(){
+    map.invalidateSize();
+    if (allLatLngs.length > 1) map.fitBounds(L.latLngBounds(allLatLngs).pad(0.08));
+  });
+  setTimeout(function(){
+    map.invalidateSize();
+    if (allLatLngs.length > 1) map.fitBounds(L.latLngBounds(allLatLngs).pad(0.08));
+  }, 0);
 }
 
-// Le panneau peut changer de hauteur au retour à la ligne (mobile) : on
-// réaligne la carte après le premier rendu.
-window.addEventListener("resize", function(){ map.invalidateSize(); });
-setTimeout(function(){ map.invalidateSize(); }, 0);
+
+/* ---------- amorçage ---------- */
+
+(function boot(){
+  // 1. Payload déjà posé sur window : utilisé par les tests hors Apps Script.
+  if (window.TOURNEES_PAYLOAD){
+    renderCarte(window.TOURNEES_PAYLOAD);
+    return;
+  }
+
+  // 2. Contexte Apps Script : on demande au serveur le dernier résultat.
+  if (typeof google !== "undefined" && google.script && google.script.run){
+    google.script.run
+      .withSuccessHandler(function(json){
+        if (!json){ showEmpty(); return; }
+        var data;
+        try { data = JSON.parse(json); }
+        catch (e){ showEmpty("Données de carte illisibles."); return; }
+        renderCarte(data);
+      })
+      .withFailureHandler(function(err){
+        showEmpty("Impossible de charger la carte : "
+                  + (err && err.message ? err.message : String(err)));
+      })
+      .getCarteTourneesPayload();
+    return;
+  }
+
+  // 3. Ouvert seul dans un navigateur, sans données.
+  showEmpty();
+})();
 </script>
 </body>
 </html>
