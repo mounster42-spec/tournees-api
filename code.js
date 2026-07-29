@@ -722,6 +722,85 @@ function afficherCarteTournees(result, params, points) {
 }
 
 
+/**
+ * Fabrique une carte AUTONOME : le gabarit HTML avec les données du run
+ * injectées dedans. Le fichier obtenu s'ouvre n'importe où — poste local,
+ * pièce jointe, Drive — sans Apps Script et sans accès au classeur.
+ *
+ * L'amorçage du gabarit teste window.TOURNEES_PAYLOAD en premier : il rend
+ * donc directement la carte et n'appelle jamais google.script.run.
+ */
+function _buildStandaloneCarteHtml_(payloadJson) {
+
+  const tpl = HtmlService.createHtmlOutputFromFile(MAP_HTML_FILE).getContent();
+
+  if (tpl.indexOf("</head>") === -1) {
+    throw new Error("Gabarit " + MAP_HTML_FILE + " inattendu : balise </head> absente.");
+  }
+
+  // Les libellés viennent du Sheet et peuvent contenir n'importe quoi.
+  // Échapper "<" neutralise </script> et <!-- , qui sortiraient du bloc.
+  // U+2028 et U+2029 sont des terminateurs de ligne en JavaScript.
+  const safe = payloadJson
+    .replace(/</g, "\\u003c")
+    .replace(/ /g, "\\u2028")
+    .replace(/ /g, "\\u2029");
+
+  return tpl.replace("</head>",
+    "<script>window.TOURNEES_PAYLOAD = " + safe + ";</script>\n</head>");
+}
+
+
+/**
+ * Entrée de menu : exporte la dernière carte en un fichier HTML autonome
+ * déposé sur Drive, puis affiche son lien.
+ *
+ * Le fichier est créé PRIVÉ. Le partage reste une décision explicite, à
+ * prendre dans Drive : ces données sont opérationnelles.
+ */
+function exporterCartePartageable() {
+
+  const json = getCarteTourneesPayload();
+  if (!json) {
+    SpreadsheetApp.getActive().toast(
+      "Aucune carte enregistrée. Lancez une optimisation.", "Export", 5);
+    return;
+  }
+
+  const html = _buildStandaloneCarteHtml_(json);
+  const stamp = Utilities.formatDate(
+    new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd_HH-mm");
+  const name = "carte_tournees_" + stamp + ".html";
+
+  const file = DriveApp.createFile(name, html, MimeType.HTML);
+
+  const esc = function (s) {
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+                    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  };
+
+  const body =
+      '<div style="font-family:Arial,sans-serif;font-size:13px;line-height:1.7;padding:14px">'
+    + "<b>Carte exportée.</b><br>"
+    + "Fichier : <code>" + esc(name) + "</code>"
+    + " &mdash; " + Math.round(html.length / 1024) + " Ko<br><br>"
+    + '<a href="' + esc(file.getUrl()) + '" target="_blank">Ouvrir dans Drive</a>'
+    + " &nbsp;|&nbsp; "
+    + '<a href="https://drive.google.com/uc?export=download&id='
+    + esc(file.getId()) + '" target="_blank">Télécharger le fichier</a>'
+    + "<br><br>"
+    + "<b>Pour partager</b> : dans Drive, clic droit sur le fichier &rsaquo; Partager.<br>"
+    + "Il est créé <b>privé</b> : rien n'est publié sans votre décision.<br><br>"
+    + "<small>Le fichier contient les données du run. Il charge Leaflet et les "
+    + "tuiles OpenStreetMap depuis Internet : une connexion reste nécessaire "
+    + "pour l'afficher.</small></div>";
+
+  SpreadsheetApp.getUi().showModalDialog(
+    HtmlService.createHtmlOutput(body).setWidth(560).setHeight(300),
+    "Carte partageable");
+}
+
+
 /** Entrée de menu : rouvre la dernière carte sans relancer d'optimisation. */
 function afficherDerniereCarte() {
   if (!getCarteTourneesPayload()) {
@@ -827,6 +906,7 @@ function onOpen() {
     )
     .addSeparator()
     .addItem("Afficher la dernière carte", "afficherDerniereCarte")
+    .addItem("Exporter la carte partageable", "exporterCartePartageable")
     .addSeparator()
     .addItem("Effacer tournées", "clearResults")
     .addItem("Réinitialiser la sélection", "resetSelection")
