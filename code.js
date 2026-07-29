@@ -581,6 +581,159 @@ function _cell(v) {
 
 
 // =========================
+// CARTE DES DEUX TOURNÉES
+// =========================
+// Nom EXACT du fichier HTML à créer dans l'éditeur Apps Script
+// (Fichier > Nouveau > Fichier HTML), sans l'extension.
+const MAP_HTML_FILE  = "CarteTournees";
+
+// Le payload d'un run de 62 points pèse ~8 Ko. PropertiesService plafonne à
+// 9 Ko par valeur : trop juste dès que les adresses s'allongent. Une cellule
+// de feuille accepte 50 000 caractères, avec en prime la persistance entre
+// sessions. D'où cette feuille masquée à une seule cellule.
+const MAP_DATA_SHEET = "_CarteData";
+
+const MAP_COLORS = ["#1f5fa9", "#d35400"];   // Tournée 1 bleu, Tournée 2 orange foncé
+
+
+function _mapDataSheet_(createIfMissing) {
+  const ss = SpreadsheetApp.getActive();
+  let sh = ss.getSheetByName(MAP_DATA_SHEET);
+  if (!sh && createIfMissing) {
+    sh = ss.insertSheet(MAP_DATA_SHEET);
+    sh.getRange(1, 2).setValue(
+      "Stockage technique de la dernière carte. Ne pas modifier.");
+    sh.hideSheet();
+  }
+  return sh;
+}
+
+
+function _saveCartePayload_(payload) {
+  _mapDataSheet_(true).getRange(1, 1).setValue(JSON.stringify(payload));
+}
+
+
+/**
+ * Appelée depuis le HTML par google.script.run. Doit rester au niveau global.
+ * Retourne le JSON du dernier run, ou null s'il n'y en a pas — le HTML affiche
+ * alors « Aucune tournée récente disponible ».
+ */
+function getCarteTourneesPayload() {
+  const sh = _mapDataSheet_(false);
+  if (!sh) return null;
+  const v = sh.getRange(1, 1).getValue();
+  return v ? String(v) : null;
+}
+
+
+/**
+ * Construit le payload de la carte à partir du run qui vient d'aboutir.
+ *
+ * result.tournee_N contient les identifiants DANS L'ORDRE DE PASSAGE, dépôt
+ * inclus aux deux extrémités : le backend renvoie [start] + points + [end].
+ * D'où role = "start" au premier rang, "end" au dernier, "collection" entre.
+ *
+ * Les latitudes, longitudes et libellés viennent du snapshot du Sheet passé en
+ * argument — aucun appel réseau, aucun recalcul, aucune réoptimisation.
+ */
+function buildCartePayload(result, params, points) {
+
+  const latMap = {}, lonMap = {}, addrMap = {};
+  for (let i = 0; i < points.length; i++) {
+    const sid = String(points[i].id);
+    latMap[sid]  = points[i].lat;
+    lonMap[sid]  = points[i].lon;
+    addrMap[sid] = points[i].address || "";
+  }
+
+  const specs = [
+    { key: "tournee_1", label: "Tournée 1" },
+    { key: "tournee_2", label: "Tournée 2" }
+  ];
+
+  const routes = [];
+  const skipped = [];
+
+  for (let s = 0; s < specs.length; s++) {
+    const ids = result[specs[s].key] || [];
+    const pts = [];
+    let order = 0;
+
+    for (let k = 0; k < ids.length; k++) {
+      const sid = String(ids[k]);
+      const lat = Number(latMap[sid]);
+      const lon = Number(lonMap[sid]);
+
+      let role = "collection";
+      if (k === 0) role = "start";
+      else if (k === ids.length - 1) role = "end";
+
+      // Coordonnée absente ou illisible : le point est écarté avec son
+      // identifiant, sans empêcher l'affichage du reste de la carte.
+      if (!isFinite(lat) || !isFinite(lon) || latMap[sid] === "" || lonMap[sid] === "") {
+        skipped.push(specs[s].label + " / " + sid);
+        continue;
+      }
+
+      if (role === "collection") order++;
+
+      pts.push({
+        order: (role === "start") ? "D" : (role === "end") ? "A" : order,
+        id: sid,
+        label: addrMap[sid],
+        lat: lat,
+        lon: lon,
+        role: role
+      });
+    }
+
+    routes.push({
+      label: specs[s].label,
+      color: MAP_COLORS[s % MAP_COLORS.length],
+      distance_km:  _cell(result[specs[s].key + "_km"]),
+      duration_min: _cell(result[specs[s].key + "_min"]),
+      points: pts
+    });
+  }
+
+  return {
+    generated_at: new Date().toISOString(),
+    strategy: result.strategy_used || result.strategy_requested || params.strategy || "",
+    points_signature: result.points_signature || "",
+    skipped: skipped,
+    routes: routes
+  };
+}
+
+
+function _ouvrirDialogueCarte_() {
+  const out = HtmlService.createHtmlOutputFromFile(MAP_HTML_FILE)
+    .setWidth(1200)
+    .setHeight(800);
+  SpreadsheetApp.getUi().showModalDialog(out, "Carte des deux tournées");
+}
+
+
+/** Construit, enregistre puis affiche la carte du run courant. */
+function afficherCarteTournees(result, params, points) {
+  _saveCartePayload_(buildCartePayload(result, params, points));
+  _ouvrirDialogueCarte_();
+}
+
+
+/** Entrée de menu : rouvre la dernière carte sans relancer d'optimisation. */
+function afficherDerniereCarte() {
+  if (!getCarteTourneesPayload()) {
+    SpreadsheetApp.getActive().toast(
+      "Aucune carte enregistrée. Lancez une optimisation.", "Carte", 5);
+    return;
+  }
+  _ouvrirDialogueCarte_();
+}
+
+
+// =========================
 // LANCER L'OPTIMISATION
 // =========================
 /**
@@ -638,6 +791,17 @@ function runOptimisation(strategyOverride) {
     "Terminé ! Stratégie : " + stratLabel + " | " + vroomInfo,
     "Succès", 10
   );
+
+  // Carte en DERNIER : un dialogue modal bloque le script jusqu'à sa fermeture,
+  // les résultats doivent donc déjà être écrits. On n'arrive ici qu'après un run
+  // réussi : callAPI lève sur une erreur HTTP et result.error sort plus haut,
+  // donc aucune carte n'est ouverte après un échec.
+  try {
+    afficherCarteTournees(result, params, points);
+  } catch (e) {
+    SpreadsheetApp.getActive().toast(
+      "Carte non affichée : " + (e && e.message ? e.message : e), "Carte", 8);
+  }
 }
 
 
@@ -661,6 +825,8 @@ function onOpen() {
         .addItem("OR-Tools Haversine", "runOrtoolsHaversine")
         .addItem("OR-Tools ORS Matrix", "runOrtoolsOrsMatrix")
     )
+    .addSeparator()
+    .addItem("Afficher la dernière carte", "afficherDerniereCarte")
     .addSeparator()
     .addItem("Effacer tournées", "clearResults")
     .addItem("Réinitialiser la sélection", "resetSelection")
