@@ -29,13 +29,28 @@ const STRATEGY_LABELS = {
 };
 
 const BENCH_SHEET = "Benchmark";
-const BENCH_HEADERS = [
+
+// Colonnes historiques : ordre et libellés figés, ne jamais déplacer ni renommer.
+const BENCH_HEADERS_BASE = [
   "Date", "Stratégie exécutée", "Stratégie demandée", "Nb pts", "Signature jeu", "Nb véh",
   "Km T1", "Km T2", "Km total",
   "Min T1", "Min T2", "Min total",
   "Temps calcul (s)", "Appels API", "Vroom", "Matrix",
   "optimization_path", "Répartition"
 ];
+
+// Colonnes ajoutées par le lot D-3, strictement à la fin.
+const BENCH_HEADERS_D3 = [
+  "d3_label",
+  "max_swap_candidates", "swap_max_consecutive_fails",
+  "swap_candidates_tested", "swaps_accepted",
+  "swap_resequence_cache_hits", "swap_resequence_cache_misses",
+  "swap_vroom_calls_saved", "swap_stop_reason",
+  "ortools_solution_limit_effective", "run_error"
+];
+
+const BENCH_HEADERS = BENCH_HEADERS_BASE.concat(BENCH_HEADERS_D3);
+
 
 
 function setupSheets() {
@@ -445,16 +460,26 @@ function _num(v) {
 
 
 /**
- * Ajoute une ligne à la feuille "Benchmark". Ne nettoie jamais, ne réécrit
- * jamais les lignes précédentes : c'est l'historique de comparaison.
+ * Crée la feuille Benchmark si besoin, et complète l'en-tête des feuilles
+ * antérieures au lot D-3 en n'écrivant QUE les colonnes manquantes, à la fin.
+ * Aucune colonne existante n'est déplacée, renommée ni effacée.
  */
-function appendBenchmark(result, params, points) {
+function ensureBenchmarkSheet() {
 
   const ss = SpreadsheetApp.getActive();
   let sheet = ss.getSheetByName(BENCH_SHEET);
 
+  // Une feuille Apps Script naît avec 26 colonnes ; l'en-tête en compte 29
+  // depuis le lot D-3. Sans cet élargissement, getRange et appendRow lèveraient
+  // « out of bounds ».
+  const widen = function (sh) {
+    const missing = BENCH_HEADERS.length - sh.getMaxColumns();
+    if (missing > 0) sh.insertColumnsAfter(sh.getMaxColumns(), missing);
+  };
+
   if (!sheet) {
     sheet = ss.insertSheet(BENCH_SHEET);
+    widen(sheet);
     sheet.getRange(1, 1, 1, BENCH_HEADERS.length).setValues([BENCH_HEADERS]);
     sheet.getRange(1, 1, 1, BENCH_HEADERS.length)
       .setBackground("#434343").setFontColor("#ffffff").setFontWeight("bold");
@@ -463,7 +488,42 @@ function appendBenchmark(result, params, points) {
     sheet.setColumnWidth(2, 150);   // Stratégie exécutée
     sheet.setColumnWidth(3, 150);   // Stratégie demandée
     sheet.setColumnWidth(17, 240);  // optimization_path
+    return sheet;
   }
+
+  // Migration : la feuille existe avec les 18 colonnes historiques.
+  widen(sheet);
+  const existing = sheet.getRange(1, 1, 1, BENCH_HEADERS.length).getValues()[0];
+  const missing = [];
+  for (var i = 0; i < BENCH_HEADERS.length; i++) {
+    if (String(existing[i] || "").trim() === "") missing.push(i);
+  }
+  if (missing.length) {
+    const first = missing[0];
+    const tail = BENCH_HEADERS.slice(first);
+    sheet.getRange(1, first + 1, 1, tail.length).setValues([tail]);
+    sheet.getRange(1, first + 1, 1, tail.length)
+      .setBackground("#434343").setFontColor("#ffffff").setFontWeight("bold");
+  }
+  return sheet;
+}
+
+
+/**
+ * Ajoute une ligne à la feuille "Benchmark". Ne nettoie jamais, ne réécrit
+ * jamais les lignes précédentes : c'est l'historique de comparaison.
+ *
+ * Les métriques de swaps sont lues directement dans la réponse du backend :
+ * une optimisation normale les enregistre donc sans dépendre d'un label.
+ *
+ * @param {Object=} extra  {d3_label, run_error}. Absent ou partiel -> les
+ *                         cellules correspondantes restent vides.
+ */
+function appendBenchmark(result, params, points, extra) {
+
+  const sheet = ensureBenchmarkSheet();
+  extra = extra || {};
+  result = result || {};
 
   const km1 = _num(result.tournee_1_km);
   const km2 = _num(result.tournee_2_km);
@@ -476,7 +536,9 @@ function appendBenchmark(result, params, points) {
   const calls = result.api_calls || {};
   const sizes = result.partition_sizes || [];
 
-  sheet.appendRow([
+  // Les champs D-3 sont absents des réponses d'un backend antérieur :
+  // _cell() rend "" plutôt que de lever, les runs normaux restent valides.
+  const row = [
     new Date(),
     // strategy_used = ce qui a RÉELLEMENT tourné. Un écart avec la colonne
     // suivante signale un repli et invalide la ligne comme point de comparaison.
@@ -492,8 +554,29 @@ function appendBenchmark(result, params, points) {
     calls.vroom  != null ? calls.vroom  : "",
     calls.matrix != null ? calls.matrix : "",
     result.optimization_path || "",
-    sizes.join(" / ")
-  ]);
+    sizes.join(" / "),
+
+    // --- colonnes D-3 ---
+    extra.d3_label || "",
+    _cell(result.max_swap_candidates),
+    _cell(result.swap_max_consecutive_fails),
+    _cell(result.swap_candidates_tested),
+    _cell(result.swaps_accepted),
+    _cell(result.swap_resequence_cache_hits),
+    _cell(result.swap_resequence_cache_misses),
+    _cell(result.swap_vroom_calls_saved),
+    _cell(result.swap_stop_reason),
+    _cell(result.ortools_solution_limit),
+    extra.run_error || ""
+  ];
+
+  sheet.appendRow(row);
+}
+
+
+/** Rend "" pour null/undefined, la valeur sinon. Ne lève jamais. */
+function _cell(v) {
+  return (v === null || v === undefined) ? "" : v;
 }
 
 
@@ -535,7 +618,19 @@ function runOptimisation(strategyOverride) {
   }
 
   writeResult(result, params, points);
-  appendBenchmark(result, params, points);
+
+  // Une réponse 200 peut masquer une dégradation backend : VROOM indisponible
+  // => vroom_ok faux => swaps jamais exécutés. Sans cette remontée, la ligne
+  // Benchmark paraît normale alors qu'elle ne mesure pas la même chose.
+  var degraded = "";
+  if (result.vroom_used === false) {
+    degraded = "VROOM indisponible (" + (result.vroom_error || "raison inconnue")
+             + ") : swaps non exécutés";
+  } else if (result.swap_stop_reason === "vroom_error") {
+    degraded = "swaps non exécutés (vroom_error)";
+  }
+
+  appendBenchmark(result, params, points, { run_error: degraded });
 
   var vroomInfo = result.vroom_used ? "Vroom direct" : "K-Means + Vroom (fallback)";
   var stratLabel = result.strategy_used || params.strategy;
@@ -550,6 +645,7 @@ function runOptimisation(strategyOverride) {
 function runKmeans()           { runOptimisation("kmeans"); }
 function runOrtoolsHaversine() { runOptimisation("ortools_haversine"); }
 function runOrtoolsOrsMatrix() { runOptimisation("ortools_ors_matrix"); }
+
 
 
 // =========================

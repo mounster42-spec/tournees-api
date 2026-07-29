@@ -73,6 +73,14 @@ _MATRIX_CACHE_MAX = 8
 ORTOOLS_SOLUTION_LIMIT = 75
 ORTOOLS_TIME_LIMIT_S = 25
 
+# Post-traitement des swaps (lot D-3), surchargeables par requete.
+SWAP_MAX_CANDIDATES = 50           # 0 desactive entierement les swaps
+SWAP_MAX_CONSECUTIVE_FAILS = 0     # 0 desactive l'arret anticipe
+
+# Valeurs autorisees de swap_stop_reason.
+SWAP_STOP_REASONS = ("disabled", "candidate_limit", "consecutive_failures",
+                     "convergence", "no_border_points", "vroom_error", "completed")
+
 _API_STATS = {"vroom": 0, "matrix": 0}
 
 
@@ -95,6 +103,23 @@ def _post_matrix(payload, headers, timeout):
     """Unique point de sortie vers l'endpoint ORS Matrix (compte les appels)."""
     _API_STATS["matrix"] += 1
     return requests.post(ORS_MATRIX_URL, json=payload, headers=headers, timeout=timeout)
+
+
+def _strict_int_param(data, name, lo, hi, default):
+    """Lit un entier STRICT dans le corps de requete.
+    Refuse chaines, booleens et decimaux, et ne tronque JAMAIS : 12.7 est une
+    erreur, pas un 12 silencieux. isinstance(True, int) valant True en Python,
+    le cas booleen est teste en premier.
+    Retourne (valeur, None) ou (None, message_erreur)."""
+    raw = data.get(name)
+    if raw is None:
+        return default, None
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return None, (f"{name} must be a strict integer "
+                      f"(string, boolean and decimal values are rejected)")
+    if not (lo <= raw <= hi):
+        return None, f"{name} out of range ({lo}..{hi})"
+    return raw, None
 
 
 def _points_signature(points):
@@ -1029,7 +1054,8 @@ def _resequence_single(points, vehicle_pts, start_idx, end_idx, headers):
 
 
 def post_process_swaps(points, routes_idx, start_idx, end_idx, max_per_vehicle,
-                       entry_metrics=None):
+                       entry_metrics=None, max_candidates=None,
+                       max_consecutive_fails=None):
     """Post-processing iteratif : echanges de points frontiere jusqu'a convergence.
     Deux modes :
     - Deplacement : point A (T1) -> T2, si T2 n'est pas plein
@@ -1050,9 +1076,42 @@ def post_process_swaps(points, routes_idx, start_idx, end_idx, max_per_vehicle,
 
       C. SORTIE           accepted_routes / accepted_swaps
          Ecrit uniquement lorsqu'un echange est reellement accepte.
+
+    Retourne (routes, metriques, swap_stats).
     """
+    max_candidates = SWAP_MAX_CANDIDATES if max_candidates is None else max_candidates
+    max_consecutive_fails = (SWAP_MAX_CONSECUTIVE_FAILS
+                             if max_consecutive_fails is None else max_consecutive_fails)
+
+    # Trace de configuration : c'est elle qui prouve ce que le backend a
+    # reellement recu. Aucune donnee sensible, uniquement deux entiers.
+    print(f"Post-processing config: max_candidates={max_candidates}, "
+          f"max_consecutive_fails={max_consecutive_fails}", flush=True)
+
+    total_tested = 0
+    accepted_swaps = 0
+    swap_stats = {
+        "max_swap_candidates": max_candidates,
+        "swap_max_consecutive_fails": max_consecutive_fails,
+        "swap_candidates_tested": 0,
+        "swaps_accepted": 0,
+        "swap_resequence_cache_hits": 0,
+        "swap_resequence_cache_misses": 0,
+        "swap_vroom_calls_saved": 0,
+        "swap_stop_reason": "completed",
+    }
+
+    def _finish(reason):
+        swap_stats["swap_candidates_tested"] = total_tested
+        swap_stats["swaps_accepted"] = accepted_swaps
+        swap_stats["swap_stop_reason"] = reason
+        # Un hit est exactement un appel reseau evite.
+        swap_stats["swap_vroom_calls_saved"] = swap_stats["swap_resequence_cache_hits"]
+        return swap_stats
+
+    # Moins de 2 tournees : les swaps n'ont pas de sens, aucun appel n'est emis.
     if len(routes_idx) != 2:
-        return routes_idx, entry_metrics
+        return routes_idx, entry_metrics, _finish("disabled")
 
     headers = {
         "Authorization": ORS_KEY,
@@ -1062,6 +1121,40 @@ def post_process_swaps(points, routes_idx, start_idx, end_idx, max_per_vehicle,
 
     # ---------- A. ETAT D'ENTREE PROTEGE ----------
     entry_routes = [list(routes_idx[0]), list(routes_idx[1])]
+
+    # ---------- SWAPS DESACTIVES ----------
+    # Court-circuit AVANT les deux appels Vroom de notation : desactiver les
+    # swaps ne doit rien couter. Aucune detection de frontiere, aucun candidat,
+    # aucun appel Matrix final. D-2 garantit le retour exact de l'entree.
+    if max_candidates <= 0:
+        print("Post-processing: swaps desactives : routes initiales conservees", flush=True)
+        return entry_routes, entry_metrics, _finish("disabled")
+
+    # ---------- MEMOISATION EXACTE, PORTEE = CET APPEL ----------
+    # Cle = tuple(pts), ordre COMPRIS : _resequence_single construit ses jobs
+    # dans l'ordre de la liste et Vroom y est sensible (optimize_with_vroom
+    # exploite d'ailleurs ce fait avec ses permutations). Ni set, ni frozenset,
+    # ni sorted : la cle doit etre exacte, sinon le cache changerait le resultat.
+    #
+    # Les candidats dupliques par symetrie (a,b) / (b,a) produisent des listes
+    # identiques element par element, ordre compris : le cache est donc exact.
+    _reseq_cache = {}
+
+    def reseq(pts):
+        key = tuple(pts)
+        cached = _reseq_cache.get(key)
+        if cached is not None:
+            swap_stats["swap_resequence_cache_hits"] += 1
+            c_route, c_dur, c_dist = cached
+            return list(c_route), c_dur, c_dist          # copie a la restitution
+        swap_stats["swap_resequence_cache_misses"] += 1
+        route, dur, dist = _resequence_single(points, pts, start_idx, end_idx, headers)
+        # Seuls les succes sont memorises. Un echec transitoire -- timeout, 429,
+        # 5xx, coupure reseau, reponse Vroom invalide -- doit pouvoir etre
+        # retente plus tard dans la meme requete.
+        if route is not None and dur is not None:
+            _reseq_cache[key] = (list(route), dur, dist)  # copie au stockage
+        return route, dur, dist
 
     entry_duration_s = None
     if entry_metrics and len(entry_metrics) == 2:
@@ -1077,12 +1170,12 @@ def post_process_swaps(points, routes_idx, start_idx, end_idx, max_per_vehicle,
     # Ces deux appels Vroom donnent une base de comparaison homogene avec les
     # candidats, tous mesures par Vroom. Leurs routes sont jetees : les adopter
     # ecraserait l'ordre optimise par Or-opt, c'est la cause exacte du defaut D-2.
-    _vroom_route0, dur0, dist0 = _resequence_single(points, pts0, start_idx, end_idx, headers)
-    _vroom_route1, dur1, dist1 = _resequence_single(points, pts1, start_idx, end_idx, headers)
+    _vroom_route0, dur0, dist0 = reseq(pts0)
+    _vroom_route1, dur1, dist1 = reseq(pts1)
 
     if dur0 is None or dur1 is None:
         print("Post-processing: impossible de calculer durees initiales", flush=True)
-        return entry_routes, entry_metrics
+        return entry_routes, entry_metrics, _finish("vroom_error")
 
     current_pts = [list(pts0), list(pts1)]
     current_vroom_durs = [dur0, dur1]
@@ -1091,28 +1184,35 @@ def post_process_swaps(points, routes_idx, start_idx, end_idx, max_per_vehicle,
 
     # ---------- C. ETAT DE SORTIE ----------
     accepted_routes = [list(entry_routes[0]), list(entry_routes[1])]
-    accepted_swaps = 0
 
-    total_tested = 0
+    consecutive_fails = 0
+    stop_reason = "completed"
     MAX_ITER = 5
-    MAX_CALLS = 50
 
-    print(f"Post-processing: base Vroom = {dur0}s + {dur1}s = {current_vroom_total}s", flush=True)
+    print(f"Post-processing: base Vroom = {dur0}s + {dur1}s = {current_vroom_total}s "
+          f"| plafond candidats={max_candidates}, arret anticipe="
+          f"{max_consecutive_fails or 'desactive'}", flush=True)
 
     for iteration in range(MAX_ITER):
-        if total_tested >= MAX_CALLS:
+        if total_tested >= max_candidates:
+            stop_reason = "candidate_limit"
             break
 
         border = _find_border_points(points, accepted_routes, start_idx, end_idx)
         print(f"  Iteration {iteration+1}: {len(border)} points frontiere (seuil 500m)", flush=True)
 
         if not border:
+            stop_reason = "no_border_points"
             break
 
         improved = False
 
         for v_from, pt_a, dist_a in border[:15]:
-            if total_tested >= MAX_CALLS:
+            if total_tested >= max_candidates:
+                stop_reason = "candidate_limit"
+                break
+            if max_consecutive_fails and consecutive_fails >= max_consecutive_fails:
+                stop_reason = "consecutive_failures"
                 break
 
             v_to = 1 - v_from
@@ -1122,9 +1222,10 @@ def post_process_swaps(points, routes_idx, start_idx, end_idx, max_per_vehicle,
                 new_pts_from = [p for p in current_pts[v_from] if p != pt_a]
                 new_pts_to = current_pts[v_to] + [pt_a]
 
-                r_from, d_from, dist_from = _resequence_single(points, new_pts_from, start_idx, end_idx, headers)
-                r_to, d_to, dist_to = _resequence_single(points, new_pts_to, start_idx, end_idx, headers)
+                r_from, d_from, dist_from = reseq(new_pts_from)
+                r_to, d_to, dist_to = reseq(new_pts_to)
                 total_tested += 1
+                consecutive_fails += 1   # remis a zero si le candidat est accepte
 
                 if d_from is not None and d_to is not None:
                     gain = current_vroom_total - (d_from + d_to)
@@ -1145,6 +1246,7 @@ def post_process_swaps(points, routes_idx, start_idx, end_idx, max_per_vehicle,
                         current_pts[v_from] = new_pts_from
                         current_pts[v_to] = new_pts_to
                         accepted_swaps += 1
+                        consecutive_fails = 0
                         improved = True
                         break  # relancer la detection
 
@@ -1158,15 +1260,20 @@ def post_process_swaps(points, routes_idx, start_idx, end_idx, max_per_vehicle,
             )[:5]
 
             for pt_b in candidates_b:
-                if total_tested >= MAX_CALLS:
+                if total_tested >= max_candidates:
+                    stop_reason = "candidate_limit"
+                    break
+                if max_consecutive_fails and consecutive_fails >= max_consecutive_fails:
+                    stop_reason = "consecutive_failures"
                     break
 
                 new_pts_from = [pt_b if p == pt_a else p for p in current_pts[v_from]]
                 new_pts_to = [pt_a if p == pt_b else p for p in current_pts[v_to]]
 
-                r_from, d_from, dist_from = _resequence_single(points, new_pts_from, start_idx, end_idx, headers)
-                r_to, d_to, dist_to = _resequence_single(points, new_pts_to, start_idx, end_idx, headers)
+                r_from, d_from, dist_from = reseq(new_pts_from)
+                r_to, d_to, dist_to = reseq(new_pts_to)
                 total_tested += 1
+                consecutive_fails += 1   # remis a zero si le candidat est accepte
 
                 if d_from is None or d_to is None:
                     continue
@@ -1185,23 +1292,41 @@ def post_process_swaps(points, routes_idx, start_idx, end_idx, max_per_vehicle,
                     current_pts[v_from] = new_pts_from
                     current_pts[v_to] = new_pts_to
                     accepted_swaps += 1
+                    consecutive_fails = 0
                     improved = True
                     break
 
             if improved:
                 break  # relancer la detection de frontiere
+            if stop_reason in ("candidate_limit", "consecutive_failures"):
+                break
+
+        # Arret dur decide dans la boucle des candidats : ne pas le requalifier.
+        if stop_reason in ("candidate_limit", "consecutive_failures"):
+            if stop_reason == "consecutive_failures":
+                print(f"  Arret anticipe: {consecutive_fails} candidats consecutifs "
+                      f"non ameliorants (plafond {max_consecutive_fails})", flush=True)
+            else:
+                print(f"  Plafond de {max_candidates} candidats atteint", flush=True)
+            break
 
         if not improved:
             print(f"  Convergence atteinte a l'iteration {iteration+1}", flush=True)
+            stop_reason = "convergence"
             break
 
     # ---------- CAS 1 : aucun swap accepte ----------
     # On rend l'etat d'entree tel quel. Les deux appels Matrix finaux ne sont
     # pas emis : ils ne mesureraient que des routes qu'on ne renvoie pas.
+    print(f"Post-processing: cache reseq {swap_stats['swap_resequence_cache_hits']} hits / "
+          f"{swap_stats['swap_resequence_cache_misses']} appels reels, "
+          f"{swap_stats['swap_resequence_cache_hits']} appels Vroom evites "
+          f"| arret: {stop_reason}", flush=True)
+
     if accepted_swaps == 0:
         print(f"Post-processing: aucun echange ameliorant ({total_tested} testes)", flush=True)
         print("Post-processing: aucun swap accepte : routes initiales conservees", flush=True)
-        return entry_routes, entry_metrics
+        return entry_routes, entry_metrics, _finish(stop_reason)
 
     # ---------- CAS 2 : au moins un swap accepte ----------
     print(f"Post-processing: {accepted_swaps} echange(s), {total_tested} appels, "
@@ -1245,7 +1370,7 @@ def post_process_swaps(points, routes_idx, start_idx, end_idx, max_per_vehicle,
         print("Post-processing: durees exactes ORS indisponibles, "
               "garde-fou D-2 sans element de comparaison : "
               "restauration des routes initiales", flush=True)
-        return entry_routes, entry_metrics
+        return entry_routes, entry_metrics, _finish(stop_reason)
 
     if final_duration_s >= entry_duration_s:
         # Egalite incluse : on conserve l'entree. Meme convention que le critere
@@ -1253,12 +1378,12 @@ def post_process_swaps(points, routes_idx, start_idx, end_idx, max_per_vehicle,
         print(f"Post-processing: resultat swaps non meilleur : restauration des "
               f"routes initiales ({final_duration_s:.0f}s >= {entry_duration_s:.0f}s)",
               flush=True)
-        return entry_routes, entry_metrics
+        return entry_routes, entry_metrics, _finish(stop_reason)
 
     print(f"Post-processing: {accepted_swaps} swap(s) accepte(s), duree totale ORS "
           f"{entry_duration_s:.0f}s -> {final_duration_s:.0f}s "
           f"(-{entry_duration_s - final_duration_s:.0f}s)", flush=True)
-    return accepted_routes, final_metrics
+    return accepted_routes, final_metrics, _finish(stop_reason)
 
 
 # =========================
@@ -1543,6 +1668,18 @@ def optimize():
     #   kmeans             -> None, aucun solveur OR-Tools n'a tourne
     #   ortools_haversine  -> constante globale, la surcharge ne l'atteint pas
     #   ortools_ors_matrix -> surcharge si fournie, sinon constante globale
+    # Lot D-3 : plafond de candidats et arret anticipe, surchargeables par
+    # requete. Validation STRICTE avant tout appel reseau : une valeur refusee
+    # ne consomme aucun quota.
+    max_swap_candidates, err = _strict_int_param(data, "max_swap_candidates", 0, 200,
+                                                 SWAP_MAX_CANDIDATES)
+    if err:
+        return jsonify({"error": err}), 400
+    swap_max_consecutive_fails, err = _strict_int_param(data, "swap_max_consecutive_fails",
+                                                        0, 200, SWAP_MAX_CONSECUTIVE_FAILS)
+    if err:
+        return jsonify({"error": err}), 400
+
     ortools_limit_override_applied = (strategy == "ortools_ors_matrix"
                                       and ortools_solution_limit is not None)
     if strategy == "kmeans":
@@ -1593,6 +1730,19 @@ def optimize():
     # Diagnostics de la matrice ORS (strategie ortools_ors_matrix uniquement) :
     # appels reellement consommes, cache touche ou non, cellules nulles.
     matrix_meta = None
+
+    # Statistiques des swaps. Valeurs neutres si post_process_swaps ne tourne
+    # pas (routes absentes ou Vroom en echec) : les champs restent presents.
+    swap_stats = {
+        "max_swap_candidates": max_swap_candidates,
+        "swap_max_consecutive_fails": swap_max_consecutive_fails,
+        "swap_candidates_tested": 0,
+        "swaps_accepted": 0,
+        "swap_resequence_cache_hits": 0,
+        "swap_resequence_cache_misses": 0,
+        "swap_vroom_calls_saved": 0,
+        "swap_stop_reason": None,
+    }
 
     if strategy == "kmeans":
         # 1. VROOM MULTI-VEHICULES (affectation + sequencement sur reseau routier reel)
@@ -1690,9 +1840,11 @@ def optimize():
 
     # 5. POST-PROCESSING : swap des points frontiere
     if routes_idx and vroom_ok:
-        routes_idx, swap_metrics = post_process_swaps(
+        routes_idx, swap_metrics, swap_stats = post_process_swaps(
             points, routes_idx, start_idx, end_idx, max_per_vehicle,
-            entry_metrics=road_metrics
+            entry_metrics=road_metrics,
+            max_candidates=max_swap_candidates,
+            max_consecutive_fails=swap_max_consecutive_fails
         )
         if swap_metrics is not None:
             road_metrics = swap_metrics
@@ -1708,6 +1860,15 @@ def optimize():
             d2_probe["pointsets_changed_by_swaps"] = [
                 set(a) != set(b) for a, b in zip(routes_after_or2opt, routes_idx)
             ]
+
+    else:
+        # Swaps non executes : Vroom indisponible ou aucune route. Sans cette
+        # ligne, swap_stop_reason restait vide et se confondait avec un run
+        # complet sans echange accepte -- c'est exactement ce qui a masque
+        # l'indisponibilite Vroom pendant la campagne D-3.
+        swap_stats["swap_stop_reason"] = "vroom_error"
+        print(f"Post-processing: NON EXECUTE (routes={bool(routes_idx)}, "
+              f"vroom_ok={vroom_ok}, erreur={vroom_error})", flush=True)
 
     print(f"Partition: {optimization_path} (moteur: {partition_engine}) | "
           f"post-traitement: {post_processing} | "
@@ -1733,6 +1894,16 @@ def optimize():
         "ortools_solution_limit": ortools_limit_effective,
         "ortools_solution_limit_requested": ortools_solution_limit,
         "ortools_solution_limit_override_applied": ortools_limit_override_applied,
+
+        # --- lot D-3 : cout et pilotage des swaps ---
+        "max_swap_candidates": swap_stats["max_swap_candidates"],
+        "swap_max_consecutive_fails": swap_stats["swap_max_consecutive_fails"],
+        "swap_candidates_tested": swap_stats["swap_candidates_tested"],
+        "swaps_accepted": swap_stats["swaps_accepted"],
+        "swap_resequence_cache_hits": swap_stats["swap_resequence_cache_hits"],
+        "swap_resequence_cache_misses": swap_stats["swap_resequence_cache_misses"],
+        "swap_vroom_calls_saved": swap_stats["swap_vroom_calls_saved"],
+        "swap_stop_reason": swap_stats["swap_stop_reason"],
         "elapsed_ms": int((time.time() - t_start) * 1000),
         "api_calls": {
             "vroom": _API_STATS["vroom"],
