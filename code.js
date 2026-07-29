@@ -49,7 +49,19 @@ const BENCH_HEADERS_D3 = [
   "ortools_solution_limit_effective", "run_error"
 ];
 
-const BENCH_HEADERS = BENCH_HEADERS_BASE.concat(BENCH_HEADERS_D3);
+// Colonnes du certificat territorial, strictement à la fin.
+const BENCH_HEADERS_TERR = [
+  "territorial_partition", "territorial_method",
+  "territorial_membership_locked", "territorial_side_violations",
+  "territorial_separator_angle_deg", "territorial_separator_margin_m",
+  "territorial_overlap_status", "territorial_candidates_unique",
+  "territorial_candidates_scored", "territorial_fallback_used",
+  "territorial_error"
+];
+
+const BENCH_HEADERS = BENCH_HEADERS_BASE
+  .concat(BENCH_HEADERS_D3)
+  .concat(BENCH_HEADERS_TERR);
 
 
 
@@ -567,7 +579,20 @@ function appendBenchmark(result, params, points, extra) {
     _cell(result.swap_vroom_calls_saved),
     _cell(result.swap_stop_reason),
     _cell(result.ortools_solution_limit),
-    extra.run_error || ""
+    extra.run_error || "",
+
+    // --- certificat territorial ---
+    _cell(result.territorial_partition),
+    _cell(result.territorial_method),
+    _cell(result.territorial_membership_locked),
+    _cell(result.territorial_side_violations),
+    _cell(result.territorial_separator_angle_deg),
+    _cell(result.territorial_separator_margin_m),
+    _cell(result.territorial_overlap_status),
+    _cell(result.territorial_candidates_unique),
+    _cell(result.territorial_candidates_scored),
+    _cell(result.territorial_fallback_used),
+    _cell(result.territorial_error)
   ];
 
   sheet.appendRow(row);
@@ -702,7 +727,20 @@ function buildCartePayload(result, params, points) {
     strategy: result.strategy_used || result.strategy_requested || params.strategy || "",
     points_signature: result.points_signature || "",
     skipped: skipped,
-    routes: routes
+    routes: routes,
+
+    // Certificat territorial, affiché tel quel par la carte. Absent des
+    // stratégies qui ne le produisent pas : la carte masque alors le bloc.
+    territorial: {
+      partition: result.territorial_partition,
+      method: result.territorial_method,
+      locked: result.territorial_membership_locked,
+      violations: result.territorial_side_violations,
+      angle_deg: result.territorial_separator_angle_deg,
+      margin_m: result.territorial_separator_margin_m,
+      status: result.territorial_overlap_status,
+      error: result.territorial_error
+    }
   };
 }
 
