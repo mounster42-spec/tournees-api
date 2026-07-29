@@ -79,7 +79,8 @@ SWAP_MAX_CONSECUTIVE_FAILS = 0     # 0 desactive l'arret anticipe
 
 # Valeurs autorisees de swap_stop_reason.
 SWAP_STOP_REASONS = ("disabled", "candidate_limit", "consecutive_failures",
-                     "convergence", "no_border_points", "vroom_error", "completed")
+                     "convergence", "no_border_points", "vroom_error", "completed",
+                     "territorial_partition_locked")
 
 _API_STATS = {"vroom": 0, "matrix": 0}
 
@@ -120,6 +121,17 @@ def _strict_int_param(data, name, lo, hi, default):
     if not (lo <= raw <= hi):
         return None, f"{name} out of range ({lo}..{hi})"
     return raw, None
+
+
+def _terr_get(matrix_meta, key, default):
+    """Lit un champ du certificat territorial. Les autres strategies ne
+    produisent pas ce bloc : la valeur par defaut s'applique alors."""
+    if not matrix_meta:
+        return default
+    terr = matrix_meta.get("territorial")
+    if not terr:
+        return default
+    return terr.get(key, default)
 
 
 def _points_signature(points):
@@ -913,38 +925,404 @@ def _build_full_matrix_chunked(points, headers):
     return dur_matrix, dist_matrix, meta, None
 
 
+# =========================
+# 4d. PARTITION TERRITORIALE (strategie ortools_ors_matrix)
+# =========================
+# Pourquoi remplacer la partition OR-Tools : _solve_cvrp_ortools minimise le
+# cout d'arc total sous contrainte de capacite. NI l'objectif NI les
+# contraintes n'imposent la moindre contiguite spatiale. Avec un depot commun,
+# deux tournees en rayons entrelaces coutent souvent moins qu'un decoupage en
+# deux blocs compacts : le solveur produit donc legitimement des territoires
+# imbriques. Le probleme n'est pas la resolution, c'est le modele.
+#
+# CERTIFICAT retenu : separabilite lineaire. Deux groupes sont declares separes
+# s'il existe une droite telle que tous les points d'un groupe sont
+# STRICTEMENT d'un cote et tous ceux de l'autre groupe strictement de l'autre.
+# Ce n'est ni une distance entre centroides, ni une penalite de dispersion :
+# c'est une propriete verifiable, recomptee independamment de la construction.
+
+TERRITORIAL_TOP_REFINE = 12       # candidates affinees en phase 2
+TERRITORIAL_MAX_SAMPLES = 6000    # garde-fou sur le nombre d'angles balayes
+
+
+def _finite_coords(p):
+    """Coordonnees exploitables : deux nombres finis dans les bornes terrestres."""
+    try:
+        lat, lon = float(p["lat"]), float(p["lon"])
+    except (TypeError, ValueError, KeyError):
+        return False
+    return (lat == lat and lon == lon                      # ecarte les NaN
+            and -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0
+            and abs(lat) != float("inf") and abs(lon) != float("inf"))
+
+
+def _local_xy(points, indices):
+    """Projette lat/lon en metres dans un plan local equirectangulaire.
+    Suffisant a l'echelle d'une agglomeration, et seule la geometrie RELATIVE
+    compte pour separer deux groupes. Retourne {index_global: (x_m, y_m)}."""
+    if not indices:
+        return {}
+    lat0 = sum(float(points[i]["lat"]) for i in indices) / len(indices)
+    lon0 = sum(float(points[i]["lon"]) for i in indices) / len(indices)
+    kx = 111320.0 * math.cos(math.radians(lat0))
+    return {i: ((float(points[i]["lon"]) - lon0) * kx,
+                (float(points[i]["lat"]) - lat0) * 111320.0)
+            for i in indices}
+
+
+def _critical_angles(xy, indices):
+    """Angles ou l'ordre des projections peut changer.
+
+    En faisant tourner la direction de projection u(theta), l'ordre des points
+    ne peut changer qu'au moment ou deux d'entre eux se projettent au meme
+    endroit, c'est-a-dire quand u est PERPENDICULAIRE au segment qui les joint.
+    Ces angles decoupent [0, pi) en intervalles ou la partition est constante.
+    Deux points confondus ne definissent aucun angle et sont ignores.
+    """
+    crit = set()
+    idx = list(indices)
+    for a in range(len(idx)):
+        xa, ya = xy[idx[a]]
+        for b in range(a + 1, len(idx)):
+            xb, yb = xy[idx[b]]
+            dx, dy = xb - xa, yb - ya
+            if dx == 0.0 and dy == 0.0:
+                continue
+            crit.add(round((math.atan2(dy, dx) + math.pi / 2.0) % math.pi, 10))
+    return sorted(crit)
+
+
+def _sample_angles(crit):
+    """Un angle par intervalle entre deux angles critiques consecutifs.
+
+    Prendre le MILIEU de chaque intervalle atteint chaque ordre de projection
+    distinct au moins une fois : l'enumeration des partitions separables par
+    une droite est donc EXHAUSTIVE, pas heuristique.
+    """
+    if not crit:
+        return [0.0]
+    n = len(crit)
+    out = []
+    for k in range(n):
+        a2 = crit[k + 1] if k + 1 < n else crit[0] + math.pi
+        out.append((crit[k] + a2) / 2.0)
+    return out
+
+
+def _split_by_angle(xy, indices, angle, group_size):
+    """Trie les points par projection sur u(angle) et coupe en deux groupes.
+
+    Retourne (group_a, group_b, margin_m), ou (None, None, 0.0) si la coupure
+    n'est pas STRICTE : une marge nulle signifie que deux points de part et
+    d'autre se projettent au meme endroit, donc qu'aucune droite ne les separe.
+    Le tri est departage par index global, le resultat est donc deterministe.
+    """
+    if group_size <= 0 or group_size >= len(indices):
+        return None, None, 0.0
+    ux, uy = math.cos(angle), math.sin(angle)
+    proj = sorted((xy[i][0] * ux + xy[i][1] * uy, i) for i in indices)
+    margin = proj[group_size][0] - proj[group_size - 1][0]
+    if margin <= 0.0:
+        return None, None, 0.0
+    return ([i for _, i in proj[:group_size]],
+            [i for _, i in proj[group_size:]],
+            margin)
+
+
+def _territorial_certificate(xy, group_a, group_b, angle):
+    """Recompte INDEPENDAMMENT les violations du certificat.
+
+    Ne fait aucune confiance a la construction : reprojette les deux groupes,
+    place la frontiere au milieu de l'intervalle qui les separe et compte les
+    points qui ne sont pas STRICTEMENT du bon cote. Une marge nulle produit
+    donc au moins une violation, comme il se doit.
+    Retourne (violations, margin_m, boundary).
+    """
+    if not group_a or not group_b:
+        return len(group_a) + len(group_b), 0.0, 0.0
+    ux, uy = math.cos(angle), math.sin(angle)
+    pa = [xy[i][0] * ux + xy[i][1] * uy for i in group_a]
+    pb = [xy[i][0] * ux + xy[i][1] * uy for i in group_b]
+    hi_a, lo_b = max(pa), min(pb)
+    boundary = (hi_a + lo_b) / 2.0
+    violations = (sum(1 for v in pa if v >= boundary)
+                  + sum(1 for v in pb if v <= boundary))
+    return violations, lo_b - hi_a, boundary
+
+
+def _partition_key(group_a, group_b):
+    """Cle canonique d'une partition NON ordonnee : le groupe contenant le
+    plus petit index sert de reference. Deux balayages symetriques donnent
+    donc la meme cle et la partition n'est comptee qu'une fois."""
+    ta, tb = tuple(sorted(group_a)), tuple(sorted(group_b))
+    return ta if (ta and tb and ta[0] < tb[0]) else tb
+
+
+def enumerate_territorial_partitions(points, delivery_indices, group_size,
+                                     max_samples=TERRITORIAL_MAX_SAMPLES):
+    """Enumere les partitions separables par une droite, dedupliquees.
+
+    Retourne (candidates, stats). Chaque candidate porte son certificat :
+    {group_a, group_b, angle, margin_m, violations}.
+    Purement geometrique : aucune matrice, aucun appel reseau.
+    """
+    stats = {"generated": 0, "unique": 0, "rejected_margin": 0, "samples": 0}
+    if len(delivery_indices) < 2 or group_size <= 0:
+        return [], stats
+
+    xy = _local_xy(points, delivery_indices)
+    angles = _sample_angles(_critical_angles(xy, delivery_indices))
+    if len(angles) > max_samples:
+        step = len(angles) / float(max_samples)
+        angles = [angles[int(k * step)] for k in range(max_samples)]
+    stats["samples"] = len(angles)
+
+    seen = {}
+    for ang in angles:
+        ga, gb, margin = _split_by_angle(xy, delivery_indices, ang, group_size)
+        stats["generated"] += 1
+        if ga is None:
+            stats["rejected_margin"] += 1
+            continue
+        viol, cert_margin, _ = _territorial_certificate(xy, ga, gb, ang)
+        if viol != 0 or cert_margin <= 0.0:
+            stats["rejected_margin"] += 1
+            continue
+        key = _partition_key(ga, gb)
+        # A cle egale, on garde la plus grande marge : la separation la plus nette.
+        if key not in seen or cert_margin > seen[key]["margin_m"]:
+            seen[key] = {"group_a": ga, "group_b": gb, "angle": ang,
+                         "margin_m": cert_margin, "violations": viol}
+
+    # Ordre stable, independant de l'ordre d'insertion du dictionnaire.
+    candidates = sorted(seen.values(), key=lambda c: (_partition_key(c["group_a"], c["group_b"]),))
+    stats["unique"] = len(candidates)
+    return candidates, stats
+
+
+def _nn_route_matrix(matrix, group, start_idx, end_idx):
+    """Nearest-neighbour sur la matrice, en index GLOBAUX.
+    La cle de comparaison inclut l'index : les egalites sont departagees de
+    facon stable et le resultat ne depend pas de l'ordre d'iteration."""
+    remaining = list(group)
+    route = [start_idx]
+    cur = start_idx
+    while remaining:
+        nxt = min(remaining, key=lambda j: (matrix[cur][j], j))
+        route.append(nxt)
+        remaining.remove(nxt)
+        cur = nxt
+    route.append(end_idx)
+    return route
+
+
+def _estimate_group_cost(matrix, group, start_idx, end_idx, refine):
+    """Cout estime d'un groupe sur la matrice fournie, en index globaux.
+    Nearest-neighbour puis, si refine, Or-opt et 2-opt matriciels — les memes
+    que ceux du pipeline. Local et deterministe, aucun appel reseau."""
+    if not group:
+        return 0.0, [start_idx, end_idx]
+    route = _nn_route_matrix(matrix, group, start_idx, end_idx)
+    if refine:
+        route = _or_opt_matrix(matrix, route)
+        route = _two_opt_matrix(matrix, route)
+    return _matrix_route_cost(matrix, route), route
+
+
+def select_territorial_partition(candidates, dur_matrix, dist_matrix,
+                                 start_idx, end_idx,
+                                 top_refine=TERRITORIAL_TOP_REFINE):
+    """Choisit la meilleure partition territoriale.
+
+    Ordre lexicographique impose : violations, puis DUREE ORS totale, puis
+    distance ORS totale, puis cle canonique. Aucun terme d'equilibrage n'entre
+    dans le cout : une tournee peut etre bien plus longue que l'autre.
+
+    Deux etages pour tenir le temps de calcul : estimation rapide de toutes
+    les candidates, puis affinage des meilleures seulement.
+    """
+    stats = {"scored": 0, "refined": 0}
+    if not candidates:
+        return None, stats
+
+    rough = []
+    for c in candidates:
+        da, _ = _estimate_group_cost(dur_matrix, c["group_a"], start_idx, end_idx, False)
+        db, _ = _estimate_group_cost(dur_matrix, c["group_b"], start_idx, end_idx, False)
+        rough.append((da + db, c))
+        stats["scored"] += 1
+
+    rough.sort(key=lambda t: (t[0], _partition_key(t[1]["group_a"], t[1]["group_b"])))
+
+    best = None
+    for _, c in rough[:max(1, top_refine)]:
+        da, _ = _estimate_group_cost(dur_matrix, c["group_a"], start_idx, end_idx, True)
+        db, _ = _estimate_group_cost(dur_matrix, c["group_b"], start_idx, end_idx, True)
+        dur_total = da + db
+        if dist_matrix:
+            ka, _ = _estimate_group_cost(dist_matrix, c["group_a"], start_idx, end_idx, False)
+            kb, _ = _estimate_group_cost(dist_matrix, c["group_b"], start_idx, end_idx, False)
+            dist_total = ka + kb
+        else:
+            dist_total = 0.0
+        stats["refined"] += 1
+
+        key = (c["violations"], dur_total, dist_total,
+               _partition_key(c["group_a"], c["group_b"]))
+        if best is None or key < best[0]:
+            best = (key, c, dur_total, dist_total)
+
+    chosen = dict(best[1])
+    chosen["est_duration_s"] = best[2]
+    chosen["est_distance_m"] = best[3]
+    return chosen, stats
+
+
 def ortools_partition_ors_matrix(points, num_vehicles, max_per_vehicle,
                                  start_idx, end_idx, headers,
                                  solution_limit=None):
-    """Affectation OR-Tools sur les DUREES routieres reelles ORS.
-    Le cout du solveur est la duree, pas la distance : c'est l'objectif de Vroom
-    et celui des metriques finales. Retourne (groups, err, meta)."""
-    meta = {}
+    """Partition TERRITORIALE sur les durees routieres reelles ORS.
+
+    Priorites, dans cet ordre strict : deux territoires separables par une
+    droite, exactement group_size points par tournee, aucune perte ni doublon,
+    puis duree ORS totale minimale. Aucun objectif d'equilibrage.
+
+    Retourne (groups, err, meta). meta porte le certificat territorial.
+    """
+    t0 = time.time()
+    meta = {"territorial": {
+        "territorial_partition": False,
+        "territorial_method": "sweep_line_projection",
+        "territorial_membership_locked": False,
+        "territorial_candidates_generated": 0,
+        "territorial_candidates_unique": 0,
+        "territorial_candidates_scored": 0,
+        "territorial_side_violations": None,
+        "territorial_separator_angle_deg": None,
+        "territorial_separator_margin_m": None,
+        "territorial_overlap_status": "unknown",
+        "territorial_fallback_used": False,
+        "territorial_error": "",
+        "territorial_enum_ms": 0,
+        "territorial_score_ms": 0,
+    }}
+    terr = meta["territorial"]
+
     depot_indices = {start_idx, end_idx}
     delivery_indices = [i for i in range(len(points)) if i not in depot_indices]
 
     if not delivery_indices:
+        terr["territorial_overlap_status"] = "no_points"
         return [[] for _ in range(num_vehicles)], None, meta
 
-    if num_vehicles * max_per_vehicle < len(delivery_indices):
-        return None, (f"capacity too small: {num_vehicles} x {max_per_vehicle} "
-                      f"< {len(delivery_indices)} points"), meta
+    if num_vehicles != 2:
+        terr["territorial_error"] = (f"territorial partition requires 2 vehicles, "
+                                     f"got {num_vehicles}")
+        terr["territorial_overlap_status"] = "not_applicable"
+        return None, terr["territorial_error"], meta
 
-    print(f"OR-Tools matrice ORS: {len(delivery_indices)} points, {num_vehicles} vehicules, "
+    n = len(delivery_indices)
+    if num_vehicles * max_per_vehicle < n:
+        terr["territorial_error"] = (f"capacity too small: {num_vehicles} x "
+                                     f"{max_per_vehicle} < {n} points")
+        return None, terr["territorial_error"], meta
+
+    # Coordonnees inexploitables : on refuse plutot que de partitionner a l'aveugle.
+    bad = [points[i].get("id", i) for i in delivery_indices
+           if not _finite_coords(points[i])]
+    if bad:
+        terr["territorial_error"] = (f"{len(bad)} point(s) with invalid coordinates: "
+                                     f"{bad[:5]}")
+        terr["territorial_overlap_status"] = "invalid_coordinates"
+        return None, terr["territorial_error"], meta
+
+    # Repartition la plus egale que la capacite autorise. Pour 60 points, 30/30.
+    group_size = n // 2
+    if group_size > max_per_vehicle or (n - group_size) > max_per_vehicle:
+        terr["territorial_error"] = (f"cannot split {n} points into two groups "
+                                     f"under capacity {max_per_vehicle}")
+        return None, terr["territorial_error"], meta
+
+    print(f"Partition territoriale: {n} points -> {group_size}/{n - group_size}, "
           f"capacite {max_per_vehicle}", flush=True)
 
-    dur_matrix, dist_matrix, meta, err = _build_full_matrix_chunked(points, headers)
+    dur_matrix, dist_matrix, mmeta, err = _build_full_matrix_chunked(points, headers)
+    meta.update(mmeta)
+    meta["territorial"] = terr
     if dur_matrix is None:
-        return None, f"ORS matrix failed: {err}", meta
+        terr["territorial_error"] = f"ORS matrix failed: {err}"
+        return None, terr["territorial_error"], meta
 
-    groups, err = _solve_cvrp_ortools(
-        dur_matrix, num_vehicles, max_per_vehicle, start_idx, end_idx,
-        solution_limit=solution_limit
-    )
-    if groups is None:
-        return None, err, meta
+    t_enum = time.time()
+    candidates, cstats = enumerate_territorial_partitions(
+        points, delivery_indices, group_size)
+    terr["territorial_enum_ms"] = int((time.time() - t_enum) * 1000)
+    terr["territorial_candidates_generated"] = cstats["generated"]
+    terr["territorial_candidates_unique"] = cstats["unique"]
 
-    print(f"  Partition: {[len(g) for g in groups]} pts", flush=True)
+    print(f"  {cstats['samples']} angles balayes, {cstats['generated']} coupures, "
+          f"{cstats['unique']} partitions uniques certifiees "
+          f"({cstats['rejected_margin']} rejetees pour marge nulle) "
+          f"en {terr['territorial_enum_ms']}ms", flush=True)
+
+    if not candidates:
+        # Aucune separation stricte : on NE retombe PAS sur l'ancienne partition
+        # imbriquee, on echoue de facon explicite et diagnostiquee.
+        terr["territorial_error"] = ("no strictly separating line found for "
+                                     f"{group_size}/{n - group_size}")
+        terr["territorial_overlap_status"] = "no_separator"
+        return None, terr["territorial_error"], meta
+
+    t_score = time.time()
+    chosen, sstats = select_territorial_partition(
+        candidates, dur_matrix, dist_matrix, start_idx, end_idx)
+    terr["territorial_score_ms"] = int((time.time() - t_score) * 1000)
+    terr["territorial_candidates_scored"] = sstats["scored"]
+
+    if chosen is None:
+        terr["territorial_error"] = "no candidate could be scored"
+        terr["territorial_overlap_status"] = "scoring_failed"
+        return None, terr["territorial_error"], meta
+
+    groups = [chosen["group_a"], chosen["group_b"]]
+
+    # Verification finale, independante de la construction ET de la selection.
+    xy = _local_xy(points, delivery_indices)
+    viol, margin, _ = _territorial_certificate(
+        xy, chosen["group_a"], chosen["group_b"], chosen["angle"])
+
+    union = set(chosen["group_a"]) | set(chosen["group_b"])
+    inter = set(chosen["group_a"]) & set(chosen["group_b"])
+    sizes_ok = (len(chosen["group_a"]) == group_size
+                and len(chosen["group_b"]) == n - group_size)
+    complete = (union == set(delivery_indices)) and not inter
+
+    if viol != 0 or margin <= 0.0 or not sizes_ok or not complete:
+        terr["territorial_side_violations"] = viol
+        terr["territorial_separator_margin_m"] = round(margin, 2)
+        terr["territorial_overlap_status"] = "overlapping"
+        terr["territorial_error"] = (
+            f"final check failed: violations={viol}, margin={margin:.2f}m, "
+            f"sizes_ok={sizes_ok}, complete={complete}")
+        return None, terr["territorial_error"], meta
+
+    terr["territorial_partition"] = True
+    terr["territorial_membership_locked"] = True
+    terr["territorial_side_violations"] = 0
+    terr["territorial_separator_angle_deg"] = round(math.degrees(chosen["angle"]) % 180.0, 3)
+    terr["territorial_separator_margin_m"] = round(margin, 2)
+    terr["territorial_overlap_status"] = "separated"
+    terr["territorial_fallback_used"] = False
+    terr["territorial_est_duration_min"] = round(chosen["est_duration_s"] / 60.0, 1)
+
+    print(f"  Retenue: {[len(g) for g in groups]} pts, angle "
+          f"{terr['territorial_separator_angle_deg']}deg, marge "
+          f"{terr['territorial_separator_margin_m']}m, violations 0, "
+          f"duree estimee {terr['territorial_est_duration_min']}min "
+          f"({sstats['refined']} affinees en {terr['territorial_score_ms']}ms)", flush=True)
+    print(f"  Partition: {[len(g) for g in groups]} pts "
+          f"(total {int((time.time() - t0) * 1000)}ms)", flush=True)
+
     return groups, None, meta
 
 
@@ -1731,6 +2109,11 @@ def optimize():
     # appels reellement consommes, cache touche ou non, cellules nulles.
     matrix_meta = None
 
+    # Appartenance verrouillee : positionne par la partition territoriale.
+    # Les swaps inter-tournees ne sont alors PAS lances, y compris leurs deux
+    # appels Vroom de notation : on evite le cout au lieu de rejeter a la fin.
+    membership_locked = False
+
     # Statistiques des swaps. Valeurs neutres si post_process_swaps ne tourne
     # pas (routes absentes ou Vroom en echec) : les champs restent presents.
     swap_stats = {
@@ -1779,6 +2162,11 @@ def optimize():
                 points, num_vehicles, max_per_vehicle, start_idx, end_idx, headers,
                 solution_limit=ortools_solution_limit
             )
+            # La partition territoriale est un CONTRAT : Vroom et Or-opt peuvent
+            # reordonner chaque tournee, aucun point ne change de vehicule.
+            terr_diag = (matrix_meta or {}).get("territorial") or {}
+            if terr_diag.get("territorial_membership_locked"):
+                membership_locked = True
         else:
             groups, part_err = None, f"no partition function for '{strategy}'"
 
@@ -1839,7 +2227,14 @@ def optimize():
         }
 
     # 5. POST-PROCESSING : swap des points frontiere
-    if routes_idx and vroom_ok:
+    if routes_idx and vroom_ok and membership_locked:
+        # Aucun appel : les swaps deplacent des points entre tournees, ce que la
+        # partition territoriale interdit par construction.
+        swap_stats["swap_stop_reason"] = "territorial_partition_locked"
+        print("Post-processing: swaps non lances, appartenance territoriale "
+              "verrouillee", flush=True)
+
+    elif routes_idx and vroom_ok:
         routes_idx, swap_metrics, swap_stats = post_process_swaps(
             points, routes_idx, start_idx, end_idx, max_per_vehicle,
             entry_metrics=road_metrics,
@@ -1904,6 +2299,22 @@ def optimize():
         "swap_resequence_cache_misses": swap_stats["swap_resequence_cache_misses"],
         "swap_vroom_calls_saved": swap_stats["swap_vroom_calls_saved"],
         "swap_stop_reason": swap_stats["swap_stop_reason"],
+
+        # --- certificat territorial (ortools_ors_matrix) ---
+        "territorial_partition": _terr_get(matrix_meta, "territorial_partition", False),
+        "territorial_method": _terr_get(matrix_meta, "territorial_method", None),
+        "territorial_membership_locked": membership_locked,
+        "territorial_candidates_generated": _terr_get(matrix_meta, "territorial_candidates_generated", 0),
+        "territorial_candidates_unique": _terr_get(matrix_meta, "territorial_candidates_unique", 0),
+        "territorial_candidates_scored": _terr_get(matrix_meta, "territorial_candidates_scored", 0),
+        "territorial_side_violations": _terr_get(matrix_meta, "territorial_side_violations", None),
+        "territorial_separator_angle_deg": _terr_get(matrix_meta, "territorial_separator_angle_deg", None),
+        "territorial_separator_margin_m": _terr_get(matrix_meta, "territorial_separator_margin_m", None),
+        "territorial_overlap_status": _terr_get(matrix_meta, "territorial_overlap_status", None),
+        "territorial_fallback_used": _terr_get(matrix_meta, "territorial_fallback_used", False),
+        "territorial_error": _terr_get(matrix_meta, "territorial_error", ""),
+        "territorial_enum_ms": _terr_get(matrix_meta, "territorial_enum_ms", None),
+        "territorial_score_ms": _terr_get(matrix_meta, "territorial_score_ms", None),
         "elapsed_ms": int((time.time() - t_start) * 1000),
         "api_calls": {
             "vroom": _API_STATS["vroom"],

@@ -35,6 +35,8 @@
   .toggles label{margin-right:12px;cursor:pointer;white-space:nowrap}
   .toggles button{font-size:12px;padding:3px 9px;cursor:pointer}
   .warn{color:#b00;font-size:12px}
+  .alert{color:#fff;background:#c0392b;padding:6px 8px;border-radius:3px;
+         font-size:12px;margin-bottom:4px}
   .meta{color:#666;font-size:11px}
 
   /* Marqueurs : pastille ronde portant le rang de passage. */
@@ -56,6 +58,7 @@
     <div class="block" id="summary"></div>
     <div class="block" id="legend"></div>
     <div class="block toggles" id="toggles"></div>
+    <div class="block" id="territorial"></div>
   </div>
 
   <div id="empty"></div>
@@ -364,6 +367,50 @@ function buildLegend(){
 }
 
 
+/* ---------- certificat territorial ---------- */
+
+function buildTerritorial(payload){
+  var host = document.getElementById("territorial");
+  var t = payload.territorial;
+
+  // Stratégie sans certificat : on ne montre rien plutôt qu'un bloc vide.
+  if (!t || (t.partition === undefined && t.status === undefined
+             && t.violations === undefined)){
+    host.innerHTML = "";
+    return;
+  }
+
+  var separated = (t.status === "separated");
+  var html = "<h2>Territoires</h2>";
+
+  if (separated){
+    html += "<b style='color:#1e8449'>Territoires séparés : oui</b><br>";
+  } else {
+    html += "<div class='alert'><b>Territoires séparés : NON</b><br>"
+          + "statut : " + esc(t.status || "inconnu")
+          + (t.error ? "<br>" + esc(t.error) : "")
+          + "</div>";
+  }
+
+  if (t.method)                     html += "Méthode : " + esc(t.method) + "<br>";
+  if (t.violations !== null && t.violations !== undefined)
+                                    html += "Violations : <b>" + esc(t.violations) + "</b><br>";
+  if (t.margin_m !== null && t.margin_m !== undefined)
+                                    html += "Marge : " + fmt(t.margin_m, 0, "m") + "<br>";
+  if (t.angle_deg !== null && t.angle_deg !== undefined)
+                                    html += "Angle séparateur : " + fmt(t.angle_deg, 1, "&deg;") + "<br>";
+  if (t.locked)                     html += "<b>Appartenance verrouillée</b><br>";
+
+  // La frontière n'est PAS dessinée : les segments affichés ne suivent pas la
+  // voirie, tracer une droite par-dessus laisserait croire à une limite de
+  // terrain. Le certificat chiffré fait foi.
+  html += "<small>La frontière n'est pas tracée : les segments sont indicatifs "
+        + "et leurs croisements ne prouvent aucun chevauchement.</small>";
+
+  host.innerHTML = html;
+}
+
+
 /* ---------- cases à cocher ---------- */
 
 function buildToggles(){
@@ -427,6 +474,7 @@ function renderCarte(payload){
   buildSummary(payload);
   buildLegend();
   buildToggles();
+  buildTerritorial(payload);
 
   // invalidateSize AVANT le cadrage : le conteneur vient d'être affiché et
   // Leaflet peut encore en connaître une taille périmée. Avec une mauvaise
