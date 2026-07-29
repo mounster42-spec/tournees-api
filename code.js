@@ -29,13 +29,42 @@ const STRATEGY_LABELS = {
 };
 
 const BENCH_SHEET = "Benchmark";
-const BENCH_HEADERS = [
+
+// Colonnes historiques : ordre et libellés figés, ne jamais déplacer ni renommer.
+const BENCH_HEADERS_BASE = [
   "Date", "Stratégie exécutée", "Stratégie demandée", "Nb pts", "Signature jeu", "Nb véh",
   "Km T1", "Km T2", "Km total",
   "Min T1", "Min T2", "Min total",
   "Temps calcul (s)", "Appels API", "Vroom", "Matrix",
   "optimization_path", "Répartition"
 ];
+
+// Colonnes ajoutées par le lot D-3, strictement à la fin.
+const BENCH_HEADERS_D3 = [
+  "d3_label",
+  "max_swap_candidates", "swap_max_consecutive_fails",
+  "swap_candidates_tested", "swaps_accepted",
+  "swap_resequence_cache_hits", "swap_resequence_cache_misses",
+  "swap_vroom_calls_saved", "swap_stop_reason",
+  "ortools_solution_limit_effective", "run_error"
+];
+
+const BENCH_HEADERS = BENCH_HEADERS_BASE.concat(BENCH_HEADERS_D3);
+
+
+// --- Campagne D-3 : trois configurations, un seul clic ---
+const D3_STRATEGY = "ortools_ors_matrix";
+const D3_SOLUTION_LIMIT = 75;
+
+const D3_RUNS = [
+  { label: "D3_CACHE_ONLY",      max_swap_candidates: 50, swap_max_consecutive_fails: 0  },
+  { label: "D3_EARLY_STOP_12",   max_swap_candidates: 50, swap_max_consecutive_fails: 12 },
+  { label: "D3_SWAPS_DISABLED",  max_swap_candidates: 0,  swap_max_consecutive_fails: 0  }
+];
+
+// Apps Script coupe une exécution de menu à 6 minutes. On s'arrête avant
+// plutôt que de se faire interrompre au milieu d'un run.
+const D3_DEADLINE_MS = 5 * 60 * 1000;
 
 
 function setupSheets() {
@@ -214,7 +243,11 @@ function getPoints() {
 // =========================
 // APPEL API
 // =========================
-function callAPI(points, params) {
+/**
+ * @param {Object=} extraPayload  Champs additionnels fusionnés dans le corps.
+ *                                Absent -> comportement historique inchangé.
+ */
+function callAPI(points, params, extraPayload) {
 
   const url = API_BASE + "/optimize";
 
@@ -226,6 +259,14 @@ function callAPI(points, params) {
     end_id: params.end_id,
     strategy: params.strategy
   };
+
+  if (extraPayload) {
+    for (var k in extraPayload) {
+      if (Object.prototype.hasOwnProperty.call(extraPayload, k)) {
+        payload[k] = extraPayload[k];
+      }
+    }
+  }
 
   // Réveil du serveur (Render free tier s'endort, peut prendre 30-60s)
   for (var attempt = 0; attempt < 6; attempt++) {
@@ -445,16 +486,26 @@ function _num(v) {
 
 
 /**
- * Ajoute une ligne à la feuille "Benchmark". Ne nettoie jamais, ne réécrit
- * jamais les lignes précédentes : c'est l'historique de comparaison.
+ * Crée la feuille Benchmark si besoin, et complète l'en-tête des feuilles
+ * antérieures au lot D-3 en n'écrivant QUE les colonnes manquantes, à la fin.
+ * Aucune colonne existante n'est déplacée, renommée ni effacée.
  */
-function appendBenchmark(result, params, points) {
+function ensureBenchmarkSheet() {
 
   const ss = SpreadsheetApp.getActive();
   let sheet = ss.getSheetByName(BENCH_SHEET);
 
+  // Une feuille Apps Script naît avec 26 colonnes ; l'en-tête en compte 29
+  // depuis le lot D-3. Sans cet élargissement, getRange et appendRow lèveraient
+  // « out of bounds ».
+  const widen = function (sh) {
+    const missing = BENCH_HEADERS.length - sh.getMaxColumns();
+    if (missing > 0) sh.insertColumnsAfter(sh.getMaxColumns(), missing);
+  };
+
   if (!sheet) {
     sheet = ss.insertSheet(BENCH_SHEET);
+    widen(sheet);
     sheet.getRange(1, 1, 1, BENCH_HEADERS.length).setValues([BENCH_HEADERS]);
     sheet.getRange(1, 1, 1, BENCH_HEADERS.length)
       .setBackground("#434343").setFontColor("#ffffff").setFontWeight("bold");
@@ -463,7 +514,40 @@ function appendBenchmark(result, params, points) {
     sheet.setColumnWidth(2, 150);   // Stratégie exécutée
     sheet.setColumnWidth(3, 150);   // Stratégie demandée
     sheet.setColumnWidth(17, 240);  // optimization_path
+    return sheet;
   }
+
+  // Migration : la feuille existe avec les 18 colonnes historiques.
+  widen(sheet);
+  const existing = sheet.getRange(1, 1, 1, BENCH_HEADERS.length).getValues()[0];
+  const missing = [];
+  for (var i = 0; i < BENCH_HEADERS.length; i++) {
+    if (String(existing[i] || "").trim() === "") missing.push(i);
+  }
+  if (missing.length) {
+    const first = missing[0];
+    const tail = BENCH_HEADERS.slice(first);
+    sheet.getRange(1, first + 1, 1, tail.length).setValues([tail]);
+    sheet.getRange(1, first + 1, 1, tail.length)
+      .setBackground("#434343").setFontColor("#ffffff").setFontWeight("bold");
+  }
+  return sheet;
+}
+
+
+/**
+ * Ajoute une ligne à la feuille "Benchmark". Ne nettoie jamais, ne réécrit
+ * jamais les lignes précédentes : c'est l'historique de comparaison.
+ *
+ * @param {Object=} extra  {d3_label, run_error} pour les runs de campagne.
+ *                         Absent -> ces deux cellules restent vides, les
+ *                         optimisations normales fonctionnent à l'identique.
+ */
+function appendBenchmark(result, params, points, extra) {
+
+  const sheet = ensureBenchmarkSheet();
+  extra = extra || {};
+  result = result || {};
 
   const km1 = _num(result.tournee_1_km);
   const km2 = _num(result.tournee_2_km);
@@ -476,7 +560,9 @@ function appendBenchmark(result, params, points) {
   const calls = result.api_calls || {};
   const sizes = result.partition_sizes || [];
 
-  sheet.appendRow([
+  // Les champs D-3 sont absents des réponses d'un backend antérieur :
+  // _cell() rend "" plutôt que de lever, les runs normaux restent valides.
+  const row = [
     new Date(),
     // strategy_used = ce qui a RÉELLEMENT tourné. Un écart avec la colonne
     // suivante signale un repli et invalide la ligne comme point de comparaison.
@@ -492,8 +578,29 @@ function appendBenchmark(result, params, points) {
     calls.vroom  != null ? calls.vroom  : "",
     calls.matrix != null ? calls.matrix : "",
     result.optimization_path || "",
-    sizes.join(" / ")
-  ]);
+    sizes.join(" / "),
+
+    // --- colonnes D-3 ---
+    extra.d3_label || "",
+    _cell(result.max_swap_candidates),
+    _cell(result.swap_max_consecutive_fails),
+    _cell(result.swap_candidates_tested),
+    _cell(result.swaps_accepted),
+    _cell(result.swap_resequence_cache_hits),
+    _cell(result.swap_resequence_cache_misses),
+    _cell(result.swap_vroom_calls_saved),
+    _cell(result.swap_stop_reason),
+    _cell(result.ortools_solution_limit),
+    extra.run_error || ""
+  ];
+
+  sheet.appendRow(row);
+}
+
+
+/** Rend "" pour null/undefined, la valeur sinon. Ne lève jamais. */
+function _cell(v) {
+  return (v === null || v === undefined) ? "" : v;
 }
 
 
@@ -553,6 +660,162 @@ function runOrtoolsOrsMatrix() { runOptimisation("ortools_ors_matrix"); }
 
 
 // =========================
+// CAMPAGNE D-3
+// =========================
+/**
+ * Lance les trois configurations de validation D-3 en une seule action.
+ *
+ * Les trois requêtes partent d'un UNIQUE snapshot de points lu au début :
+ * une case décochée en cours de campagne ne peut donc pas fausser la
+ * comparaison. Les requêtes sont strictement séquentielles — jamais
+ * fetchAll, jamais de parallélisme — chacune consommant du quota ORS et
+ * devant être mesurée isolément.
+ *
+ * N'est jamais déclenchée automatiquement : uniquement depuis le menu.
+ */
+function lancerCampagneD3() {
+
+  const ss = SpreadsheetApp.getActive();
+  ensureStrategyCell();
+
+  const params = getParams();
+  params.strategy = D3_STRATEGY;
+
+  // Snapshot unique, lu une seule fois pour les trois runs.
+  const points = getPoints();
+  if (points.length === 0) {
+    ss.toast("Aucun point sélectionné !", "Campagne D-3", 5);
+    return;
+  }
+
+  const started = Date.now();
+  const results = [];
+  let reference_signature = null;
+  let aborted = null;
+
+  for (var i = 0; i < D3_RUNS.length; i++) {
+    const cfg = D3_RUNS[i];
+
+    if (Date.now() - started > D3_DEADLINE_MS) {
+      aborted = "Limite de 6 minutes d'Apps Script approchée : runs restants annulés.";
+      results.push({ label: cfg.label, error: "non exécuté — " + aborted });
+      appendBenchmark({}, params, points, { d3_label: cfg.label, run_error: aborted });
+      continue;
+    }
+
+    ss.toast("Run " + (i + 1) + "/" + D3_RUNS.length + " : " + cfg.label,
+             "Campagne D-3", 30);
+
+    var result = null;
+    var errMsg = "";
+
+    try {
+      result = callAPI(points, params, {
+        ortools_solution_limit: D3_SOLUTION_LIMIT,
+        max_swap_candidates: cfg.max_swap_candidates,
+        swap_max_consecutive_fails: cfg.swap_max_consecutive_fails
+      });
+      if (result && result.error) {
+        errMsg = String(result.error);
+        result = null;
+      }
+    } catch (e) {
+      errMsg = String(e && e.message ? e.message : e);
+    }
+
+    if (!result) {
+      // Échec isolé : enregistré sans être masqué, on poursuit avec le suivant.
+      results.push({ label: cfg.label, error: errMsg });
+      appendBenchmark({}, params, points, { d3_label: cfg.label, run_error: errMsg });
+      continue;
+    }
+
+    // Contrôle d'identité du jeu de points : sans lui la comparaison est nulle.
+    const sig = result.points_signature || "";
+    if (reference_signature === null) {
+      reference_signature = sig;
+    } else if (sig !== reference_signature) {
+      const msg = "Signature différente (" + sig + " au lieu de "
+                + reference_signature + ") : campagne interrompue.";
+      results.push({ label: cfg.label, error: msg });
+      appendBenchmark(result, params, points, { d3_label: cfg.label, run_error: msg });
+      aborted = msg;
+      break;
+    }
+
+    appendBenchmark(result, params, points, { d3_label: cfg.label, run_error: "" });
+    results.push({ label: cfg.label, result: result });
+  }
+
+  _afficherResumeD3(results, reference_signature, aborted);
+}
+
+
+function _afficherResumeD3(results, signature, aborted) {
+
+  const esc = function (v) {
+    return String(v === null || v === undefined ? "" : v)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  };
+
+  var html = ""
+    + "<style>"
+    + "body{font-family:Arial,sans-serif;font-size:13px;margin:12px}"
+    + "table{border-collapse:collapse;width:100%}"
+    + "th,td{border:1px solid #ccc;padding:5px 7px;text-align:right;white-space:nowrap}"
+    + "th{background:#434343;color:#fff;text-align:center}"
+    + "td.l{text-align:left}"
+    + ".err{color:#b00;text-align:left}"
+    + ".warn{background:#fff4e5;border:1px solid #e0a800;padding:8px;margin-bottom:10px}"
+    + "</style>";
+
+  if (aborted) {
+    html += '<div class="warn"><b>Campagne interrompue.</b><br>' + esc(aborted) + "</div>";
+  }
+  html += "<p>Signature du jeu : <b>" + esc(signature || "n/a") + "</b></p>";
+
+  html += "<table><tr>"
+    + "<th>Label</th><th>Km tot.</th><th>Min tot.</th><th>Calcul (s)</th>"
+    + "<th>Candidats</th><th>Swaps</th><th>Cache hits</th><th>Vroom</th>"
+    + "<th>Stop</th><th>Erreur</th></tr>";
+
+  for (var i = 0; i < results.length; i++) {
+    const r = results[i];
+
+    if (r.error) {
+      html += "<tr><td class='l'>" + esc(r.label) + "</td>"
+            + "<td colspan='8'></td>"
+            + "<td class='err'>" + esc(r.error) + "</td></tr>";
+      continue;
+    }
+
+    const b = r.result;
+    const km1 = _num(b.tournee_1_km), km2 = _num(b.tournee_2_km);
+    const mn1 = _num(b.tournee_1_min), mn2 = _num(b.tournee_2_min);
+    const kmT = (km1 !== "" && km2 !== "") ? Math.round((km1 + km2) * 100) / 100 : "";
+    const mnT = (mn1 !== "" && mn2 !== "") ? Math.round((mn1 + mn2) * 10) / 10 : "";
+    const calls = b.api_calls || {};
+
+    html += "<tr>"
+      + "<td class='l'>" + esc(r.label) + "</td>"
+      + "<td>" + esc(kmT) + "</td>"
+      + "<td>" + esc(mnT) + "</td>"
+      + "<td>" + esc(b.elapsed_ms != null ? Math.round(b.elapsed_ms / 100) / 10 : "") + "</td>"
+      + "<td>" + esc(b.swap_candidates_tested) + "</td>"
+      + "<td>" + esc(b.swaps_accepted) + "</td>"
+      + "<td>" + esc(b.swap_resequence_cache_hits) + "</td>"
+      + "<td>" + esc(calls.vroom) + "</td>"
+      + "<td class='l'>" + esc(b.swap_stop_reason) + "</td>"
+      + "<td></td></tr>";
+  }
+  html += "</table>";
+
+  const out = HtmlService.createHtmlOutput(html).setWidth(900).setHeight(340);
+  SpreadsheetApp.getUi().showModalDialog(out, "Campagne D-3 — résumé");
+}
+
+
+// =========================
 // MENU PERSONNALISÉ
 // =========================
 function onOpen() {
@@ -565,6 +828,8 @@ function onOpen() {
         .addItem("OR-Tools Haversine", "runOrtoolsHaversine")
         .addItem("OR-Tools ORS Matrix", "runOrtoolsOrsMatrix")
     )
+    .addSeparator()
+    .addItem("Campagne D-3 swaps", "lancerCampagneD3")
     .addSeparator()
     .addItem("Effacer tournées", "clearResults")
     .addItem("Réinitialiser la sélection", "resetSelection")
