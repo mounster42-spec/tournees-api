@@ -47,11 +47,13 @@ ORS_MATRIX_URL = "https://api.heigit.org/openrouteservice/v2/matrix/driving-car"
 # =========================
 # 2b. INSTRUMENTATION (compteur d'appels API + strategies)
 # =========================
-VALID_STRATEGIES = ("kmeans", "ortools_haversine", "ortools_ors_matrix")
+VALID_STRATEGIES = ("kmeans", "ortools_haversine", "ortools_ors_matrix",
+                    "ortools_ors_matrix_connected")
 IMPLEMENTED_STRATEGIES = {"kmeans"}
 if ORTOOLS_AVAILABLE:
     IMPLEMENTED_STRATEGIES.add("ortools_haversine")
     IMPLEMENTED_STRATEGIES.add("ortools_ors_matrix")
+    IMPLEMENTED_STRATEGIES.add("ortools_ors_matrix_connected")
 
 # Matrice ORS complete (strategie ortools_ors_matrix).
 # 62 x 62 = 3844 routes depasse le plafond free tier : on decoupe par blocs
@@ -80,7 +82,7 @@ SWAP_MAX_CONSECUTIVE_FAILS = 0     # 0 desactive l'arret anticipe
 # Valeurs autorisees de swap_stop_reason.
 SWAP_STOP_REASONS = ("disabled", "candidate_limit", "consecutive_failures",
                      "convergence", "no_border_points", "vroom_error", "completed",
-                     "territorial_partition_locked")
+                     "territorial_partition_locked", "connected_partition_locked")
 
 _API_STATS = {"vroom": 0, "matrix": 0}
 
@@ -132,6 +134,17 @@ def _terr_get(matrix_meta, key, default):
     if not terr:
         return default
     return terr.get(key, default)
+
+
+def _conn_get(matrix_meta, key, default):
+    """Lit un champ du certificat de connexite. Les autres strategies ne
+    produisent pas ce bloc : la valeur par defaut s'applique alors."""
+    if not matrix_meta:
+        return default
+    conn = matrix_meta.get("connected")
+    if not conn:
+        return default
+    return conn.get(key, default)
 
 
 def _points_signature(points):
@@ -1327,6 +1340,678 @@ def ortools_partition_ors_matrix(points, num_vehicles, max_per_vehicle,
 
 
 # =========================
+# 4e. PARTITION CONNEXE (strategie ortools_ors_matrix_connected)
+# =========================
+# La separation lineaire du mode sweep garantit des territoires nets, mais
+# elle interdit des decoupages parfaitement acceptables : une vallee en U, un
+# territoire en croissant autour d'un autre. Ici la contrainte est plus faible
+# et plus proche du terrain : chaque territoire doit former UN SEUL bloc
+# connexe dans un graphe de voisinage geographique. Aucune droite n'est exigee.
+
+CONNECTED_KNN_START = 4          # k initial du graphe de voisinage
+CONNECTED_KNN_MAX = 12           # au-dela, l'arbre couvrant prend le relais
+CONNECTED_TOP_ORTOOLS = 12       # candidates envoyees au solveur (niveau 2)
+CONNECTED_TOP_VROOM = 3          # candidates envoyees a Vroom (niveau 3)
+CONNECTED_LOCAL_ITERS = 60       # bornes de la recherche locale
+CONNECTED_REPAIR_ITERS = 200
+CONNECTED_TIE_SECONDS = 30.0     # ecart de duree sous lequel on departage au km
+
+
+def build_geo_graph(points, indices, k=CONNECTED_KNN_START):
+    """Graphe de voisinage non oriente sur les points de collecte.
+
+    k plus proches voisins au sens haversine, k augmente tant que le graphe
+    global n'est pas connexe, puis UNION avec un arbre couvrant minimal. Cette
+    union garantit la connexite globale meme pour un point tres isole, ce que
+    les kNN seuls ne donnent jamais.
+    Retourne (adjacency, meta). Aucune dependance, aucun appel reseau.
+    """
+    n = len(indices)
+    adjacency = {i: set() for i in indices}
+    if n <= 1:
+        return adjacency, {"k": 0, "mst_edges": 0, "connected": True}
+
+    dist = {}
+    for a in range(n):
+        ia = indices[a]
+        for b in range(a + 1, n):
+            ib = indices[b]
+            d = haversine((float(points[ia]["lat"]), float(points[ia]["lon"])),
+                          (float(points[ib]["lat"]), float(points[ib]["lon"])))
+            dist[(ia, ib)] = d
+            dist[(ib, ia)] = d
+
+    def knn_edges(kk):
+        edges = set()
+        for i in indices:
+            # tri par (distance, index) : les egalites sont departagees de
+            # facon stable, le graphe est donc deterministe.
+            near = sorted((j for j in indices if j != i),
+                          key=lambda j: (dist[(i, j)], j))[:kk]
+            for j in near:
+                edges.add((min(i, j), max(i, j)))
+        return edges
+
+    used_k = min(k, max(1, n - 1))
+    edges = knn_edges(used_k)
+    while used_k < min(CONNECTED_KNN_MAX, n - 1):
+        adj = {i: set() for i in indices}
+        for u, v in edges:
+            adj[u].add(v)
+            adj[v].add(u)
+        if _graph_connected(indices, adj):
+            break
+        used_k += 1
+        edges = knn_edges(used_k)
+
+    # Arbre couvrant minimal (Prim), en union : filet de securite.
+    mst_added = 0
+    in_tree = {indices[0]}
+    rest = set(indices[1:])
+    while rest:
+        best = min(((u, v) for u in in_tree for v in rest),
+                   key=lambda e: (dist[e], e[0], e[1]))
+        u, v = best
+        key = (min(u, v), max(u, v))
+        if key not in edges:
+            edges.add(key)
+            mst_added += 1
+        in_tree.add(v)
+        rest.discard(v)
+
+    for u, v in edges:
+        adjacency[u].add(v)
+        adjacency[v].add(u)
+
+    return adjacency, {"k": used_k, "mst_edges": mst_added,
+                       "connected": _graph_connected(indices, adjacency),
+                       "edges": len(edges)}
+
+
+def _graph_connected(nodes, adjacency):
+    """Le graphe induit par nodes est-il d'un seul tenant ?"""
+    nodeset = set(nodes)
+    if not nodeset:
+        return True
+    start = min(nodeset)
+    seen = {start}
+    stack = [start]
+    while stack:
+        cur = stack.pop()
+        for nb in adjacency.get(cur, ()):
+            if nb in nodeset and nb not in seen:
+                seen.add(nb)
+                stack.append(nb)
+    return len(seen) == len(nodeset)
+
+
+def is_connected_partition(group_ids, adjacency):
+    """Connexite d'un groupe, evaluee sur le SOUS-GRAPHE INDUIT par ses seuls
+    points. Retourne {connected, component_count, component_sizes, components}.
+    Les tailles sont triees decroissantes, la sortie est donc deterministe."""
+    nodeset = set(group_ids)
+    seen = set()
+    components = []
+    for node in sorted(nodeset):
+        if node in seen:
+            continue
+        comp = {node}
+        stack = [node]
+        seen.add(node)
+        while stack:
+            cur = stack.pop()
+            for nb in adjacency.get(cur, ()):
+                if nb in nodeset and nb not in seen:
+                    seen.add(nb)
+                    comp.add(nb)
+                    stack.append(nb)
+        components.append(sorted(comp))
+    components.sort(key=lambda c: (-len(c), c[0]))
+    return {
+        "connected": len(components) <= 1,
+        "component_count": len(components),
+        "component_sizes": [len(c) for c in components],
+        "components": components,
+    }
+
+
+def boundary_metrics(ga, gb, adjacency, points):
+    """Mesures geographiques secondaires : elles departagent, elles ne
+    remplacent pas l'objectif de duree ORS."""
+    sa, sb = set(ga), set(gb)
+    cut_edges = 0
+    cut_len = 0.0
+    cross = 0
+    enclaves = 0
+    for group, other in ((sa, sb), (sb, sa)):
+        for i in group:
+            nbs = adjacency.get(i, set())
+            foreign = sum(1 for j in nbs if j in other)
+            cross += foreign
+            if nbs and foreign > len(nbs) / 2.0:
+                enclaves += 1
+    for i in sa:
+        for j in adjacency.get(i, ()):
+            if j in sb:
+                cut_edges += 1
+                cut_len += haversine(
+                    (float(points[i]["lat"]), float(points[i]["lon"])),
+                    (float(points[j]["lat"]), float(points[j]["lon"]))) * 1000.0
+    return {"cut_edges": cut_edges, "cut_length_m": round(cut_len, 1),
+            "cross_neighbors": cross, "enclave_points": enclaves}
+
+
+def _move_cost_delta(dur_matrix, group_from, group_to, node, start_idx, end_idx):
+    """Variation de duree estimee si node passe d'un groupe a l'autre.
+    Estimation nearest-neighbour, locale et deterministe."""
+    a0, _ = _estimate_group_cost(dur_matrix, group_from, start_idx, end_idx, False)
+    b0, _ = _estimate_group_cost(dur_matrix, group_to, start_idx, end_idx, False)
+    a1, _ = _estimate_group_cost(dur_matrix, [x for x in group_from if x != node],
+                                 start_idx, end_idx, False)
+    b1, _ = _estimate_group_cost(dur_matrix, list(group_to) + [node],
+                                 start_idx, end_idx, False)
+    return (a1 + b1) - (a0 + b0)
+
+
+def repair_to_connected(ga, gb, adjacency, points, dur_matrix,
+                        start_idx, end_idx, target_a):
+    """Rend deux groupes connexes en conservant la cardinalite exacte.
+
+    Deux temps : absorber les composantes secondaires -- iles et enclaves --
+    dans le groupe voisin, puis retablir la cardinalite en deplacant des points
+    de FRONTIERE choisis pour degrader le moins possible la duree ORS, et
+    seulement s'ils laissent les deux groupes connexes.
+    Retourne (ga, gb, ok, moves).
+    """
+    ga, gb = list(ga), list(gb)
+    moves = 0
+
+    for _ in range(CONNECTED_REPAIR_ITERS):
+        ia = is_connected_partition(ga, adjacency)
+        ib = is_connected_partition(gb, adjacency)
+        if ia["connected"] and ib["connected"]:
+            break
+        # On deplace la plus petite composante secondaire, cote le plus morcele.
+        if ia["component_count"] > 1:
+            src, dst, comps = ga, gb, ia["components"]
+        else:
+            src, dst, comps = gb, ga, ib["components"]
+        smallest = min(comps[1:], key=lambda c: (len(c), c[0]))
+        for node in smallest:
+            src.remove(node)
+            dst.append(node)
+            moves += 1
+        ga, gb = (src, dst) if src is ga else (dst, src)
+    else:
+        return ga, gb, False, moves
+
+    # Retablissement de la cardinalite, sans jamais casser la connexite.
+    for _ in range(CONNECTED_REPAIR_ITERS):
+        if len(ga) == target_a:
+            break
+        if len(ga) > target_a:
+            src, dst = ga, gb
+        else:
+            src, dst = gb, ga
+
+        best = None
+        for node in sorted(src):
+            # candidat de frontiere uniquement : il doit toucher l'autre groupe
+            if not any(nb in set(dst) for nb in adjacency.get(node, ())):
+                continue
+            new_src = [x for x in src if x != node]
+            new_dst = list(dst) + [node]
+            if not is_connected_partition(new_src, adjacency)["connected"]:
+                continue
+            if not is_connected_partition(new_dst, adjacency)["connected"]:
+                continue
+            delta = _move_cost_delta(dur_matrix, src, dst, node, start_idx, end_idx)
+            if best is None or (delta, node) < (best[0], best[1]):
+                best = (delta, node, new_src, new_dst)
+        if best is None:
+            return ga, gb, False, moves
+        _, _, new_src, new_dst = best
+        moves += 1
+        if src is ga:
+            ga, gb = new_src, new_dst
+        else:
+            gb, ga = new_src, new_dst
+    else:
+        return ga, gb, False, moves
+
+    ok = (len(ga) == target_a
+          and is_connected_partition(ga, adjacency)["connected"]
+          and is_connected_partition(gb, adjacency)["connected"])
+    return sorted(ga), sorted(gb), ok, moves
+
+
+def connected_local_search(ga, gb, adjacency, dur_matrix, start_idx, end_idx,
+                           max_iters=CONNECTED_LOCAL_ITERS):
+    """Echanges 1 contre 1 sur les points de frontiere.
+
+    Un echange n'est retenu que s'il ameliore la duree estimee ET laisse les
+    deux territoires connexes. La cardinalite est invariante par construction.
+    Parcours trie : la recherche est deterministe.
+    """
+    ga, gb = list(ga), list(gb)
+    base, _ = _estimate_group_cost(dur_matrix, ga, start_idx, end_idx, False)
+    base += _estimate_group_cost(dur_matrix, gb, start_idx, end_idx, False)[0]
+    swaps = 0
+
+    for _ in range(max_iters):
+        sa, sb = set(ga), set(gb)
+        border_a = sorted(i for i in ga if any(nb in sb for nb in adjacency.get(i, ())))
+        border_b = sorted(i for i in gb if any(nb in sa for nb in adjacency.get(i, ())))
+        best = None
+        for i in border_a:
+            for j in border_b:
+                na = [x for x in ga if x != i] + [j]
+                nb_ = [x for x in gb if x != j] + [i]
+                if not is_connected_partition(na, adjacency)["connected"]:
+                    continue
+                if not is_connected_partition(nb_, adjacency)["connected"]:
+                    continue
+                c = _estimate_group_cost(dur_matrix, na, start_idx, end_idx, False)[0]
+                c += _estimate_group_cost(dur_matrix, nb_, start_idx, end_idx, False)[0]
+                if c < base - 1e-9 and (best is None or (c, i, j) < (best[0], best[1], best[2])):
+                    best = (c, i, j, na, nb_)
+        if best is None:
+            break
+        base, _, _, ga, gb = best
+        swaps += 1
+
+    return sorted(ga), sorted(gb), base, swaps
+
+
+def _two_means_partition(points, indices, target_a):
+    """2-moyennes local et deterministe : germes = les deux points les plus
+    eloignes. Evite d'importer sklearn ici et reste testable hors production."""
+    if len(indices) < 2:
+        return list(indices), []
+    xy = _local_xy(points, indices)
+    seed_a, seed_b, best = indices[0], indices[1], -1.0
+    for a in range(len(indices)):
+        for b in range(a + 1, len(indices)):
+            ia, ib = indices[a], indices[b]
+            d = math.hypot(xy[ia][0] - xy[ib][0], xy[ia][1] - xy[ib][1])
+            if d > best:
+                best, seed_a, seed_b = d, ia, ib
+    ca, cb = xy[seed_a], xy[seed_b]
+    for _ in range(25):
+        scored = sorted(
+            ((math.hypot(xy[i][0] - ca[0], xy[i][1] - ca[1])
+              - math.hypot(xy[i][0] - cb[0], xy[i][1] - cb[1]), i)
+             for i in indices))
+        ga = [i for _, i in scored[:target_a]]
+        gb = [i for _, i in scored[target_a:]]
+        na = (sum(xy[i][0] for i in ga) / len(ga), sum(xy[i][1] for i in ga) / len(ga))
+        nb = (sum(xy[i][0] for i in gb) / len(gb), sum(xy[i][1] for i in gb) / len(gb)) if gb else cb
+        if na == ca and nb == cb:
+            break
+        ca, cb = na, nb
+    return sorted(ga), sorted(gb)
+
+
+def _normalize_sizes(ga, gb, indices, target_a, xy):
+    """Ramene les groupes a la cardinalite exacte en deplacant les points les
+    plus proches du centroide oppose. Deterministe."""
+    ga, gb = list(ga), list(gb)
+    allset = set(indices)
+    ga = [i for i in ga if i in allset]
+    gb = [i for i in gb if i in allset and i not in set(ga)]
+    missing = sorted(allset - set(ga) - set(gb))
+    gb.extend(missing)
+    while len(ga) > target_a and gb is not None:
+        cb = (sum(xy[i][0] for i in gb) / len(gb), sum(xy[i][1] for i in gb) / len(gb)) if gb else (0, 0)
+        move = min(ga, key=lambda i: (math.hypot(xy[i][0] - cb[0], xy[i][1] - cb[1]), i))
+        ga.remove(move)
+        gb.append(move)
+    while len(ga) < target_a:
+        ca = (sum(xy[i][0] for i in ga) / len(ga), sum(xy[i][1] for i in ga) / len(ga)) if ga else (0, 0)
+        move = min(gb, key=lambda i: (math.hypot(xy[i][0] - ca[0], xy[i][1] - ca[1]), i))
+        gb.remove(move)
+        ga.append(move)
+    return sorted(ga), sorted(gb)
+
+
+def generate_connected_candidates(points, indices, target_a, adjacency,
+                                  dur_matrix, hav_matrix, start_idx, end_idx):
+    """Partitions initiales diversifiees, puis reparees jusqu'a la connexite.
+
+    Sources : ORS non contrainte (l'incumbent de performance), balayage
+    lineaire, Haversine, 2-moyennes local, et plusieurs coupes du balayage.
+    Chacune est normalisee en cardinalite PUIS reparee : la solution ORS n'est
+    jamais acceptee telle quelle si elle reste morcelee.
+    Retourne (candidates, stats).
+    """
+    stats = {"generated": 0, "valid": 0, "sources": {}}
+    xy = _local_xy(points, indices)
+    seen = {}
+    raw = []
+
+    def add(seed, ga, gb):
+        raw.append((seed, list(ga), list(gb)))
+
+    # 1. ORS non contrainte : la performance a reparer.
+    if ORTOOLS_AVAILABLE:
+        g, _err = _solve_cvrp_ortools(dur_matrix, 2, len(indices), start_idx, end_idx)
+        if g and len(g) == 2:
+            add("ors_unconstrained", g[0], g[1])
+        # 3. Haversine, meme solveur sur la matrice a vol d'oiseau.
+        gh, _err = _solve_cvrp_ortools(hav_matrix, 2, len(indices), start_idx, end_idx)
+        if gh and len(gh) == 2:
+            add("haversine", gh[0], gh[1])
+
+    # 2 et 5. Balayage lineaire : la meilleure et quelques coupes diversifiees.
+    sweep, _sstats = enumerate_territorial_partitions(points, indices, target_a)
+    for rank, c in enumerate(sweep[:8]):
+        add("sweep_%d" % rank, c["group_a"], c["group_b"])
+
+    # 4. 2-moyennes local.
+    ka, kb = _two_means_partition(points, indices, target_a)
+    add("two_means", ka, kb)
+
+    for seed, ga, gb in raw:
+        stats["generated"] += 1
+        ga, gb = _normalize_sizes(ga, gb, indices, target_a, xy)
+        ga, gb, ok, moves = repair_to_connected(
+            ga, gb, adjacency, points, dur_matrix, start_idx, end_idx, target_a)
+        if not ok:
+            stats["sources"][seed] = "repair_failed"
+            continue
+        ga, gb, est, swaps = connected_local_search(
+            ga, gb, adjacency, dur_matrix, start_idx, end_idx)
+        key = _partition_key(ga, gb)
+        if key in seen:
+            stats["sources"][seed] = "duplicate"
+            continue
+        stats["sources"][seed] = "ok(repair=%d,swaps=%d)" % (moves, swaps)
+        stats["valid"] += 1
+        seen[key] = {"group_a": ga, "group_b": gb, "seed": seed,
+                     "est_duration_s": est, "repair_moves": moves,
+                     "local_swaps": swaps}
+
+    candidates = sorted(seen.values(), key=lambda c: (c["est_duration_s"],
+                                                      _partition_key(c["group_a"], c["group_b"])))
+    return candidates, stats
+
+
+def _rescore(dur_matrix, dist_matrix, route_a, route_b):
+    """Rescore DEUX ordres avec la MEME matrice ORS.
+
+    Indispensable : les durees rendues par Vroom et celles calculees par
+    OR-Tools ne sortent pas du meme estimateur. Les comparer directement
+    fausserait le classement. Ici tout repasse par la matrice.
+    """
+    d = _matrix_route_cost(dur_matrix, route_a) + _matrix_route_cost(dur_matrix, route_b)
+    k = (_matrix_route_cost(dist_matrix, route_a) + _matrix_route_cost(dist_matrix, route_b)
+         ) if dist_matrix else 0.0
+    return d, k
+
+
+def _selection_key(cand):
+    """Ordre lexicographique impose. L'equilibre entre tournees n'y figure pas.
+    La duree est arrondie au palier de tolerance pour que le kilometrage puisse
+    departager deux solutions pratiquement equivalentes en temps."""
+    return (0 if cand["connected"] else 1,
+            0 if cand["cardinality_ok"] else 1,
+            cand["components_total"],
+            round(cand["duration_s"] / CONNECTED_TIE_SECONDS),
+            cand["distance_m"],
+            cand["boundary"]["cut_edges"] + cand["boundary"]["enclave_points"],
+            _partition_key(cand["group_a"], cand["group_b"]))
+
+
+def ortools_partition_ors_matrix_connected(points, num_vehicles, max_per_vehicle,
+                                           start_idx, end_idx, headers,
+                                           solution_limit=None):
+    """Partition en deux territoires CONNEXES sur les durees routieres ORS.
+
+    Contrat : cardinalite exacte, aucune perte ni doublon, chaque territoire
+    d'un seul tenant dans le graphe de voisinage, puis duree ORS minimale.
+    Aucun objectif d'equilibrage. Retourne (groups, err, meta).
+    """
+    t0 = time.time()
+    diag = {
+        "connected_partition": False,
+        "connected_method": "knn_graph_repair_local_search",
+        "connected_membership_locked": False,
+        "connected_target_sizes": None,
+        "connected_components_t1": None,
+        "connected_components_t2": None,
+        "connected_component_sizes_t1": None,
+        "connected_component_sizes_t2": None,
+        "connected_candidates_generated": 0,
+        "connected_candidates_valid": 0,
+        "connected_candidates_scored": 0,
+        "connected_candidates_ortools": 0,
+        "connected_candidates_vroom": 0,
+        "connected_cut_edges": None,
+        "connected_cut_length_m": None,
+        "connected_cross_neighbors": None,
+        "connected_enclave_points": None,
+        "connected_selected_seed": None,
+        "connected_fallback_used": False,
+        "connected_error": "",
+        "connected_graph_k": None,
+        "connected_vroom_calls": 0,
+        "selected_sequencer": None,
+        "final_selection_reason": "",
+        "ortools_total_duration_s": None,
+        "ortools_total_distance_m": None,
+        "vroom_total_duration_s": None,
+        "vroom_total_distance_m": None,
+        "connected_enum_ms": 0,
+        "connected_score_ms": 0,
+    }
+    meta = {"connected": diag}
+
+    depots = {start_idx, end_idx}
+    indices = [i for i in range(len(points)) if i not in depots]
+    if not indices:
+        diag["connected_error"] = "no delivery points"
+        return [[] for _ in range(num_vehicles)], None, meta
+
+    if num_vehicles != 2:
+        diag["connected_error"] = f"connected partition requires 2 vehicles, got {num_vehicles}"
+        return None, diag["connected_error"], meta
+
+    bad = [points[i].get("id", i) for i in indices if not _finite_coords(points[i])]
+    if bad:
+        diag["connected_error"] = f"{len(bad)} point(s) with invalid coordinates: {bad[:5]}"
+        return None, diag["connected_error"], meta
+
+    n = len(indices)
+    target_a = n // 2                     # N pair -> N/2 ; N impair -> ecart de 1
+    if target_a > max_per_vehicle or (n - target_a) > max_per_vehicle:
+        diag["connected_error"] = (f"cannot split {n} points under capacity "
+                                   f"{max_per_vehicle}")
+        return None, diag["connected_error"], meta
+    diag["connected_target_sizes"] = [target_a, n - target_a]
+
+    print(f"Partition connexe: {n} points -> {target_a}/{n - target_a}", flush=True)
+
+    dur_matrix, dist_matrix, mmeta, err = _build_full_matrix_chunked(points, headers)
+    meta.update(mmeta)
+    meta["connected"] = diag
+    if dur_matrix is None:
+        diag["connected_error"] = f"ORS matrix failed: {err}"
+        return None, diag["connected_error"], meta
+
+    adjacency, gmeta = build_geo_graph(points, indices)
+    diag["connected_graph_k"] = gmeta["k"]
+    print(f"  Graphe: k={gmeta['k']}, {gmeta['edges']} aretes, "
+          f"{gmeta['mst_edges']} ajoutees par l'arbre couvrant, "
+          f"connexe={gmeta['connected']}", flush=True)
+
+    hav_matrix = _build_haversine_matrix(points)
+
+    t_gen = time.time()
+    cands, cstats = generate_connected_candidates(
+        points, indices, target_a, adjacency, dur_matrix, hav_matrix,
+        start_idx, end_idx)
+    diag["connected_enum_ms"] = int((time.time() - t_gen) * 1000)
+    diag["connected_candidates_generated"] = cstats["generated"]
+    diag["connected_candidates_valid"] = cstats["valid"]
+    print(f"  Candidates: {cstats['generated']} generees, {cstats['valid']} valides "
+          f"en {diag['connected_enum_ms']}ms | {cstats['sources']}", flush=True)
+
+    if not cands:
+        diag["connected_error"] = "no connected partition could be built"
+        return None, diag["connected_error"], meta
+
+    # --- niveau 1 : heuristique locale sur la matrice ORS ---
+    t_score = time.time()
+    scored = []
+    allset = set(indices)
+    for c in cands:
+        ga, gb = c["group_a"], c["group_b"]
+        ia = is_connected_partition(ga, adjacency)
+        ib = is_connected_partition(gb, adjacency)
+        ra = _estimate_group_cost(dur_matrix, ga, start_idx, end_idx, True)[1]
+        rb = _estimate_group_cost(dur_matrix, gb, start_idx, end_idx, True)[1]
+        dur, dist = _rescore(dur_matrix, dist_matrix, ra, rb)
+        scored.append({
+            "group_a": ga, "group_b": gb, "seed": c["seed"],
+            "route_a": ra, "route_b": rb, "duration_s": dur, "distance_m": dist,
+            "connected": ia["connected"] and ib["connected"],
+            "cardinality_ok": (len(ga) == target_a and len(gb) == n - target_a
+                               and set(ga) | set(gb) == allset
+                               and not (set(ga) & set(gb))),
+            "components_total": ia["component_count"] + ib["component_count"] - 2,
+            "comp_a": ia, "comp_b": ib,
+            "boundary": boundary_metrics(ga, gb, adjacency, points),
+            "sequencer": "heuristic",
+        })
+    diag["connected_candidates_scored"] = len(scored)
+    scored.sort(key=_selection_key)
+
+    # Incumbent : jamais remplace par une solution moins bonne.
+    incumbent = scored[0]
+    diag["final_selection_reason"] = "level1_heuristic"
+
+    # --- niveau 2 : OR-Tools sur les meilleures, sequencement seul ---
+    if ORTOOLS_AVAILABLE:
+        for cand in scored[:CONNECTED_TOP_ORTOOLS]:
+            ra = _tsp_order_ortools(dur_matrix, cand["group_a"], start_idx, end_idx)
+            rb = _tsp_order_ortools(dur_matrix, cand["group_b"], start_idx, end_idx)
+            if ra is None or rb is None:
+                continue
+            diag["connected_candidates_ortools"] += 1
+            dur, dist = _rescore(dur_matrix, dist_matrix, ra, rb)
+            variant = dict(cand)
+            variant.update({"route_a": ra, "route_b": rb, "duration_s": dur,
+                            "distance_m": dist, "sequencer": "ortools"})
+            if _selection_key(variant) < _selection_key(incumbent):
+                incumbent = variant
+                diag["final_selection_reason"] = "level2_ortools"
+        diag["ortools_total_duration_s"] = round(incumbent["duration_s"], 1)
+        diag["ortools_total_distance_m"] = round(incumbent["distance_m"], 1)
+
+    # --- niveau 3 : Vroom sur les 3 meilleures, 2 appels chacune ---
+    finalists = sorted(scored, key=_selection_key)[:CONNECTED_TOP_VROOM]
+    for cand in finalists:
+        ra, da, _ = _resequence_single(points, cand["group_a"], start_idx, end_idx, headers)
+        rb, db, _ = _resequence_single(points, cand["group_b"], start_idx, end_idx, headers)
+        diag["connected_vroom_calls"] += 2
+        if ra is None or rb is None:
+            # Rate limit ou erreur : on garde la solution OR-Tools, sans echouer.
+            diag["connected_fallback_used"] = True
+            diag["connected_error"] = diag["connected_error"] or "vroom unavailable, kept OR-Tools order"
+            break
+        diag["connected_candidates_vroom"] += 1
+        dur, dist = _rescore(dur_matrix, dist_matrix, ra, rb)
+        variant = dict(cand)
+        variant.update({"route_a": ra, "route_b": rb, "duration_s": dur,
+                        "distance_m": dist, "sequencer": "vroom"})
+        if diag["vroom_total_duration_s"] is None or dur < diag["vroom_total_duration_s"]:
+            diag["vroom_total_duration_s"] = round(dur, 1)
+            diag["vroom_total_distance_m"] = round(dist, 1)
+        if _selection_key(variant) < _selection_key(incumbent):
+            incumbent = variant
+            diag["final_selection_reason"] = "level3_vroom"
+
+    diag["connected_score_ms"] = int((time.time() - t_score) * 1000)
+
+    # --- verification finale, independante de la construction ---
+    ga, gb = incumbent["group_a"], incumbent["group_b"]
+    ia = is_connected_partition(ga, adjacency)
+    ib = is_connected_partition(gb, adjacency)
+    cardinality_ok = (len(ga) == target_a and len(gb) == n - target_a
+                      and set(ga) | set(gb) == allset and not (set(ga) & set(gb)))
+    if not (ia["connected"] and ib["connected"] and cardinality_ok):
+        diag["connected_error"] = (f"final check failed: connected="
+                                   f"{ia['connected']}/{ib['connected']}, "
+                                   f"cardinality_ok={cardinality_ok}")
+        return None, diag["connected_error"], meta
+
+    b = boundary_metrics(ga, gb, adjacency, points)
+    diag.update({
+        "connected_partition": True,
+        "connected_membership_locked": True,
+        "connected_components_t1": ia["component_count"],
+        "connected_components_t2": ib["component_count"],
+        "connected_component_sizes_t1": ia["component_sizes"],
+        "connected_component_sizes_t2": ib["component_sizes"],
+        "connected_cut_edges": b["cut_edges"],
+        "connected_cut_length_m": b["cut_length_m"],
+        "connected_cross_neighbors": b["cross_neighbors"],
+        "connected_enclave_points": b["enclave_points"],
+        "connected_selected_seed": incumbent["seed"],
+        "selected_sequencer": incumbent["sequencer"],
+    })
+
+    print(f"  Retenue: {[len(ga), len(gb)]} pts, seed={incumbent['seed']}, "
+          f"sequenceur={incumbent['sequencer']}, composantes 1/1, "
+          f"{b['cut_edges']} aretes coupees, {b['enclave_points']} enclaves, "
+          f"duree {incumbent['duration_s'] / 60:.1f}min "
+          f"({int((time.time() - t0) * 1000)}ms)", flush=True)
+
+    return [ga, gb], None, meta
+
+
+def _tsp_order_ortools(matrix, group, start_idx, end_idx):
+    """Ordonne UN groupe avec OR-Tools. Ne touche jamais a l'appartenance :
+    un seul vehicule, donc aucun point ne peut changer de tournee.
+    Retourne une route en index globaux, ou None."""
+    if not ORTOOLS_AVAILABLE or not group:
+        return [start_idx, end_idx] if not group else None
+    nodes = [start_idx] + [g for g in group if g != start_idx and g != end_idx]
+    if end_idx != start_idx:
+        nodes.append(end_idx)
+    local = {k: nodes[k] for k in range(len(nodes))}
+    try:
+        if start_idx == end_idx:
+            mgr = pywrapcp.RoutingIndexManager(len(nodes), 1, 0)
+        else:
+            mgr = pywrapcp.RoutingIndexManager(len(nodes), 1, [0], [len(nodes) - 1])
+        routing = pywrapcp.RoutingModel(mgr)
+
+        def cb(i, j):
+            return int(matrix[local[mgr.IndexToNode(i)]][local[mgr.IndexToNode(j)]])
+
+        t = routing.RegisterTransitCallback(cb)
+        routing.SetArcCostEvaluatorOfAllVehicles(t)
+        prm = pywrapcp.DefaultRoutingSearchParameters()
+        prm.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+        prm.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+        prm.solution_limit = 30          # limite COURTE : 12 candidates a sequencer
+        prm.time_limit.FromSeconds(3)
+        prm.log_search = False
+        sol = routing.SolveWithParameters(prm)
+        if sol is None:
+            return None
+        out, idx = [], routing.Start(0)
+        while not routing.IsEnd(idx):
+            out.append(local[mgr.IndexToNode(idx)])
+            idx = sol.Value(routing.NextVar(idx))
+        out.append(end_idx)
+        return out
+    except Exception:
+        return None
+
+
+# =========================
 # 5. NEAREST-NEIGHBOR FALLBACK
 # =========================
 def _nearest_neighbor_route(points, vehicle_points, start_idx, end_idx):
@@ -2071,6 +2756,13 @@ def optimize():
     elif strategy == "ortools_ors_matrix":
         partition_solver = "territorial_projection"
         ortools_limit_effective = None
+    elif strategy == "ortools_ors_matrix_connected":
+        # OR-Tools n'y sert qu'au SEQUENCEMENT de chaque groupe, avec une
+        # limite courte propre a ce niveau. La limite globale ne s'y applique
+        # pas : l'annoncer serait faux. La valeur reelle est renseignee plus
+        # bas, uniquement si le solveur a effectivement tourne.
+        partition_solver = "connected_graph_partition"
+        ortools_limit_effective = None
     else:
         # kmeans : le moteur exact, vroom_multi ou kmeans_fallback, est deja
         # rapporte par partition_engine.
@@ -2127,6 +2819,7 @@ def optimize():
     # Les swaps inter-tournees ne sont alors PAS lances, y compris leurs deux
     # appels Vroom de notation : on evite le cout au lieu de rejeter a la fin.
     membership_locked = False
+    swap_lock_reason = "territorial_partition_locked"
 
     # Statistiques des swaps. Valeurs neutres si post_process_swaps ne tourne
     # pas (routes absentes ou Vroom en echec) : les champs restent presents.
@@ -2181,6 +2874,15 @@ def optimize():
             terr_diag = (matrix_meta or {}).get("territorial") or {}
             if terr_diag.get("territorial_membership_locked"):
                 membership_locked = True
+        elif strategy == "ortools_ors_matrix_connected":
+            groups, part_err, matrix_meta = ortools_partition_ors_matrix_connected(
+                points, num_vehicles, max_per_vehicle, start_idx, end_idx, headers,
+                solution_limit=ortools_solution_limit
+            )
+            conn_diag = (matrix_meta or {}).get("connected") or {}
+            if conn_diag.get("connected_membership_locked"):
+                membership_locked = True
+                swap_lock_reason = "connected_partition_locked"
         else:
             groups, part_err = None, f"no partition function for '{strategy}'"
 
@@ -2244,9 +2946,9 @@ def optimize():
     if routes_idx and vroom_ok and membership_locked:
         # Aucun appel : les swaps deplacent des points entre tournees, ce que la
         # partition territoriale interdit par construction.
-        swap_stats["swap_stop_reason"] = "territorial_partition_locked"
-        print("Post-processing: swaps non lances, appartenance territoriale "
-              "verrouillee", flush=True)
+        swap_stats["swap_stop_reason"] = swap_lock_reason
+        print(f"Post-processing: swaps non lances, appartenance verrouillee "
+              f"({swap_lock_reason})", flush=True)
 
     elif routes_idx and vroom_ok:
         routes_idx, swap_metrics, swap_stats = post_process_swaps(
@@ -2330,6 +3032,36 @@ def optimize():
         "territorial_error": _terr_get(matrix_meta, "territorial_error", ""),
         "territorial_enum_ms": _terr_get(matrix_meta, "territorial_enum_ms", None),
         "territorial_score_ms": _terr_get(matrix_meta, "territorial_score_ms", None),
+
+        # --- certificat de connexite (ortools_ors_matrix_connected) ---
+        "connected_partition": _conn_get(matrix_meta, "connected_partition", False),
+        "connected_method": _conn_get(matrix_meta, "connected_method", None),
+        "connected_membership_locked": _conn_get(matrix_meta, "connected_membership_locked", False),
+        "connected_target_sizes": _conn_get(matrix_meta, "connected_target_sizes", None),
+        "connected_components_t1": _conn_get(matrix_meta, "connected_components_t1", None),
+        "connected_components_t2": _conn_get(matrix_meta, "connected_components_t2", None),
+        "connected_component_sizes_t1": _conn_get(matrix_meta, "connected_component_sizes_t1", None),
+        "connected_component_sizes_t2": _conn_get(matrix_meta, "connected_component_sizes_t2", None),
+        "connected_candidates_generated": _conn_get(matrix_meta, "connected_candidates_generated", 0),
+        "connected_candidates_valid": _conn_get(matrix_meta, "connected_candidates_valid", 0),
+        "connected_candidates_scored": _conn_get(matrix_meta, "connected_candidates_scored", 0),
+        "connected_candidates_ortools": _conn_get(matrix_meta, "connected_candidates_ortools", 0),
+        "connected_candidates_vroom": _conn_get(matrix_meta, "connected_candidates_vroom", 0),
+        "connected_cut_edges": _conn_get(matrix_meta, "connected_cut_edges", None),
+        "connected_cut_length_m": _conn_get(matrix_meta, "connected_cut_length_m", None),
+        "connected_cross_neighbors": _conn_get(matrix_meta, "connected_cross_neighbors", None),
+        "connected_enclave_points": _conn_get(matrix_meta, "connected_enclave_points", None),
+        "connected_selected_seed": _conn_get(matrix_meta, "connected_selected_seed", None),
+        "connected_fallback_used": _conn_get(matrix_meta, "connected_fallback_used", False),
+        "connected_error": _conn_get(matrix_meta, "connected_error", ""),
+        "connected_graph_k": _conn_get(matrix_meta, "connected_graph_k", None),
+        "connected_vroom_calls": _conn_get(matrix_meta, "connected_vroom_calls", 0),
+        "selected_sequencer": _conn_get(matrix_meta, "selected_sequencer", None),
+        "final_selection_reason": _conn_get(matrix_meta, "final_selection_reason", ""),
+        "ortools_total_duration_s": _conn_get(matrix_meta, "ortools_total_duration_s", None),
+        "ortools_total_distance_m": _conn_get(matrix_meta, "ortools_total_distance_m", None),
+        "vroom_total_duration_s": _conn_get(matrix_meta, "vroom_total_duration_s", None),
+        "vroom_total_distance_m": _conn_get(matrix_meta, "vroom_total_distance_m", None),
         "elapsed_ms": int((time.time() - t_start) * 1000),
         "api_calls": {
             "vroom": _API_STATS["vroom"],

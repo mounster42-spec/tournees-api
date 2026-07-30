@@ -369,8 +369,57 @@ function buildLegend(){
 
 /* ---------- certificat territorial ---------- */
 
+function buildConnected(payload){
+  var c = payload.connected;
+  if (!c || (c.partition === undefined && c.components_t1 === undefined)) return "";
+
+  var ok = (c.components_t1 === 1 && c.components_t2 === 1);
+  var html = "<h2>Territoires connexes</h2>";
+
+  if (ok){
+    html += "<b style='color:#1e8449'>Territoires connexes : oui</b><br>";
+  } else {
+    html += "<div class='alert'><b>Territoires connexes : NON</b><br>"
+          + "composantes " + esc(c.components_t1) + " / " + esc(c.components_t2)
+          + (c.error ? "<br>" + esc(c.error) : "") + "</div>";
+  }
+
+  if (c.method)            html += "Méthode : " + esc(c.method) + "<br>";
+  if (c.sizes)             html += "Tailles : " + esc(c.sizes.join(" / ")) + "<br>";
+  html += "Composantes : " + esc(c.components_t1) + " / " + esc(c.components_t2);
+  if (c.component_sizes_t1 && c.component_sizes_t2){
+    html += " <small>(" + esc(c.component_sizes_t1.join(",")) + " | "
+          + esc(c.component_sizes_t2.join(",")) + ")</small>";
+  }
+  html += "<br>";
+  if (c.enclave_points !== null && c.enclave_points !== undefined)
+    html += "Points enclavés : <b>" + esc(c.enclave_points) + "</b><br>";
+  if (c.cut_edges !== null && c.cut_edges !== undefined)
+    html += "Arêtes de frontière : " + esc(c.cut_edges)
+          + (c.cut_length_m != null ? " (" + fmt(c.cut_length_m, 0, "m") + ")" : "") + "<br>";
+  if (c.sequencer)         html += "Solveur final : <b>" + esc(c.sequencer) + "</b><br>";
+  if (c.locked)            html += "<b>Appartenance verrouillée</b><br>";
+
+  // Aucune frontiere n'est dessinee : le contour reel des territoires n'est pas
+  // calcule, et les traits indicatifs entre points ne suivent pas la voirie —
+  // leurs croisements ne prouvent donc aucune violation de connexite.
+  html += "<small>Aucune frontière n'est tracée : le contour des territoires "
+        + "n'est pas calculé. Les croisements des traits indicatifs ne "
+        + "constituent pas une violation.</small>";
+  return html;
+}
+
+
 function buildTerritorial(payload){
   var host = document.getElementById("territorial");
+
+  // Mode a territoires connexes : certificat different, pas de droite.
+  var connectedHtml = buildConnected(payload);
+  if (connectedHtml){
+    host.innerHTML = connectedHtml;
+    return;
+  }
+
   var t = payload.territorial;
 
   // Stratégie sans certificat : on ne montre rien plutôt qu'un bloc vide.

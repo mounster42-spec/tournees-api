@@ -3,7 +3,8 @@
 // =========================
 const API_BASE = "https://tournees-api.onrender.com";
 
-const STRATEGIES = ["kmeans", "ortools_haversine", "ortools_ors_matrix"];
+const STRATEGIES = ["kmeans", "ortools_haversine", "ortools_ors_matrix",
+                    "ortools_ors_matrix_connected"];
 const DEFAULT_STRATEGY = "kmeans";
 
 // Ligne de la feuille "Paramètres" portant la stratégie
@@ -18,14 +19,18 @@ const ENGINE_LABELS = {
   "vroom_multi":        "Vroom (affectation + séquencement)",
   "kmeans_fallback":    "K-Means (affectation) + Vroom (séquencement)",
   "ortools_haversine":  "OR-Tools Haversine (affectation) + Vroom (séquencement)",
-  "ortools_ors_matrix": "OR-Tools ORS Matrix (affectation) + Vroom (séquencement)"
+  "ortools_ors_matrix": "OR-Tools ORS Matrix (affectation) + Vroom (séquencement)",
+  "ortools_ors_matrix_connected":
+    "OR-Tools ORS Matrix — territoires connexes (affectation) + Vroom (séquencement)"
 };
 
 // Repli si partition_engine est absent (backend antérieur au lot 3).
 const STRATEGY_LABELS = {
   "kmeans":             "K-Means (affectation) + Vroom (séquencement)",
   "ortools_haversine":  "OR-Tools Haversine (affectation) + Vroom (séquencement)",
-  "ortools_ors_matrix": "OR-Tools ORS Matrix (affectation) + Vroom (séquencement)"
+  "ortools_ors_matrix": "OR-Tools ORS Matrix (affectation) + Vroom (séquencement)",
+  "ortools_ors_matrix_connected":
+    "OR-Tools ORS Matrix — territoires connexes (affectation) + Vroom (séquencement)"
 };
 
 const BENCH_SHEET = "Benchmark";
@@ -59,9 +64,25 @@ const BENCH_HEADERS_TERR = [
   "territorial_error"
 ];
 
+// Colonnes du certificat de connexite, strictement a la fin.
+const BENCH_HEADERS_CONN = [
+  "connected_partition", "connected_method", "connected_membership_locked",
+  "connected_target_sizes", "connected_components_t1", "connected_components_t2",
+  "connected_component_sizes_t1", "connected_component_sizes_t2",
+  "connected_candidates_generated", "connected_candidates_valid",
+  "connected_candidates_scored", "connected_candidates_ortools",
+  "connected_candidates_vroom", "connected_cut_edges", "connected_cut_length_m",
+  "connected_cross_neighbors", "connected_enclave_points",
+  "connected_selected_seed", "connected_fallback_used", "connected_error",
+  "connected_vroom_calls", "selected_sequencer", "final_selection_reason",
+  "ortools_total_duration_s", "ortools_total_distance_m",
+  "vroom_total_duration_s", "vroom_total_distance_m", "partition_solver"
+];
+
 const BENCH_HEADERS = BENCH_HEADERS_BASE
   .concat(BENCH_HEADERS_D3)
-  .concat(BENCH_HEADERS_TERR);
+  .concat(BENCH_HEADERS_TERR)
+  .concat(BENCH_HEADERS_CONN);
 
 
 
@@ -592,7 +613,37 @@ function appendBenchmark(result, params, points, extra) {
     _cell(result.territorial_candidates_unique),
     _cell(result.territorial_candidates_scored),
     _cell(result.territorial_fallback_used),
-    _cell(result.territorial_error)
+    _cell(result.territorial_error),
+
+    // --- certificat de connexite ---
+    _cell(result.connected_partition),
+    _cell(result.connected_method),
+    _cell(result.connected_membership_locked),
+    _cellList(result.connected_target_sizes),
+    _cell(result.connected_components_t1),
+    _cell(result.connected_components_t2),
+    _cellList(result.connected_component_sizes_t1),
+    _cellList(result.connected_component_sizes_t2),
+    _cell(result.connected_candidates_generated),
+    _cell(result.connected_candidates_valid),
+    _cell(result.connected_candidates_scored),
+    _cell(result.connected_candidates_ortools),
+    _cell(result.connected_candidates_vroom),
+    _cell(result.connected_cut_edges),
+    _cell(result.connected_cut_length_m),
+    _cell(result.connected_cross_neighbors),
+    _cell(result.connected_enclave_points),
+    _cell(result.connected_selected_seed),
+    _cell(result.connected_fallback_used),
+    _cell(result.connected_error),
+    _cell(result.connected_vroom_calls),
+    _cell(result.selected_sequencer),
+    _cell(result.final_selection_reason),
+    _cell(result.ortools_total_duration_s),
+    _cell(result.ortools_total_distance_m),
+    _cell(result.vroom_total_duration_s),
+    _cell(result.vroom_total_distance_m),
+    _cell(result.partition_solver)
   ];
 
   sheet.appendRow(row);
@@ -602,6 +653,13 @@ function appendBenchmark(result, params, points, extra) {
 /** Rend "" pour null/undefined, la valeur sinon. Ne lève jamais. */
 function _cell(v) {
   return (v === null || v === undefined) ? "" : v;
+}
+
+
+/** Sérialise une liste en texte lisible dans une cellule. "" si absente. */
+function _cellList(v) {
+  if (v === null || v === undefined) return "";
+  return Array.isArray(v) ? v.join(" / ") : String(v);
 }
 
 
@@ -740,6 +798,23 @@ function buildCartePayload(result, params, points) {
       margin_m: result.territorial_separator_margin_m,
       status: result.territorial_overlap_status,
       error: result.territorial_error
+    },
+
+    // Certificat de connexite, affiché par la carte pour le mode connexe.
+    connected: {
+      partition: result.connected_partition,
+      method: result.connected_method,
+      locked: result.connected_membership_locked,
+      sizes: result.connected_target_sizes,
+      components_t1: result.connected_components_t1,
+      components_t2: result.connected_components_t2,
+      component_sizes_t1: result.connected_component_sizes_t1,
+      component_sizes_t2: result.connected_component_sizes_t2,
+      cut_edges: result.connected_cut_edges,
+      cut_length_m: result.connected_cut_length_m,
+      enclave_points: result.connected_enclave_points,
+      sequencer: result.selected_sequencer,
+      error: result.connected_error
     }
   };
 }
@@ -926,6 +1001,7 @@ function runOptimisation(strategyOverride) {
 function runKmeans()           { runOptimisation("kmeans"); }
 function runOrtoolsHaversine() { runOptimisation("ortools_haversine"); }
 function runOrtoolsOrsMatrix() { runOptimisation("ortools_ors_matrix"); }
+function runOrtoolsOrsMatrixConnected() { runOptimisation("ortools_ors_matrix_connected"); }
 
 
 
@@ -941,6 +1017,8 @@ function onOpen() {
         .addItem("K-Means (baseline)", "runKmeans")
         .addItem("OR-Tools Haversine", "runOrtoolsHaversine")
         .addItem("OR-Tools ORS Matrix", "runOrtoolsOrsMatrix")
+        .addItem("OR-Tools ORS Matrix — territoires connexes",
+                 "runOrtoolsOrsMatrixConnected")
     )
     .addSeparator()
     .addItem("Afficher la dernière carte", "afficherDerniereCarte")
