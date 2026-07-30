@@ -4125,8 +4125,13 @@ class _HybridClock:
         now = time.monotonic()
         return now >= self._deadline or now >= self.deadline
 
+    @property
+    def stage_deadline(self):
+        """Le plus contraignant des deux couperets : celui du bloc et le global."""
+        return min(self._deadline, self.deadline)
+
     def stage_remaining_s(self):
-        return max(0.0, min(self._deadline, self.deadline) - time.monotonic())
+        return max(0.0, self.stage_deadline - time.monotonic())
 
     def end(self, stop_reason):
         if self._current is None:
@@ -4286,6 +4291,250 @@ def hybrid_direct_joint_solve(points, indices, dur_matrix, dist_matrix, adjacenc
                             dur_matrix, dist_matrix, adjacency, points,
                             "joint_direct", "vroom_local", service_s,
                             declared=declared)
+
+
+def _hybrid_border_and_cores(group_a, group_b, adjacency, depth=1):
+    """Frontiere et noyaux dans le graphe G5.
+
+    `depth` compte les COUCHES LAISSEES LIBRES autour de la coupure :
+      - depth=1 : seuls les points ayant un voisin dans l'autre territoire
+        sont libres. Le noyau est large, la contrainte est forte ;
+      - depth=2 : leurs voisins sont libres aussi. Le noyau est plus petit,
+        le solveur a plus de latitude pour redessiner la frontiere.
+
+    Ce qui est fixe ne l'est pas parce qu'on le croit optimal, mais parce
+    qu'un point entoure de points du meme territoire n'a aucune raison
+    plausible de changer de camp : le figer concentre la recherche la ou elle
+    peut encore changer quelque chose.
+    """
+    sa, sb = set(group_a), set(group_b)
+    free = {i for i in sa if any(j in sb for j in adjacency.get(i, ()))}
+    free |= {i for i in sb if any(j in sa for j in adjacency.get(i, ()))}
+    for _ in range(max(0, int(depth) - 1)):
+        grown = set(free)
+        for i in free:
+            grown |= set(adjacency.get(i, ()))
+        free = grown
+    return sorted(free), sorted(sa - free), sorted(sb - free)
+
+
+def hybrid_nucleus_solve(points, indices, dur_matrix, dist_matrix, adjacency,
+                         start_idx, end_idx, capacity, seed_solution, depth,
+                         ledger, clock, service_s):
+    """BLOC B -- une resolution VROOM conjointe a noyaux fixes par skills.
+
+    Les points du noyau T1 portent la skill 1, ceux du noyau T2 la skill 2,
+    et les vehicules portent la skill correspondante : VROOM ne peut donc pas
+    les deplacer. Les points de frontiere ne portent aucune skill et restent
+    entierement libres.
+
+    Une variante = une requete a deux vehicules = UNE resolution au compteur.
+    """
+    free, core_a, core_b = _hybrid_border_and_cores(
+        seed_solution["group_a"], seed_solution["group_b"], adjacency, depth)
+
+    if not free:
+        # Aucun point de frontiere : tout est fige, la variante ne peut que
+        # reproduire sa graine. Depenser une resolution pour recalculer une
+        # solution deja connue serait du budget perdu.
+        raise local_vroom.LocalVroomError(
+            local_vroom.ERR_INVALID_SOLUTION,
+            "aucun point de frontiere a la profondeur %d" % depth)
+    if not core_a or not core_b:
+        # Tout est frontiere : la variante ne contraint rien et referait la
+        # resolution directe. On ne depense pas une resolution pour cela.
+        raise local_vroom.LocalVroomError(
+            local_vroom.ERR_INVALID_SOLUTION,
+            "noyau vide a la profondeur %d" % depth)
+    if len(core_a) > capacity or len(core_b) > capacity:
+        raise local_vroom.LocalVroomError(
+            local_vroom.ERR_INVALID_SOLUTION,
+            "noyau plus grand que la capacite")
+
+    job_skills = {}
+    for i in core_a:
+        job_skills[i] = [1]
+    for i in core_b:
+        job_skills[i] = [2]
+
+    vehicle_ids = (1, 2)
+    payload = local_vroom.build_joint_payload(
+        job_ids=indices,
+        durations=dur_matrix,
+        start_index=start_idx,
+        end_index=end_idx,
+        max_tasks_per_vehicle=capacity,
+        service_times={i: service_s for i in indices} if service_s else None,
+        job_location_index={i: i for i in indices},
+        vehicle_ids=vehicle_ids,
+        job_skills=job_skills,
+        vehicle_skills={1: [1], 2: [2]},
+    )
+    solution = local_vroom.solve_vroom_local(
+        payload,
+        timeout_s=local_vroom.get_config().per_solve_timeout_s,
+        ledger=ledger,
+        cancellation_deadline=clock.deadline,
+    )
+    sequences = local_vroom.validate_joint_solution(
+        solution, indices, vehicle_ids,
+        max_tasks_per_vehicle=capacity,
+        start_index=start_idx, end_index=end_idx)
+
+    # Le contrat des skills est verifie NOUS-MEMES : une solution qui aurait
+    # deplace un point du noyau serait valide au sens de la cardinalite mais
+    # violerait la variante demandee.
+    if not set(core_a).issubset(set(sequences[1])) or \
+            not set(core_b).issubset(set(sequences[2])):
+        raise local_vroom.LocalVroomError(
+            local_vroom.ERR_INVALID_SOLUTION,
+            "un point de noyau a change de territoire")
+
+    route_a, route_b = _hybrid_routes(sequences, vehicle_ids, start_idx, end_idx)
+    return _hybrid_solution(
+        sequences[1], sequences[2], route_a, route_b, dur_matrix, dist_matrix,
+        adjacency, points, "joint_nucleus_d%d" % depth, "vroom_local",
+        service_s, declared=(solution.get("summary") or {}).get("duration")), free
+
+
+def _hybrid_nn_cycle(indices, cost, first):
+    """Cycle global par plus proche voisin, sans depot.
+
+    `cost(a, b)` est fourni par l'appelant : la meme construction sert donc
+    aussi bien sur les durees ORS que sur l'haversine, sans dupliquer le code.
+    """
+    remaining = set(indices)
+    remaining.discard(first)
+    cycle = [first]
+    cursor = first
+    while remaining:
+        nxt = min(remaining, key=lambda j: (cost(cursor, j), j))
+        cycle.append(nxt)
+        remaining.discard(nxt)
+        cursor = nxt
+    return cycle
+
+
+def _hybrid_sweep_cycle(points, indices):
+    """Cycle par balayage angulaire autour du barycentre.
+
+    Un balayage produit une tournee geographiquement coherente la ou le plus
+    proche voisin peut zigzaguer : les deux familles de cycles donnent des
+    decoupes differentes, ce qui est exactement le but.
+    """
+    lat = sum(float(points[i]["lat"]) for i in indices) / len(indices)
+    lon = sum(float(points[i]["lon"]) for i in indices) / len(indices)
+    return sorted(indices, key=lambda i: (
+        math.atan2(float(points[i]["lat"]) - lat, float(points[i]["lon"]) - lon), i))
+
+
+def _hybrid_build_cycles(points, indices, dur_matrix):
+    """Plusieurs grandes tournees sur l'ensemble des points, sans reseau."""
+    cycles = []
+    n = len(indices)
+    if n < 4:
+        return [list(indices)]
+
+    def ors_cost(a, b):
+        return dur_matrix[a][b]
+
+    def hav_cost(a, b):
+        return haversine((float(points[a]["lat"]), float(points[a]["lon"])),
+                         (float(points[b]["lat"]), float(points[b]["lon"])))
+
+    # Quatre departs repartis dans la liste plutot qu'un seul : le plus proche
+    # voisin depend fortement de son point de depart, et un seul cycle ne
+    # donnerait qu'une seule famille de decoupes.
+    starts = sorted({indices[0], indices[n // 4], indices[n // 2],
+                     indices[(3 * n) // 4]})
+    for first in starts:
+        cycles.append(_hybrid_nn_cycle(indices, ors_cost, first))
+    cycles.append(_hybrid_nn_cycle(indices, hav_cost, indices[0]))
+    cycles.append(_hybrid_sweep_cycle(points, indices))
+    return cycles
+
+
+def _hybrid_refine_order(dur_matrix, route, deadline):
+    """Or-opt puis 2-opt sur la matrice ORS, sous garde de temps.
+
+    Aucun appel reseau : la matrice est celle deja chargee. La garde evite
+    qu'une seule route consomme tout le budget du bloc.
+    """
+    if time.monotonic() >= deadline or len(route) < 5:
+        return route
+    improved = _or_opt_matrix(dur_matrix, list(route))
+    if time.monotonic() >= deadline:
+        return improved
+    return _two_opt_matrix(dur_matrix, improved)
+
+
+def hybrid_route_first(points, indices, dur_matrix, dist_matrix, adjacency,
+                       start_idx, end_idx, target_a, clock, service_s,
+                       max_refined=6):
+    """BLOC B -- candidates route-first, sans aucun appel reseau.
+
+    Construire d'abord de grandes tournees sur les 60 points, puis les
+    DECOUPER en deux blocs contigus, produit des territoires naturellement
+    compacts : deux points voisins dans la tournee restent voisins dans la
+    decoupe. Chaque cycle est teste dans les deux orientations et sur toutes
+    les rotations echantillonnees.
+
+    Une decoupe fournit directement un ORDRE, donc son cout se lit sur la
+    matrice ORS en une passe. Seules les meilleures decoupes uniques paient
+    ensuite l'affinage Or-opt / 2-opt.
+
+    Retourne (solutions, stats).
+    """
+    n = len(indices)
+    stats = {"cycles": 0, "cuts": 0, "connected": 0, "unique": 0}
+    cycles = _hybrid_build_cycles(points, indices, dur_matrix)
+    stats["cycles"] = len(cycles)
+
+    step = max(1, n // 12)                 # une douzaine de rotations par cycle
+    seen = {}
+    for cycle in cycles:
+        if clock.expired():
+            break
+        for oriented in (cycle, list(reversed(cycle))):
+            for offset in range(0, n, step):
+                if clock.expired():
+                    break
+                rotated = oriented[offset:] + oriented[:offset]
+                block_a = rotated[:target_a]
+                block_b = rotated[target_a:]
+                stats["cuts"] += 1
+                if len(block_a) != target_a or len(block_b) != n - target_a:
+                    continue
+                if not is_connected_partition(block_a, adjacency)["connected"]:
+                    continue
+                if not is_connected_partition(block_b, adjacency)["connected"]:
+                    continue
+                stats["connected"] += 1
+                key = canonical_partition_key(block_a, block_b)
+                route_a = [start_idx] + list(block_a) + [end_idx]
+                route_b = [start_idx] + list(block_b) + [end_idx]
+                score = score_routes_on_matrix(dur_matrix, dist_matrix,
+                                               [route_a, route_b], service_s)
+                previous = seen.get(key)
+                if previous is None or score["duration_s"] < previous[0]:
+                    seen[key] = (score["duration_s"], block_a, block_b,
+                                 route_a, route_b)
+
+    stats["unique"] = len(seen)
+
+    # Affinage reserve aux meilleures decoupes : affiner les cent premieres
+    # consommerait le budget sans changer le classement.
+    ranked = sorted(seen.values(), key=lambda item: (item[0], item[1]))
+    solutions = []
+    for _, block_a, block_b, route_a, route_b in ranked[:max_refined]:
+        if clock.expired():
+            break
+        refined_a = _hybrid_refine_order(dur_matrix, route_a, clock.stage_deadline)
+        refined_b = _hybrid_refine_order(dur_matrix, route_b, clock.stage_deadline)
+        solutions.append(_hybrid_solution(
+            block_a, block_b, refined_a, refined_b, dur_matrix, dist_matrix,
+            adjacency, points, "route_first", "matrix_local_search", service_s))
+    return solutions, stats
 
 
 def _hybrid_diagnostics_template():
@@ -4483,6 +4732,76 @@ def _hybrid_run(points, indices, start_idx, end_idx, capacity, headers,
             diag["joint_direct_error"] = exc.code
             print("  Bloc A: echec VROOM local (%s)" % exc.code, flush=True)
     clock.end(stop_reason)
+
+    # =====================================================================
+    # BLOC B -- NOYAUX PUIS ROUTE-FIRST
+    # =====================================================================
+    # La graine des noyaux est la meilleure solution deja obtenue. Sans
+    # solution du bloc A, la variante n'aurait aucune frontiere a redessiner :
+    # on saute alors les noyaux plutot que de depenser une resolution a
+    # l'aveugle.
+    clock.begin("joint_nucleus", min(
+        config.nucleus_solves * (config.per_solve_timeout_s + 2.0),
+        clock.remaining_s()))
+    stop_reason = "done"
+    seed = select_best_solution(solutions) if solutions else None
+    if seed is None:
+        stop_reason = "no_seed"
+        diag["joint_nucleus_error"] = "no seed solution"
+    else:
+        best_nucleus = None
+        for depth in range(1, config.nucleus_solves + 1):
+            if clock.expired():
+                stop_reason = local_vroom.ERR_GLOBAL_TIME_LIMIT
+                break
+            if not ledger.can_attempt():
+                stop_reason = (local_vroom.ERR_BUDGET_EXHAUSTED
+                               if ledger.budget_left() <= 0
+                               else local_vroom.ERR_GLOBAL_TIME_LIMIT)
+                if ledger.budget_left() > 0:
+                    ledger.record_skip_for_time()
+                break
+            diag["joint_nucleus_attempted"] += 1
+            try:
+                solution, free = hybrid_nucleus_solve(
+                    points, indices, dur_matrix, dist_matrix, adjacency,
+                    start_idx, end_idx, capacity, seed, depth, ledger, clock,
+                    service_s)
+                solutions.append(solution)
+                diag["joint_nucleus_valid"] += 1
+                if best_nucleus is None or solution["duration_s"] < best_nucleus:
+                    best_nucleus = solution["duration_s"]
+                print("  Bloc B: noyaux d%d, %d points libres, %s, "
+                      "duree rescoree %.1fmin"
+                      % (depth, len(free), solution["sizes"],
+                         solution["duration_s"] / 60), flush=True)
+            except local_vroom.LocalVroomError as exc:
+                diag["joint_nucleus_error"] = exc.code
+                stop_reason = exc.code
+                print("  Bloc B: variante noyaux d%d rejetee (%s)"
+                      % (depth, exc.code), flush=True)
+        if best_nucleus is not None:
+            diag["joint_nucleus_best_duration_s"] = round(best_nucleus, 1)
+    clock.end(stop_reason)
+
+    # --- route-first : aucun appel reseau, budget dur ----------------------
+    clock.begin("route_first", min(config.route_first_budget_s,
+                                   clock.remaining_s()))
+    n_idx = len(indices)
+    rf_solutions, rf_stats = hybrid_route_first(
+        points, indices, dur_matrix, dist_matrix, adjacency, start_idx,
+        end_idx, n_idx // 2, clock, service_s)
+    solutions.extend(rf_solutions)
+    diag["route_first_cycles"] = rf_stats["cycles"]
+    diag["route_first_unique"] = rf_stats["unique"]
+    if rf_solutions:
+        diag["route_first_best_duration_s"] = round(
+            min(s["duration_s"] for s in rf_solutions), 1)
+    print("  Bloc B: route-first %d cycles, %d decoupes, %d connexes, "
+          "%d partitions uniques, %d affinees"
+          % (rf_stats["cycles"], rf_stats["cuts"], rf_stats["connected"],
+             rf_stats["unique"], len(rf_solutions)), flush=True)
+    clock.end("budget_exhausted" if clock.expired() else "done")
 
     return _hybrid_finish(points, indices, start_idx, end_idx, dur_matrix,
                           dist_matrix, adjacency, solutions, clock, ledger,
