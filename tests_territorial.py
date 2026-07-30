@@ -303,6 +303,29 @@ class TestLockAndStructure(unittest.TestCase):
         self.assertNotIn("territorial", body,
                          "haversine ne doit pas dependre de la logique territoriale")
 
+    def test_18_solution_limit_reporting_per_strategy(self):
+        """Le pipeline territorial ne passe plus par _solve_cvrp_ortools :
+        annoncer 75 comme limite effective serait faux. Regression du reporting."""
+        block = self.src[self.src.index("if strategy == \"ortools_haversine\":"):
+                         self.src.index("ortools_limit_override_applied = False")]
+
+        # haversine : seule strategie a utiliser encore le solveur CVRP
+        self.assertIn('partition_solver = "ortools_cvrp"', block)
+        self.assertIn("ortools_limit_effective = ORTOOLS_SOLUTION_LIMIT", block)
+
+        # ortools_ors_matrix : balayage geometrique, aucune limite OR-Tools
+        self.assertIn('partition_solver = "territorial_projection"', block)
+        terr = block[block.index('partition_solver = "territorial_projection"'):]
+        self.assertIn("ortools_limit_effective = None", terr,
+                      "le pipeline territorial doit rapporter None")
+
+        # la surcharge n'atteint plus aucun solveur
+        self.assertIn("ortools_limit_override_applied = False", self.src)
+        self.assertNotIn("ortools_limit_override_applied = (strategy ==", self.src)
+
+        # champ identifiant le solveur de partition, expose dans la reponse
+        self.assertIn('"partition_solver": partition_solver', self.src)
+
     def test_invariants_preserved(self):
         self.assertIn("ORTOOLS_SOLUTION_LIMIT = 75", self.src)
         self.assertIn("ORTOOLS_TIME_LIMIT_S = 25", self.src)
