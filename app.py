@@ -20,6 +20,16 @@ try:
 except ImportError:
     ORTOOLS_AVAILABLE = False
 
+# Couche VROOM locale (experimentale). Comme pour OR-Tools, son absence ne doit
+# jamais empecher le service de demarrer : sans elle, seules les strategies
+# existantes repondent, exactement comme aujourd'hui.
+try:
+    import local_vroom
+    LOCAL_VROOM_MODULE_AVAILABLE = True
+except ImportError:
+    local_vroom = None
+    LOCAL_VROOM_MODULE_AVAILABLE = False
+
 app = Flask(__name__)
 
 
@@ -5327,6 +5337,22 @@ def optimize():
 @app.route("/")
 def home():
     return "API OK - Vroom VRP ready"
+
+
+@app.route("/healthz")
+def healthz():
+    """Sonde legere : aucun fork, aucun reseau, aucun calcul.
+
+    Elle sert au controle de demarrage du conteneur. Avec un worker Gunicorn
+    synchrone, elle reste en file d'attente pendant une optimisation longue --
+    c'est le comportement actuel du service et il ne change pas ici."""
+    payload = {"status": "ok", "ortools": ORTOOLS_AVAILABLE}
+    if LOCAL_VROOM_MODULE_AVAILABLE:
+        payload.update(local_vroom.healthz())
+    else:
+        payload["local_vroom_enabled"] = False
+        payload["local_vroom_binary_present"] = False
+    return jsonify(payload)
 
 
 if __name__ == "__main__":
