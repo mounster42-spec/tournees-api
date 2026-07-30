@@ -242,23 +242,38 @@ class TestMstCuts(unittest.TestCase):
 class TestRegionGrowing(unittest.TestCase):
 
     def test_07_08_cardinality_and_connectivity(self):
-        """La source ne rend QUE des candidates certifiees : cardinalite
-        exacte et une seule composante par groupe. Une combinaison germes /
-        regle qui enclave les deux regions est abandonnee, pas reparee."""
+        """Cardinalite exacte pour TOUTES les sorties. Connexite certifiee ici
+        meme pour celles etiquetees "region_growing" ; celles etiquetees
+        "region_growing_repaired" partent vers la reparation commune."""
         pts = scattered_points(24)
         idx, adj, gmeta, dur, _dist = build(pts)
         target = len(idx) // 2
         out = app._region_growing_candidates(pts, idx, target, adj, dur,
                                              gmeta["tree_edges"], 200)
         self.assertGreater(len(out), 0)
-        for _s, ga, gb in out:
+        for source, ga, gb in out:
             self.assertEqual(len(ga), target, "cardinalite exacte violee")
             self.assertEqual(len(gb), len(idx) - target)
             self.assertEqual(set(ga) | set(gb), set(idx), "point perdu")
             self.assertEqual(set(ga) & set(gb), set(), "point duplique")
-            self.assertTrue(app.is_connected_partition(ga, adj)["connected"],
-                            "T1 morcele : la croissance n'ajoute que des voisins")
-            self.assertTrue(app.is_connected_partition(gb, adj)["connected"])
+            if source == "region_growing":
+                self.assertTrue(
+                    app.is_connected_partition(ga, adj)["connected"],
+                    "T1 morcele : la croissance n'ajoute que des voisins")
+                self.assertTrue(app.is_connected_partition(gb, adj)["connected"])
+
+    def test_region_growing_is_never_silent_on_a_dead_end_terrain(self):
+        """Une source muette se lit a tort comme une source inutile. Sur un
+        terrain qui enclave les regions, elle doit rendre des candidates a
+        reparer plutot que rien du tout."""
+        pts = scattered_points(24)
+        idx, adj, gmeta, dur, _ = build(pts)
+        out = app._region_growing_candidates(pts, idx, len(idx) // 2, adj, dur,
+                                             gmeta["tree_edges"], 200)
+        self.assertGreater(len(out), 0, "aucune candidate produite")
+        labels = {s for s, _a, _b in out}
+        self.assertTrue(labels <= {"region_growing", "region_growing_repaired"},
+                        "etiquette de source inattendue : %s" % labels)
 
     def test_region_growing_is_deterministic(self):
         pts = scattered_points(20)

@@ -145,6 +145,22 @@ def _flatten_counts(mapping):
     return ";".join("%s=%s" % (k, mapping[k]) for k in sorted(mapping))
 
 
+def _flatten_per_source(mapping):
+    """Bilan par source aplati pour Benchmark, dans un ordre stable :
+    "sweep:r=180,d=150,s=0,x=8,f=2,u=28". r=brutes, d=doublons, s=taille
+    invalide, x=deconnectees, f=reparations echouees, u=uniques conservees."""
+    if not isinstance(mapping, dict) or not mapping:
+        return ""
+    parts = []
+    for src in sorted(mapping):
+        b = mapping[src] or {}
+        parts.append("%s:r=%s,d=%s,s=%s,x=%s,f=%s,u=%s"
+                     % (src, b.get("raw", 0), b.get("duplicates", 0),
+                        b.get("invalid_size", 0), b.get("disconnected", 0),
+                        b.get("repair_failed", 0), b.get("unique", 0)))
+    return ";".join(parts)
+
+
 def _conn_get(matrix_meta, key, default):
     """Lit un champ du certificat de connexite. Les autres strategies ne
     produisent pas ce bloc : la valeur par defaut s'applique alors."""
@@ -829,6 +845,23 @@ def _post_matrix_retry(payload, headers, timeout=30):
     return None, f"failed after {ORS_MATRIX_RETRIES} attempts: {last_err}"
 
 
+def _matrix_content_hash(dur_matrix, dist_matrix):
+    """Empreinte courte du CONTENU des deux matrices ORS.
+
+    Deux runs qui affichent la meme empreinte ont resolu le meme probleme
+    routier ; deux empreintes differentes expliquent a elles seules un
+    resultat different, sans qu'aucun bug de selection soit en cause.
+    """
+    h = hashlib.md5()
+    for matrix in (dur_matrix, dist_matrix):
+        if not matrix:
+            h.update(b"|none|")
+            continue
+        for row in matrix:
+            h.update((",".join(str(v) for v in row) + ";").encode("utf-8"))
+    return h.hexdigest()[:12]
+
+
 def _matrix_block_plan(n):
     """Decoupe les n sources en blocs de lignes respectant le plafond de routes.
     Retourne (blocs, None) ou (None, message)."""
@@ -940,8 +973,16 @@ def _build_full_matrix_chunked(points, headers):
         print(f"  Matrice ORS: {nulls} cellule(s) nulle(s) remplacee(s) par "
               f"une estimation haversine a {ORS_MATRIX_NULL_SPEED_KMH} km/h", flush=True)
 
+    # Empreinte du CONTENU de la matrice, pas de ses entrees. La signature des
+    # points ne prouve rien : deux runs sur le meme jeu peuvent recevoir des
+    # durees routieres differentes -- mise a jour du reseau ORS, trafic, ou
+    # cellules nulles remplacees. Sans cette empreinte, comparer deux runs
+    # revient a comparer deux problemes qu'on suppose identiques.
+    meta["content_hash"] = _matrix_content_hash(dur_matrix, dist_matrix)
+
     _matrix_cache_put(key, (dur_matrix, dist_matrix, nulls))
     print(f"  Matrice ORS {n}x{n} assemblee en {meta['calls']} appel(s), "
+          f"empreinte contenu={meta['content_hash']}, "
           f"mise en cache ({key[:8]})", flush=True)
 
     return dur_matrix, dist_matrix, meta, None
@@ -1384,6 +1425,13 @@ CONNECTED_MAX_RAW_CANDIDATES = _env_int("CONNECTED_MAX_RAW_CANDIDATES", 2000, 2,
 CONNECTED_MAX_PERTURBATIONS = _env_int("CONNECTED_MAX_PERTURBATIONS", 250, 0, 20000)
 CONNECTED_MAX_CHAIN_LENGTH = _env_int("CONNECTED_MAX_CHAIN_LENGTH", 4, 1, 12)
 CONNECTED_MAX_REPAIRS = _env_int("CONNECTED_MAX_REPAIRS", 400, 1, 20000)
+CONNECTED_LOCAL_SEARCH_SEEDS = _env_int("CONNECTED_LOCAL_SEARCH_SEEDS", 6, 0, 100)
+# Places reservees aux candidates du generateur historique parmi les douze
+# finalistes. Une seule ne suffit pas : le score proxy classe mal ces
+# partitions -- sur un jeu reel, la meilleure au proxy rendait 11456 s apres
+# OR-Tools quand une autre, classee neuvieme, en rendait 11347. Reserver la
+# moitie des places laisse l'autre moitie a la diversite.
+CONNECTED_LEGACY_FINALIST_SLOTS = _env_int("CONNECTED_LEGACY_FINALIST_SLOTS", 6, 1, 12)
 CONNECTED_MAX_GENERATION_S = _env_int("CONNECTED_MAX_GENERATION_S", 25, 1, 600)
 CONNECTED_ORS_NEIGHBOR_K = _env_int("CONNECTED_ORS_NEIGHBOR_K", 3, 0, 20)
 
@@ -1615,6 +1663,27 @@ def canonical_partition_key(group_a, group_b):
     side_a = tuple(sorted(group_a))
     side_b = tuple(sorted(group_b))
     return min((side_a, side_b), (side_b, side_a))
+
+
+def _source_family(seed):
+    """Famille d'une source : "legacy:sweep_3" -> "legacy".
+
+    La diversite reserve des places aux sources encore absentes. Sans ce
+    regroupement, les onze graines historiques comptent pour onze sources
+    differentes et rafleraient toutes les places au titre de la nouveaute,
+    au detriment des geometries reellement distinctes.
+    """
+    return str(seed or "").split(":", 1)[0]
+
+
+def _short_key(partition_key):
+    """Empreinte courte et stable d'une partition, pour les journaux.
+    Comparer deux runs a l'oeil sur trente index est illisible ; huit
+    caracteres suffisent a dire "meme partition" ou "partition differente"."""
+    if not partition_key:
+        return "--------"
+    raw = "|".join(",".join(str(i) for i in side) for side in partition_key)
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()[:8]
 
 
 def partition_difference(key_a, key_b):
@@ -2133,22 +2202,30 @@ def _grow_two_regions(indices, target_a, adjacency, points, dur_matrix,
             break
         if not moved:
             # Les deux groupes sont enclaves : les points restants ne touchent
-            # plus aucun des deux. Verser le reliquat quelque part fabriquerait
-            # une ile, donc une candidate invalide deguisee en candidate. On
-            # abandonne cette combinaison germes/regle, les autres suffisent.
-            return None, None
-    return sorted(ga), sorted(gb)
+            # plus aucun des deux. Le reliquat part au groupe non sature et la
+            # candidate est marquee INCOMPLETE -- la reparation commune s'en
+            # chargera. L'abandonner rendrait la source totalement muette sur
+            # les terrains en impasse, ce qui est exactement ce qu'on observait.
+            leftovers = sorted(remaining)
+            (ga if len(ga) < target_a else gb).extend(leftovers)
+            remaining.clear()
+            return sorted(ga), sorted(gb), False
+    return sorted(ga), sorted(gb), True
 
 
 def _region_growing_candidates(points, indices, target_a, adjacency,
                                dur_matrix, tree_edges, budget):
     """SOURCE 3 -- toutes les paires de germes croisees avec toutes les regles.
 
-    Chaque resultat est CERTIFIE avant d'etre rendu : cardinalite exacte et une
-    seule composante par groupe. La croissance par voisinage l'assure presque
-    toujours, mais un terrain en impasse peut enclaver les deux regions -- ces
-    cas-la sont ecartes plutot que reparés, ce qui effacerait justement la
-    geometrie que la source cherchait a produire.
+    Deux etiquettes, pour que le bilan par source reste lisible :
+      - "region_growing" : croissance menee a terme uniquement par voisinage,
+        donc cardinalite exacte et une seule composante par groupe, CERTIFIEES
+        ici meme ;
+      - "region_growing_repaired" : terrain en impasse, les deux regions se
+        sont enclavees avant d'atteindre la cible. La candidate part quand meme
+        vers la reparation commune. La rejeter rendait la source entierement
+        muette sur certains jeux, ce qui se lisait a tort comme une source qui
+        ne produit rien.
     """
     out = []
     if len(indices) < 2:
@@ -2157,16 +2234,19 @@ def _region_growing_candidates(points, indices, target_a, adjacency,
                                       tree_edges):
         for rule in ("haversine", "ors", "continuity", "centroid"):
             for alternate in (True, False):
-                ga, gb = _grow_two_regions(indices, target_a, adjacency, points,
-                                           dur_matrix, seed_a, seed_b, rule,
-                                           alternate)
-                if ga is None:
+                ga, gb, complete = _grow_two_regions(
+                    indices, target_a, adjacency, points, dur_matrix, seed_a,
+                    seed_b, rule, alternate)
+                if not ga or not gb:
                     continue
-                ok, _reason, _info = validate_partition(ga, gb, indices,
-                                                        target_a, adjacency)
-                if not ok:
-                    continue
-                out.append(("region_growing", ga, gb))
+                if complete:
+                    ok, _reason, _info = validate_partition(ga, gb, indices,
+                                                            target_a, adjacency)
+                    if not ok:
+                        continue
+                    out.append(("region_growing", ga, gb))
+                else:
+                    out.append(("region_growing_repaired", ga, gb))
                 if len(out) >= budget:
                     return out
     return out
@@ -2224,8 +2304,96 @@ def _kmedoids_candidates(points, indices, target_a, adjacency, dur_matrix,
     return out
 
 
+def _unconstrained_partitions(indices, dur_matrix, hav_matrix, start_idx,
+                              end_idx):
+    """Les deux partitions NON CONTRAINTES du solveur : sur les durees ORS et
+    sur le vol d'oiseau.
+
+    Calculees UNE SEULE FOIS et partagees par la source historique et par les
+    reparations multiples. Chaque appel a _solve_cvrp_ortools coute plusieurs
+    secondes du budget de generation ; les dupliquer priverait les sources
+    suivantes de leur temps.
+    Retourne [(label, ga, gb), ...], eventuellement vide.
+    """
+    out = []
+    if not ORTOOLS_AVAILABLE:
+        return out
+    g, _err = _solve_cvrp_ortools(dur_matrix, 2, len(indices), start_idx, end_idx)
+    if g and len(g) == 2:
+        out.append(("ors_unconstrained", list(g[0]), list(g[1])))
+    gh, _err = _solve_cvrp_ortools(hav_matrix, 2, len(indices), start_idx, end_idx)
+    if gh and len(gh) == 2:
+        out.append(("haversine", list(gh[0]), list(gh[1])))
+    return out
+
+
+def legacy_connected_candidates(points, indices, target_a, adjacency, dur_matrix,
+                                start_idx, end_idx, unconstrained=None):
+    """SOURCE 0 -- reproduction EXACTE du generateur d'avant diversification.
+
+    Cette source n'est pas une redite : le generateur d'origine terminait
+    chaque candidate par connected_local_search(), une montee de colline par
+    echanges 1 contre 1 sur la frontiere. L'appartenance qu'elle rendait
+    n'etait donc PAS l'appartenance brute du balayage, et aucune des nouvelles
+    sources ne la reproduit. En la retirant, la diversification avait
+    silencieusement supprime l'incumbent historique du jeu de candidates : sur
+    la signature 42dd749a, la solution a 6641 s n'etait tout simplement plus
+    proposee au solveur.
+
+    Ses candidates sont etiquetees "legacy:<seed>" et beneficient d'une place
+    reservee parmi les finalistes : la diversification ajoute des solutions,
+    elle n'en retire jamais.
+    Retourne [(source, ga, gb), ...].
+    """
+    out = []
+    xy = _local_xy(points, indices)
+    raw = list(unconstrained or [])
+
+    # Balayage lineaire : les huit premieres coupes strictement separables,
+    # dans l'ordre historique (cle canonique croissante).
+    sweep, _sstats = enumerate_territorial_partitions(points, indices, target_a)
+    for rank, c in enumerate(sweep[:8]):
+        raw.append(("sweep_%d" % rank, c["group_a"], c["group_b"]))
+
+    ka, kb = _two_means_partition(points, indices, target_a)
+    if ka and kb:
+        raw.append(("two_means", ka, kb))
+
+    for seed, ga, gb in raw:
+        ga, gb = _normalize_sizes(ga, gb, indices, target_a, xy)
+        ga, gb, ok, _moves = repair_to_connected(
+            ga, gb, adjacency, points, dur_matrix, start_idx, end_idx, target_a)
+        if not ok:
+            continue
+        # L'etape que la diversification avait perdue.
+        ga, gb, _est, _swaps = connected_local_search(
+            ga, gb, adjacency, dur_matrix, start_idx, end_idx)
+        out.append(("legacy:" + seed, sorted(ga), sorted(gb)))
+    return out
+
+
+def _local_search_candidates(seeds, adjacency, dur_matrix, start_idx, end_idx,
+                             budget):
+    """Optimum local des meilleures candidates NOUVELLES.
+
+    Meme montee de colline que la source historique, appliquee cette fois aux
+    partitions issues des nouvelles sources : une appartenance brute et son
+    optimum local sont deux territoires distincts, et c'est le second qui
+    gagnait historiquement.
+    """
+    out = []
+    for ga, gb in seeds[:budget]:
+        na, nb, _est, swaps = connected_local_search(ga, gb, adjacency,
+                                                     dur_matrix, start_idx,
+                                                     end_idx)
+        if swaps:
+            out.append(("local_search", sorted(na), sorted(nb)))
+    return out
+
+
 def _ors_repair_candidates(points, indices, target_a, adjacency, dur_matrix,
-                           hav_matrix, start_idx, end_idx, budget):
+                           hav_matrix, start_idx, end_idx, budget,
+                           unconstrained=None):
     """SOURCE 5 -- reparations multiples de la partition ORS non contrainte.
 
     La partition que le solveur trouve sans contrainte de connexite est la
@@ -2236,15 +2404,9 @@ def _ors_repair_candidates(points, indices, target_a, adjacency, dur_matrix,
     territoires.
     """
     out = []
-    if not ORTOOLS_AVAILABLE:
-        return out
-    seeds = []
-    g, _err = _solve_cvrp_ortools(dur_matrix, 2, len(indices), start_idx, end_idx)
-    if g and len(g) == 2:
-        seeds.append(("ors_repair", g[0], g[1]))
-    gh, _err = _solve_cvrp_ortools(hav_matrix, 2, len(indices), start_idx, end_idx)
-    if gh and len(gh) == 2:
-        seeds.append(("haversine_repair", gh[0], gh[1]))
+    labels = {"ors_unconstrained": "ors_repair", "haversine": "haversine_repair"}
+    seeds = [(labels.get(lbl, lbl), ga, gb)
+             for lbl, ga, gb in (unconstrained or [])]
     if not seeds:
         return out
 
@@ -2381,38 +2543,63 @@ def generate_connected_candidates(points, indices, target_a, adjacency,
         "raw": 0, "unique": 0, "duplicates": 0, "invalid_size": 0,
         "disconnected": 0, "repair_failed": 0, "repairs": 0,
         "by_source": {}, "perturbations": 0, "timeout": False,
+        # Bilan DETAILLE par source. Un simple compteur d'uniques ne dit pas
+        # si une source est muette parce qu'elle ne produit rien, parce que
+        # tout est deja connu, ou parce que ses variantes sont morcelees.
+        "per_source": {}, "legacy_keys": [], "expired_after": None,
     }
     xy = _local_xy(points, indices)
     tree_edges = tree_edges or []
     if deadline is None:
         deadline = time.time() + CONNECTED_MAX_GENERATION_S
 
-    def expired():
+    def expired(stage=None):
         if time.time() >= deadline:
             stats["timeout"] = True
+            if stats["expired_after"] is None:
+                stats["expired_after"] = stage
             return True
         return False
 
+    def bucket(source):
+        return stats["per_source"].setdefault(
+            source, {"raw": 0, "duplicates": 0, "invalid_size": 0,
+                     "disconnected": 0, "repair_failed": 0, "unique": 0})
+
+    # Les deux resolutions non contraintes servent A LA FOIS a la source
+    # historique et aux reparations multiples : on les calcule une seule fois.
+    unconstrained = _unconstrained_partitions(indices, dur_matrix, hav_matrix,
+                                              start_idx, end_idx)
+
     # --- collecte des appartenances brutes, source par source ---
     raw_budget = CONNECTED_MAX_RAW_CANDIDATES
+
+    # SOURCE 0 : les candidates du generateur historique, hors entrelacement.
+    # Elles passent AVANT tout le reste et ne peuvent donc jamais etre evincees
+    # par le plafond de partitions uniques.
+    legacy = legacy_connected_candidates(points, indices, target_a, adjacency,
+                                         dur_matrix, start_idx, end_idx,
+                                         unconstrained=unconstrained)
+
     batches = []
     batches.append(_ors_repair_candidates(points, indices, target_a, adjacency,
                                           dur_matrix, hav_matrix, start_idx,
-                                          end_idx, raw_budget))
-    if not expired():
+                                          end_idx, raw_budget,
+                                          unconstrained=unconstrained))
+    if not expired("mst"):
         batches.append(_mst_cut_candidates(points, indices, target_a, tree_edges,
                                            raw_budget))
-    if not expired():
+    if not expired("region_growing"):
         batches.append(_region_growing_candidates(points, indices, target_a,
                                                   adjacency, dur_matrix,
                                                   tree_edges, raw_budget))
-    if not expired():
+    if not expired("two_means"):
         batches.append(_two_means_candidates(points, indices, target_a, adjacency,
                                              dur_matrix, tree_edges, raw_budget))
-    if not expired():
+    if not expired("kmedoids"):
         batches.append(_kmedoids_candidates(points, indices, target_a, adjacency,
                                             dur_matrix, tree_edges, raw_budget))
-    if not expired():
+    if not expired("sweep"):
         batches.append(_sweep_membership_candidates(points, indices, target_a,
                                                     raw_budget))
 
@@ -2428,8 +2615,6 @@ def generate_connected_candidates(points, indices, target_a, adjacency,
         if len(raw) >= raw_budget:
             break
     raw = raw[:raw_budget]
-    stats["raw"] = len(raw)
-    stats["generated"] = len(raw)
 
     seen = {}
     seen_raw = set()
@@ -2439,11 +2624,16 @@ def generate_connected_candidates(points, indices, target_a, adjacency,
         """Valide, repare si necessaire, deduplique. Retourne True si une
         NOUVELLE partition connexe a ete retenue."""
         nonlocal repairs_used
+        b = bucket(source)
+        b["raw"] += 1
+        stats["raw"] += 1
+        stats["generated"] += 1
         # Deduplication AVANT toute reparation : reparer deux fois la meme
         # appartenance brute coute cher et rend exactement le meme resultat.
         raw_key = canonical_partition_key(ga, gb)
         if raw_key in seen_raw:
             stats["duplicates"] += 1
+            b["duplicates"] += 1
             return False
         seen_raw.add(raw_key)
 
@@ -2452,8 +2642,9 @@ def generate_connected_candidates(points, indices, target_a, adjacency,
         if not ok and allow_repair:
             if reason in ("invalid_size", "disconnected", "lost_points",
                           "duplicate"):
-                if repairs_used >= CONNECTED_MAX_REPAIRS or expired():
+                if repairs_used >= CONNECTED_MAX_REPAIRS or expired("repair"):
                     stats["repair_failed"] += 1
+                    b["repair_failed"] += 1
                     return False
                 repairs_used += 1
                 stats["repairs"] += 1
@@ -2463,16 +2654,20 @@ def generate_connected_candidates(points, indices, target_a, adjacency,
                     target_a)
                 if not done:
                     stats["repair_failed"] += 1
+                    b["repair_failed"] += 1
                     return False
                 ok, reason, _info = validate_partition(ga, gb, indices,
                                                        target_a, adjacency)
         if not ok:
             if reason == "disconnected":
                 stats["disconnected"] += 1
+                b["disconnected"] += 1
             elif reason == "invalid_size":
                 stats["invalid_size"] += 1
+                b["invalid_size"] += 1
             else:
                 stats["repair_failed"] += 1
+                b["repair_failed"] += 1
             return False
 
         # Deduplication APRES reparation : deux sources differentes convergent
@@ -2480,19 +2675,42 @@ def generate_connected_candidates(points, indices, target_a, adjacency,
         key = canonical_partition_key(ga, gb)
         if key in seen:
             stats["duplicates"] += 1
+            b["duplicates"] += 1
             return False
         est = (_estimate_group_cost(dur_matrix, ga, start_idx, end_idx, False)[0]
                + _estimate_group_cost(dur_matrix, gb, start_idx, end_idx, False)[0])
         seen[key] = {"group_a": ga, "group_b": gb, "seed": source,
-                     "est_duration_s": est, "partition_key": key}
+                     "est_duration_s": est, "partition_key": key,
+                     "legacy": source.startswith("legacy:")}
         stats["by_source"][source] = stats["by_source"].get(source, 0) + 1
+        b["unique"] += 1
         stats["valid"] += 1
         return True
 
+    # Les candidates historiques d'abord, SANS aucun plafond ni garde-fou de
+    # temps : leur nombre est borne par construction (onze au plus) et elles
+    # portent l'incumbent qu'il ne faut jamais perdre.
+    for source, ga, gb in legacy:
+        if consider(source, ga, gb):
+            stats["legacy_keys"].append(canonical_partition_key(ga, gb))
+
     for source, ga, gb in raw:
-        if len(seen) >= CONNECTED_MAX_UNIQUE_CANDIDATES or expired():
+        if len(seen) >= CONNECTED_MAX_UNIQUE_CANDIDATES or expired("consider"):
             break
         consider(source, ga, gb)
+
+    # --- optimum local des meilleures nouvelles candidates ---
+    # Meme montee de colline que la source historique : c'est elle qui
+    # transformait une coupe de balayage en incumbent.
+    if not expired("local_search") and len(seen) < CONNECTED_MAX_UNIQUE_CANDIDATES:
+        fresh = sorted((c for c in seen.values() if not c["legacy"]),
+                       key=lambda c: (c["est_duration_s"], c["partition_key"]))
+        for source, ga, gb in _local_search_candidates(
+                [(c["group_a"], c["group_b"]) for c in fresh], adjacency,
+                dur_matrix, start_idx, end_idx, CONNECTED_LOCAL_SEARCH_SEEDS):
+            if len(seen) >= CONNECTED_MAX_UNIQUE_CANDIDATES or expired("local_search"):
+                break
+            consider(source, ga, gb, allow_repair=False)
 
     # --- perturbations des meilleures candidates ---
     # Elles ne partent QUE de partitions deja valides : leurs voisines sont
@@ -2500,7 +2718,7 @@ def generate_connected_candidates(points, indices, target_a, adjacency,
     # budget de reparation sur des variantes sans avenir.
     if (CONNECTED_MAX_PERTURBATIONS > 0
             and len(seen) < CONNECTED_TARGET_UNIQUE_CANDIDATES
-            and not expired()):
+            and not expired("perturbation")):
         best = sorted(seen.values(),
                       key=lambda c: (c["est_duration_s"], c["partition_key"]))[:4]
         variants = _perturbation_candidates(
@@ -2508,13 +2726,11 @@ def generate_connected_candidates(points, indices, target_a, adjacency,
             adjacency, CONNECTED_MAX_PERTURBATIONS)
         stats["perturbations"] = len(variants)
         for source, ga, gb in variants:
-            if len(seen) >= CONNECTED_MAX_UNIQUE_CANDIDATES or expired():
+            if len(seen) >= CONNECTED_MAX_UNIQUE_CANDIDATES or expired("perturbation"):
                 break
             # Une voisine n'est retenue que si elle est valide TELLE QUELLE :
             # la reparer effacerait justement la perturbation.
             consider(source, ga, gb, allow_repair=False)
-        stats["raw"] += len(variants)
-        stats["generated"] += len(variants)
 
     stats["unique"] = len(seen)
     stats["sources"] = dict(stats["by_source"])
@@ -2565,7 +2781,8 @@ def _fallback_connected_candidates(points, indices, target_a, adjacency,
 
 
 def select_diverse_finalists(scored, limit,
-                             diverse_share=CONNECTED_DIVERSE_SHARE):
+                             diverse_share=CONNECTED_DIVERSE_SHARE,
+                             protected_keys=()):
     """Choisit les finalistes en melangeant score et diversite d'appartenance.
 
     Prendre les `limit` meilleurs scores donne souvent douze variantes du meme
@@ -2574,8 +2791,13 @@ def select_diverse_finalists(scored, limit,
     classee treizieme -- n'est jamais essayee. On reserve donc une partie des
     places a la distance d'appartenance et aux sources encore absentes.
 
-    La MEILLEURE candidate est toujours prise en premier : la diversite ajoute
-    des essais, elle n'en retire jamais le plus prometteur.
+    Deux garanties, dans cet ordre :
+      - les partitions PROTEGEES entrent d'office. C'est la place reservee a
+        la meilleure candidate du generateur historique : un proxy defavorable
+        ne doit pas suffire a l'ecarter du banc d'essai OR-Tools, sinon la
+        diversification peut degrader le resultat au lieu de l'enrichir ;
+      - la MEILLEURE candidate au score est prise ensuite, sans condition.
+    La diversite ne remplit que les places restantes.
     Retourne (finalistes, min_difference).
     """
     ordered = sorted(scored, key=_selection_key)
@@ -2584,25 +2806,33 @@ def select_diverse_finalists(scored, limit,
     if len(ordered) <= limit:
         return ordered, _min_pairwise_difference(ordered)
 
-    quota = max(1, limit - int(limit * diverse_share))
-    chosen = ordered[:quota]                    # les meilleurs scores, sans condition
+    protected = set(protected_keys or ())
+    chosen = [c for c in ordered if c["partition_key"] in protected][:limit]
     chosen_keys = [c["partition_key"] for c in chosen]
-    used_sources = {c.get("seed") for c in chosen}
+
+    quota = max(1, limit - int(limit * diverse_share))
+    for cand in ordered:                        # les meilleurs scores ensuite
+        if len(chosen) >= quota:
+            break
+        if cand["partition_key"] not in chosen_keys:
+            chosen.append(cand)
+            chosen_keys.append(cand["partition_key"])
+    used_sources = {_source_family(c.get("seed")) for c in chosen}
     rank_of = {c["partition_key"]: r for r, c in enumerate(ordered)}
 
-    for _ in range(limit - quota):
+    while len(chosen) < limit:
         best, best_key = None, None
         for cand in ordered:
             if cand["partition_key"] in chosen_keys:
                 continue
-            diff = min(partition_difference(cand["partition_key"], k)
-                       for k in chosen_keys)
+            diff = min((partition_difference(cand["partition_key"], k)
+                        for k in chosen_keys), default=1)
             if diff == 0:
                 continue
             # source encore absente d'abord, puis ecart d'appartenance, puis
             # rang de score : une candidate lointaine mais mediocre ne passe
             # jamais devant une candidate lointaine et bien classee.
-            novel = 0 if cand.get("seed") not in used_sources else 1
+            novel = 0 if _source_family(cand.get("seed")) not in used_sources else 1
             key = (novel, -diff, rank_of[cand["partition_key"]],
                    cand["partition_key"])
             if best_key is None or key < best_key:
@@ -2611,7 +2841,7 @@ def select_diverse_finalists(scored, limit,
             break
         chosen.append(best)
         chosen_keys.append(best["partition_key"])
-        used_sources.add(best.get("seed"))
+        used_sources.add(_source_family(best.get("seed")))
 
     # Complement si la diversite n'a pas trouve assez de candidates distinctes.
     for cand in ordered:
@@ -2818,6 +3048,21 @@ def ortools_partition_ors_matrix_connected(points, num_vehicles, max_per_vehicle
         "connected_graph_method": None,
         "connected_ors_neighbor_k": CONNECTED_ORS_NEIGHBOR_K,
         "connected_diversity_error": "",
+        # --- protection de l'incumbent historique ---
+        "connected_candidates_legacy": 0,
+        "connected_legacy_protected": False,
+        "connected_legacy_proxy_rank": None,
+        "connected_legacy_finalist_slots": 0,
+        "connected_legacy_finalists": 0,
+        "connected_legacy_in_finalists": False,
+        "connected_legacy_is_winner": False,
+        "connected_legacy_duration_s": None,
+        "connected_legacy_distance_m": None,
+        "connected_legacy_seed": None,
+        "connected_candidates_local_search": 0,
+        "connected_per_source": {},
+        "connected_generation_expired_after": None,
+        "connected_matrix_hash": None,
     }
     meta = {"connected": diag}
 
@@ -2895,20 +3140,45 @@ def ortools_partition_ors_matrix_connected(points, num_vehicles, max_per_vehicle
     diag["connected_candidates_by_source"] = by_source
     diag["connected_candidates_sweep"] = by_source.get("sweep", 0)
     diag["connected_candidates_mst"] = by_source.get("mst", 0)
-    diag["connected_candidates_region_growing"] = by_source.get("region_growing", 0)
+    diag["connected_candidates_region_growing"] = (
+        by_source.get("region_growing", 0)
+        + by_source.get("region_growing_repaired", 0))
     diag["connected_candidates_two_means"] = by_source.get("two_means", 0)
     diag["connected_candidates_kmedoids"] = by_source.get("kmedoids", 0)
     diag["connected_candidates_ors_repair"] = (by_source.get("ors_repair", 0)
                                                + by_source.get("haversine_repair", 0))
     diag["connected_candidates_perturbation"] = by_source.get("perturbation", 0)
+    diag["connected_candidates_local_search"] = by_source.get("local_search", 0)
+    diag["connected_candidates_legacy"] = sum(
+        v for k, v in by_source.items() if k.startswith("legacy:"))
+    diag["connected_per_source"] = dict(cstats.get("per_source") or {})
+    diag["connected_generation_expired_after"] = cstats.get("expired_after")
+    diag["connected_matrix_hash"] = mmeta.get("content_hash")
     if cstats.get("timeout"):
         diag["connected_diversity_error"] = (diag["connected_diversity_error"]
-                                             or "generation budget reached")
+                                             or "generation budget reached after %s"
+                                             % cstats.get("expired_after"))
     print(f"  Candidates: {diag['connected_candidates_raw']} brutes, "
           f"{diag['connected_candidates_unique']} uniques, "
           f"{diag['connected_candidates_duplicates']} doublons, "
           f"{diag['connected_candidates_repair_failed']} reparations echouees "
-          f"en {diag['connected_enum_ms']}ms | {by_source}", flush=True)
+          f"en {diag['connected_enum_ms']}ms | matrice={diag['connected_matrix_hash']}",
+          flush=True)
+    # Bilan par source : brutes / doublons / taille KO / deconnectees /
+    # reparations echouees / uniques conservees. C'est la seule facon de savoir
+    # si une source est muette parce qu'elle ne produit rien ou parce que tout
+    # ce qu'elle produit est deja connu.
+    for src in sorted(diag["connected_per_source"]):
+        b = diag["connected_per_source"][src]
+        print("    %-22s brutes=%-4d dup=%-4d tailleKO=%-3d deconn=%-4d "
+              "repKO=%-3d uniques=%d"
+              % (src, b["raw"], b["duplicates"], b["invalid_size"],
+                 b["disconnected"], b["repair_failed"], b["unique"]),
+              flush=True)
+    if cstats.get("expired_after"):
+        print(f"    budget de generation epuise a l'etape "
+              f"'{cstats['expired_after']}' : les sources suivantes n'ont pas "
+              f"tourne", flush=True)
 
     if not cands:
         diag["connected_error"] = "no connected partition could be built"
@@ -2944,16 +3214,55 @@ def ortools_partition_ors_matrix_connected(points, num_vehicles, max_per_vehicle
             "comp_a": ia, "comp_b": ib,
             "boundary": boundary_metrics(ga, gb, adjacency, points),
             "duration_s": dur, "distance_m": dist,
+            "legacy": bool(c.get("legacy")),
         })
     diag["connected_candidates_scored"] = len(rough)
 
-    # --- finalistes : score ET diversite d'appartenance ---
-    finalist_bases, min_diff = select_diverse_finalists(rough,
-                                                        CONNECTED_ORTOOLS_FINALISTS)
+    # Rang proxy de chaque candidate, pour le journal de traçabilite.
+    proxy_rank = {c["partition_key"]: r
+                  for r, c in enumerate(sorted(rough, key=_selection_key))}
+
+    # --- places reservees aux candidates historiques ---
+    # Les candidates du generateur d'avant diversification entrent d'office
+    # dans les finalistes, dans la limite de CONNECTED_LEGACY_FINALIST_SLOTS.
+    # Sans cette reserve, un proxy defavorable suffit a les ecarter du banc
+    # d'essai OR-Tools : c'est exactement ce qui a fait perdre la solution a
+    # 6641 s sur 42dd749a. Et une seule place ne suffit pas -- le proxy classe
+    # mal ces partitions, la meilleure au proxy n'est pas la meilleure apres
+    # sequencement.
+    legacy_rough = sorted((c for c in rough if c["legacy"]), key=_selection_key)
+    protected_keys = tuple(c["partition_key"]
+                           for c in legacy_rough[:CONNECTED_LEGACY_FINALIST_SLOTS])
+    if legacy_rough:
+        best_legacy = legacy_rough[0]
+        diag["connected_legacy_protected"] = True
+        diag["connected_legacy_proxy_rank"] = proxy_rank[best_legacy["partition_key"]]
+        diag["connected_legacy_seed"] = best_legacy["seed"]
+        diag["connected_legacy_finalist_slots"] = len(protected_keys)
+
+    # --- finalistes : incumbent historique, puis score, puis diversite ---
+    finalist_bases, min_diff = select_diverse_finalists(
+        rough, CONNECTED_ORTOOLS_FINALISTS, protected_keys=protected_keys)
+    finalist_keys = {b["partition_key"] for b in finalist_bases}
     diag["connected_candidates_selected_diverse"] = len(finalist_bases)
     diag["connected_candidate_min_difference"] = min_diff
+    diag["connected_legacy_in_finalists"] = bool(
+        protected_keys and protected_keys[0] in finalist_keys)
+    diag["connected_legacy_finalists"] = sum(
+        1 for k in protected_keys if k in finalist_keys)
     print(f"  Finalistes: {len(finalist_bases)} sur {len(rough)} candidates, "
           f"ecart d'appartenance minimal={min_diff} points", flush=True)
+
+    # Journal compact des candidates HISTORIQUES : c'est la trace qui manquait
+    # pour savoir ce qu'etait devenu sweep_2 d'un run a l'autre.
+    for c in sorted(legacy_rough, key=lambda x: x["seed"]):
+        print("    [historique] %-18s cle=%s rang=%-3d proxy=%.1fs/%.0fm "
+              "finaliste=%s"
+              % (c["seed"], _short_key(c["partition_key"]),
+                 proxy_rank[c["partition_key"]], c["duration_s"],
+                 c["distance_m"],
+                 "oui" if c["partition_key"] in finalist_keys else "NON"),
+              flush=True)
 
     # Affinage Or-opt + 2-opt reserve aux finalistes : le faire sur toutes les
     # candidates coute cher et ne change pas la preselection.
@@ -2980,6 +3289,10 @@ def ortools_partition_ors_matrix_connected(points, num_vehicles, max_per_vehicle
                                            "ortools")
             solutions.append(sol)
             ortools_sols.append(sol)
+            if cand.get("legacy"):
+                print("    [historique] %-18s cle=%s OR-Tools %.1fs / %.0fm"
+                      % (cand["seed"], _short_key(cand["partition_key"]),
+                         sol["duration_s"], sol["distance_m"]), flush=True)
         # La MEME fonction de selection sert partout : ces deux colonnes
         # decrivent OR-Tools seul, avec la regle appliquee au reste.
         ortools_best = select_best_solution(ortools_sols)
@@ -3032,6 +3345,21 @@ def ortools_partition_ors_matrix_connected(points, num_vehicles, max_per_vehicle
         return None, diag["connected_error"], meta
     diag["final_selection_reason"] = incumbent["selection_reason"]
     diag["connected_solutions_considered"] = len(solutions)
+    diag["connected_legacy_is_winner"] = bool(incumbent.get("legacy"))
+
+    # Meilleure solution issue de la partition historique, tous sequenceurs
+    # confondus. La comparer au gagnant repond a la seule question qui compte :
+    # la diversification a-t-elle ajoute ou remplace ?
+    legacy_best = select_best_solution([s for s in solutions if s.get("legacy")])
+    if legacy_best is not None:
+        diag["connected_legacy_duration_s"] = round(legacy_best["duration_s"], 1)
+        diag["connected_legacy_distance_m"] = round(legacy_best["distance_m"], 1)
+        if not diag["connected_legacy_is_winner"]:
+            print("  Historique battu: %.1fs / %.0fm (%s) contre %.1fs / %.0fm "
+                  "retenu (%s)"
+                  % (legacy_best["duration_s"], legacy_best["distance_m"],
+                     legacy_best["seed"], incumbent["duration_s"],
+                     incumbent["distance_m"], incumbent["seed"]), flush=True)
 
     diag["connected_score_ms"] = int((time.time() - t_score) * 1000)
 
@@ -4248,6 +4576,27 @@ def optimize():
         "connected_graph_method": _conn_get(matrix_meta, "connected_graph_method", None),
         "connected_ors_neighbor_k": _conn_get(matrix_meta, "connected_ors_neighbor_k", None),
         "connected_diversity_error": _conn_get(matrix_meta, "connected_diversity_error", ""),
+
+        # --- protection de l'incumbent historique ---
+        "connected_candidates_legacy": _conn_get(matrix_meta, "connected_candidates_legacy", 0),
+        "connected_candidates_local_search": _conn_get(matrix_meta, "connected_candidates_local_search", 0),
+        "connected_legacy_protected": _conn_get(matrix_meta, "connected_legacy_protected", False),
+        "connected_legacy_seed": _conn_get(matrix_meta, "connected_legacy_seed", None),
+        "connected_legacy_proxy_rank": _conn_get(matrix_meta, "connected_legacy_proxy_rank", None),
+        "connected_legacy_finalist_slots": _conn_get(matrix_meta, "connected_legacy_finalist_slots", 0),
+        "connected_legacy_finalists": _conn_get(matrix_meta, "connected_legacy_finalists", 0),
+        "connected_legacy_in_finalists": _conn_get(matrix_meta, "connected_legacy_in_finalists", False),
+        "connected_legacy_is_winner": _conn_get(matrix_meta, "connected_legacy_is_winner", False),
+        "connected_legacy_duration_s": _conn_get(matrix_meta, "connected_legacy_duration_s", None),
+        "connected_legacy_distance_m": _conn_get(matrix_meta, "connected_legacy_distance_m", None),
+        "connected_per_source": _conn_get(matrix_meta, "connected_per_source", {}),
+        "connected_per_source_text": _flatten_per_source(
+            _conn_get(matrix_meta, "connected_per_source", {})),
+        "connected_generation_expired_after": _conn_get(matrix_meta, "connected_generation_expired_after", None),
+        # Empreinte du CONTENU de la matrice ORS : deux runs sur la meme
+        # signature de points peuvent avoir recu des durees routieres
+        # differentes. Sans ce champ, aucune comparaison de runs n'est fondee.
+        "connected_matrix_hash": _conn_get(matrix_meta, "connected_matrix_hash", None),
 
         # --- post-optimisation intra-tournee, communes a toutes les strategies ---
         "final_post_optimizer": final_post_optimizer,
