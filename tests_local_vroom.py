@@ -105,7 +105,13 @@ class FakeVroom:
 
     Le journal est sur DISQUE et non en memoire parce que le wrapper passe au
     subprocess un environnement minimal : le faux binaire ne peut rien recevoir
-    par variable d'environnement, et c'est precisement ce qu'on veut verifier."""
+    par variable d'environnement, et c'est precisement ce qu'on veut verifier.
+
+    Le vrai subprocess n'est exerce que sous POSIX : c'est la cible du
+    service, et le comportement du binaire y est prouve par la CI. Les tests
+    de la strategie, eux, injectent un solveur factice et n'ont donc besoin
+    d'aucun processus -- ils tournent partout.
+    """
 
     def __init__(self, mode="ok"):
         self.dir = tempfile.mkdtemp(prefix="fakevroom-")
@@ -176,32 +182,35 @@ class TestConfiguration(unittest.TestCase):
 
     def test_default_budgets_match_the_prudent_profile(self):
         config = make_config()
-        self.assertEqual(config.max_solves, 8)
+        self.assertEqual(config.max_solves, 4)
         self.assertEqual(config.direct_solves, 1)
-        self.assertEqual(config.nucleus_solves, 2)
-        self.assertEqual(config.finalist_solves, 5)
+        self.assertEqual(config.nucleus_solves, 1)
+        self.assertEqual(config.finalist_solves, 2)
         self.assertEqual(config.max_concurrent_solves, 1)
+        # 1 directe + 1 noyau + 2 finalistes = le plafond de 4.
+        self.assertEqual(config.direct_solves + config.nucleus_solves
+                         + config.finalist_solves, config.max_solves)
         self.assertAlmostEqual(config.total_soft_limit_s, 58.0)
-        self.assertAlmostEqual(config.per_solve_timeout_s, 6.0)
-        self.assertAlmostEqual(config.min_remaining_to_start_s, 7.0)
-        self.assertAlmostEqual(config.route_first_budget_s, 4.0)
-        self.assertAlmostEqual(config.alns_budget_s, 10.0)
+        self.assertAlmostEqual(config.per_solve_timeout_s, 8.0)
+        self.assertAlmostEqual(config.min_remaining_to_start_s, 9.0)
+        self.assertAlmostEqual(config.route_first_budget_s, 3.0)
+        self.assertAlmostEqual(config.alns_budget_s, 6.0)
 
-    def test_budgets_can_be_raised_to_sixteen_without_code_change(self):
+    def test_budgets_can_be_raised_to_eight_without_code_change(self):
         env_backup = dict(os.environ)
         try:
-            os.environ["LOCAL_VROOM_MAX_SOLVES"] = "16"
-            os.environ["LOCAL_VROOM_NUCLEUS_SOLVES"] = "3"
-            os.environ["LOCAL_VROOM_FINALIST_SOLVES"] = "12"
+            os.environ["LOCAL_VROOM_MAX_SOLVES"] = "8"
+            os.environ["LOCAL_VROOM_NUCLEUS_SOLVES"] = "2"
+            os.environ["LOCAL_VROOM_FINALIST_SOLVES"] = "5"
             config = local_vroom.LocalVroomConfig()
         finally:
             os.environ.clear()
             os.environ.update(env_backup)
-        self.assertEqual(config.max_solves, 16)
-        self.assertEqual(config.nucleus_solves, 3)
-        self.assertEqual(config.finalist_solves, 12)
+        self.assertEqual(config.max_solves, 8)
+        self.assertEqual(config.nucleus_solves, 2)
+        self.assertEqual(config.finalist_solves, 5)
         self.assertEqual(config.direct_solves + config.nucleus_solves
-                         + config.finalist_solves, 16)
+                         + config.finalist_solves, 8)
 
     def test_absurd_values_fall_back_to_defaults(self):
         env_backup = dict(os.environ)
@@ -212,8 +221,8 @@ class TestConfiguration(unittest.TestCase):
         finally:
             os.environ.clear()
             os.environ.update(env_backup)
-        self.assertEqual(config.max_solves, 8)
-        self.assertAlmostEqual(config.per_solve_timeout_s, 6.0)
+        self.assertEqual(config.max_solves, 4)
+        self.assertAlmostEqual(config.per_solve_timeout_s, 8.0)
 
     def test_concurrency_cannot_be_raised_above_one(self):
         env_backup = dict(os.environ)
@@ -239,25 +248,25 @@ class TestLedger(unittest.TestCase):
         ledger.record_attempt()
         self.assertEqual(ledger.attempted, 1)
 
-    def test_no_ninth_solve_with_default_settings(self):
-        ledger = LocalVroomLedger(max_solves=8, soft_limit_s=58.0)
-        for _ in range(8):
+    def test_no_fifth_solve_with_default_settings(self):
+        ledger = LocalVroomLedger(max_solves=4, soft_limit_s=58.0)
+        for _ in range(4):
             self.assertTrue(ledger.can_attempt())
             ledger.record_attempt()
         self.assertFalse(ledger.can_attempt())
         self.assertEqual(ledger.budget_left(), 0)
 
-    def test_sixteen_solves_when_configured(self):
-        ledger = LocalVroomLedger(max_solves=16, soft_limit_s=58.0)
-        for _ in range(16):
+    def test_eight_solves_when_configured(self):
+        ledger = LocalVroomLedger(max_solves=8, soft_limit_s=58.0)
+        for _ in range(8):
             self.assertTrue(ledger.can_attempt())
             ledger.record_attempt()
         self.assertFalse(ledger.can_attempt())
 
     def test_can_attempt_is_false_when_time_runs_short(self):
         # Demarre il y a 55 s sur une limite de 58 : il reste 3 s, moins que
-        # les 7 s minimales exigees pour lancer une resolution.
-        ledger = LocalVroomLedger(max_solves=8, soft_limit_s=58.0,
+        # les 9 s minimales exigees pour lancer une resolution.
+        ledger = LocalVroomLedger(max_solves=4, soft_limit_s=58.0,
                                   started_at=time.monotonic() - 55.0)
         self.assertGreater(ledger.budget_left(), 0)
         self.assertFalse(ledger.can_attempt())
@@ -448,8 +457,8 @@ class TestGuards(unittest.TestCase):
 
     def test_budget_is_checked_before_the_fork_not_after(self):
         config = make_config(binary=self.fake.path)
-        ledger = LocalVroomLedger(max_solves=8, config=config)
-        for _ in range(8):
+        ledger = LocalVroomLedger(max_solves=4, config=config)
+        for _ in range(4):
             ledger.record_attempt()
         _, payload = joint_payload()
         with self.assertRaises(LocalVroomError) as ctx:
@@ -457,7 +466,7 @@ class TestGuards(unittest.TestCase):
         self.assertEqual(ctx.exception.code, ERR_BUDGET_EXHAUSTED)
         # La preuve que rien n'a ete lance : le faux binaire n'a pas ete appele.
         self.assertEqual(self.fake.call_count, 0)
-        self.assertEqual(ledger.attempted, 8)
+        self.assertEqual(ledger.attempted, 4)
 
     def test_no_solve_starts_with_less_than_seven_seconds_left(self):
         config = make_config(binary=self.fake.path)
@@ -466,7 +475,7 @@ class TestGuards(unittest.TestCase):
         with self.assertRaises(LocalVroomError) as ctx:
             local_vroom.solve_vroom_local(
                 payload, ledger=ledger, config=config,
-                cancellation_deadline=time.monotonic() + 3.0)
+                cancellation_deadline=time.monotonic() + 5.0)
         self.assertEqual(ctx.exception.code, ERR_GLOBAL_TIME_LIMIT)
         self.assertEqual(self.fake.call_count, 0)
         self.assertEqual(ledger.skipped_for_time, 1)
@@ -541,15 +550,15 @@ class TestSubprocessExecution(unittest.TestCase):
             local_vroom.validate_joint_solution(solution, job_ids, (1, 2))
         self.assertEqual(ctx.exception.code, ERR_INVALID_SOLUTION)
 
-    def test_ninth_solve_never_reaches_the_binary(self):
+    def test_fifth_solve_never_reaches_the_binary(self):
         fake, config, ledger, job_ids, payload = self._run()
-        for _ in range(8):
+        for _ in range(4):
             local_vroom.solve_vroom_local(payload, ledger=ledger, config=config)
-        self.assertEqual(fake.call_count, 8)
+        self.assertEqual(fake.call_count, 4)
         with self.assertRaises(LocalVroomError) as ctx:
             local_vroom.solve_vroom_local(payload, ledger=ledger, config=config)
         self.assertEqual(ctx.exception.code, ERR_BUDGET_EXHAUSTED)
-        self.assertEqual(fake.call_count, 8)
+        self.assertEqual(fake.call_count, 4)
 
     def test_the_binary_receives_no_secret(self):
         """Le subprocess est lance avec un environnement minimal : meme si
@@ -709,10 +718,22 @@ class TestStaticGuarantees(unittest.TestCase):
 
     def test_existing_strategies_are_unchanged(self):
         import app
+        # Les quatre strategies de production, dans le meme ordre. La
+        # strategie experimentale s'ajoute APRES, elle ne s'intercale pas.
         self.assertEqual(
-            app.VALID_STRATEGIES,
+            app.PRODUCTION_STRATEGIES,
             ("kmeans", "ortools_haversine", "ortools_ors_matrix",
              "ortools_ors_matrix_connected"))
+        self.assertEqual(app.VALID_STRATEGIES[:4], app.PRODUCTION_STRATEGIES)
+
+    def test_experimental_strategy_is_not_implemented_by_default(self):
+        import app
+        # Desactivee, elle ne figure pas parmi les strategies implementees :
+        # une requete la demandant recoit 501, comme pour un nom inconnu.
+        if not local_vroom.LocalVroomConfig().enabled:
+            self.assertNotIn("hybrid_local_vroom_territorial",
+                             app.IMPLEMENTED_STRATEGIES)
+        self.assertIn("hybrid_local_vroom_territorial", app.VALID_STRATEGIES)
 
     def test_healthz_route_is_declared(self):
         # Les autres fichiers de tests remplacent flask par un faux module des

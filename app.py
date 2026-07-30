@@ -58,12 +58,25 @@ ORS_MATRIX_URL = "https://api.heigit.org/openrouteservice/v2/matrix/driving-car"
 # 2b. INSTRUMENTATION (compteur d'appels API + strategies)
 # =========================
 VALID_STRATEGIES = ("kmeans", "ortools_haversine", "ortools_ors_matrix",
-                    "ortools_ors_matrix_connected")
+                    "ortools_ors_matrix_connected",
+                    "hybrid_local_vroom_territorial")
+# Les quatre strategies de production. Leur comportement ne doit pas bouger
+# quand une strategie experimentale est ajoutee : ce tuple fige la reference.
+PRODUCTION_STRATEGIES = ("kmeans", "ortools_haversine", "ortools_ors_matrix",
+                         "ortools_ors_matrix_connected")
 IMPLEMENTED_STRATEGIES = {"kmeans"}
 if ORTOOLS_AVAILABLE:
     IMPLEMENTED_STRATEGIES.add("ortools_haversine")
     IMPLEMENTED_STRATEGIES.add("ortools_ors_matrix")
     IMPLEMENTED_STRATEGIES.add("ortools_ors_matrix_connected")
+
+# Strategie experimentale. Elle n'est declaree implementee que si le module
+# local est importable ET si l'experimentation est explicitement activee :
+# par defaut elle repond 501, exactement comme une strategie inconnue. C'est
+# la protection la plus stricte -- aucune requete ne peut l'atteindre par
+# accident.
+if LOCAL_VROOM_MODULE_AVAILABLE and local_vroom.get_config().enabled:
+    IMPLEMENTED_STRATEGIES.add("hybrid_local_vroom_territorial")
 
 # Matrice ORS complete (strategie ortools_ors_matrix).
 # 62 x 62 = 3844 routes depasse le plafond free tier : on decoupe par blocs
@@ -4022,6 +4035,521 @@ def _tsp_order_ortools(matrix, group, start_idx, end_idx):
 
 
 # =========================
+# 4f. HYBRIDE VROOM LOCAL + ALNS TERRITORIALE (experimental)
+# =========================
+# Strategie experimentale, inactive tant que LOCAL_VROOM_EXPERIMENT_ENABLED
+# n'est pas positionne. Elle n'empile PAS l'ancien pipeline connexe et le
+# nouveau : elle reprend seulement quelques graines peu couteuses de la
+# bibliotheque existante, et construit ses propres candidates.
+#
+# Trois blocs, chacun avec son budget et sa cause d'arret :
+#   A. matrice ORS, juge commun, resolution VROOM conjointe directe ;
+#   B. graphe G5, variante a noyaux, route-first ;
+#   C. ALNS territoriale, puis finalistes VROOM.
+#
+# Invariant de bout en bout : aucun bloc ne jette ce qu'un bloc precedent a
+# obtenu. L'incumbent du bloc A reste retournable meme si B et C expirent.
+
+HYBRID_SERVICE_S = _env_int("LOCAL_VROOM_SERVICE_S", 0, 0, 3600)
+
+
+def score_routes_on_matrix(dur_matrix, dist_matrix, routes, service_s=0):
+    """JUGE COMMUN. Toute solution experimentale passe par ici, sans exception.
+
+    VROOM et OR-Tools ne rendent pas des durees issues du meme estimateur :
+    les comparer directement fausserait le classement. Leurs valeurs propres
+    restent des diagnostics ; le classement, lui, ne connait que cette
+    fonction, appliquee a la MEME matrice ORS, avec les MEMES depart et
+    arrivee et le MEME temps de service par arret.
+
+    Retourne {duration_s, distance_m, stops}. La duree inclut le service :
+    avec le defaut service_s=0, elle vaut exactement la somme des arcs, donc
+    la meme grandeur que celle des strategies existantes.
+    """
+    duration = 0.0
+    distance = 0.0
+    stops = 0
+    for route in routes:
+        if not route or len(route) < 2:
+            continue
+        duration += _matrix_route_cost(dur_matrix, route)
+        if dist_matrix:
+            distance += _matrix_route_cost(dist_matrix, route)
+        stops += len(route) - 2
+    duration += stops * float(service_s)
+    return {"duration_s": duration, "distance_m": distance, "stops": stops}
+
+
+class _HybridClock:
+    """Discipline temporelle des blocs.
+
+    Chaque bloc recoit son debut, son budget, son temps consomme et sa cause
+    d'arret ; le temps global restant est lisible a tout moment. Un budget de
+    bloc ne peut jamais depasser la limite souple globale : quand les deux
+    entrent en conflit, c'est toujours la limite globale qui gagne.
+    """
+
+    def __init__(self, soft_limit_s):
+        self.t0 = time.monotonic()
+        self.soft_limit_s = float(soft_limit_s)
+        self.stages = []
+        self._current = None
+
+    @property
+    def deadline(self):
+        return self.t0 + self.soft_limit_s
+
+    def remaining_s(self):
+        return max(0.0, self.deadline - time.monotonic())
+
+    def soft_limit_reached(self):
+        return time.monotonic() >= self.deadline
+
+    def begin(self, name, budget_s):
+        budget = min(float(budget_s), self.remaining_s())
+        started = time.monotonic()
+        self._current = {
+            "stage": name,
+            "budget_s": round(budget, 3),
+            "started_at_s": round(started - self.t0, 3),
+            "elapsed_ms": 0,
+            "stop_reason": None,
+            "remaining_after_s": None,
+        }
+        self._started = started
+        self._deadline = started + budget
+        return self._current
+
+    def expired(self):
+        """Vrai si le budget du bloc OU la limite globale est atteint."""
+        now = time.monotonic()
+        return now >= self._deadline or now >= self.deadline
+
+    def stage_remaining_s(self):
+        return max(0.0, min(self._deadline, self.deadline) - time.monotonic())
+
+    def end(self, stop_reason):
+        if self._current is None:
+            return None
+        # Mesure directe depuis le debut du bloc : une soustraction de deux
+        # arrondis pouvait rendre une duree negative sur les blocs tres brefs.
+        self._current["elapsed_ms"] = int((time.monotonic() - self._started) * 1000)
+        self._current["stop_reason"] = stop_reason
+        self._current["remaining_after_s"] = round(self.remaining_s(), 3)
+        self.stages.append(self._current)
+        done = self._current
+        self._current = None
+        return done
+
+    def as_diagnostics(self):
+        return {
+            "hybrid_stages": list(self.stages),
+            "total_elapsed_ms": int((time.monotonic() - self.t0) * 1000),
+            "soft_limit_reached": self.soft_limit_reached(),
+        }
+
+
+def build_knn_graph_g5(points, indices, k=5):
+    """Graphe spatial STRICT G5 : k plus proches voisins haversine, k fixe.
+
+    Volontairement plus pauvre que build_geo_graph : aucune arete issue de la
+    duree ORS, aucun arbre couvrant, aucune augmentation de k pour forcer la
+    connexite globale. Il ne sert pas a estimer un cout -- la matrice ORS s'en
+    charge -- mais uniquement a dire ce qui est VOISIN : noyaux, frontiere,
+    enclaves. Un k fixe rend cette lecture geographique stable d'un run a
+    l'autre ; un k variable la rendrait dependante du jeu de points.
+    """
+    adjacency = {i: set() for i in indices}
+    n = len(indices)
+    if n <= 1:
+        return adjacency, {"k": 0, "edges": 0, "method": "knn_haversine_strict"}
+
+    coords = {i: (float(points[i]["lat"]), float(points[i]["lon"])) for i in indices}
+    dist = {}
+    for a in range(n):
+        ia = indices[a]
+        for b in range(a + 1, n):
+            ib = indices[b]
+            d = haversine(coords[ia], coords[ib])
+            dist[(ia, ib)] = d
+            dist[(ib, ia)] = d
+
+    used_k = min(int(k), n - 1)
+    edges = set()
+    for i in indices:
+        # Tri par (distance, index) : les egalites sont departagees de facon
+        # stable, le graphe est donc deterministe.
+        near = sorted((j for j in indices if j != i),
+                      key=lambda j: (dist[(i, j)], j))[:used_k]
+        for j in near:
+            edges.add((min(i, j), max(i, j)))
+    for u, v in edges:
+        adjacency[u].add(v)
+        adjacency[v].add(u)
+    return adjacency, {"k": used_k, "edges": len(edges),
+                       "method": "knn_haversine_strict"}
+
+
+def _hybrid_routes(sequences, vehicle_ids, start_idx, end_idx):
+    """Deux ordres complets, depot compris, a partir des sequences VROOM."""
+    return [[start_idx] + list(sequences[vid]) + [end_idx] for vid in vehicle_ids]
+
+
+def _hybrid_solution(group_a, group_b, route_a, route_b, dur_matrix, dist_matrix,
+                     adjacency, points, source, sequencer, service_s,
+                     declared=None):
+    """Solution complete, systematiquement rescoree par le juge commun.
+
+    `declared` porte ce que le solveur a annonce de lui-meme. Cette valeur ne
+    sert JAMAIS au classement : elle est conservee pour pouvoir constater
+    l'ecart entre l'estimateur du solveur et la matrice ORS.
+    """
+    score = score_routes_on_matrix(dur_matrix, dist_matrix,
+                                   [route_a, route_b], service_s)
+    ca = is_connected_partition(group_a, adjacency)
+    cb = is_connected_partition(group_b, adjacency)
+    boundary = boundary_metrics(group_a, group_b, adjacency, points)
+    visited = [p for r in (route_a, route_b) for p in r[1:-1]]
+    expected = sorted(list(group_a) + list(group_b))
+    return {
+        "group_a": sorted(group_a),
+        "group_b": sorted(group_b),
+        "route_a": list(route_a),
+        "route_b": list(route_b),
+        "duration_s": score["duration_s"],
+        "distance_m": score["distance_m"],
+        "connected": bool(ca["connected"] and cb["connected"]),
+        "components_total": ca["component_count"] + cb["component_count"],
+        "components": [ca["component_count"], cb["component_count"]],
+        "cardinality_ok": sorted(visited) == expected,
+        "sizes": [len(group_a), len(group_b)],
+        "boundary": boundary,
+        "partition_key": canonical_partition_key(group_a, group_b),
+        "source": source,
+        "sequencer": sequencer,
+        "selection_reason": "hybrid_" + source,
+        "seed": source,
+        "declared_duration_s": declared,
+    }
+
+
+def _hybrid_matrix_seed(matrix_hash):
+    """Graine deterministe derivee de l'empreinte de matrice.
+
+    Deux runs sur la meme matrice explorent donc exactement la meme suite de
+    mouvements : un resultat different ne peut plus venir du hasard.
+    """
+    return int(hashlib.md5(str(matrix_hash).encode("utf-8")).hexdigest()[:8], 16)
+
+
+def hybrid_direct_joint_solve(points, indices, dur_matrix, dist_matrix, adjacency,
+                              start_idx, end_idx, capacity, ledger, clock,
+                              service_s, diag):
+    """BLOC A -- une seule resolution VROOM conjointe, affectation et ordre.
+
+    Une requete, deux vehicules, donc UNE resolution au compteur. La
+    cardinalite n'est pas esperee du solveur : elle est imposee par la
+    capacite (60 taches, 2 x 30 => 30/30 est la seule affectation
+    admissible ; 58 taches, 2 x 29 => 29/29).
+
+    Retourne une solution ou None. Un echec n'est jamais masque : il est
+    consigne dans le ledger et la strategie continue avec ce qu'elle a.
+    """
+    vehicle_ids = (1, 2)
+    payload = local_vroom.build_joint_payload(
+        job_ids=indices,
+        durations=dur_matrix,
+        start_index=start_idx,
+        end_index=end_idx,
+        max_tasks_per_vehicle=capacity,
+        service_times={i: service_s for i in indices} if service_s else None,
+        job_location_index={i: i for i in indices},
+        vehicle_ids=vehicle_ids,
+    )
+    # L'horloge du bloc et le ledger partagent la meme base monotone : le
+    # couperet global est donc le meme des deux cotes, sans conversion.
+    solution = local_vroom.solve_vroom_local(
+        payload,
+        timeout_s=local_vroom.get_config().per_solve_timeout_s,
+        ledger=ledger,
+        cancellation_deadline=clock.deadline,
+    )
+    sequences = local_vroom.validate_joint_solution(
+        solution, indices, vehicle_ids,
+        max_tasks_per_vehicle=capacity,
+        start_index=start_idx, end_index=end_idx)
+
+    route_a, route_b = _hybrid_routes(sequences, vehicle_ids, start_idx, end_idx)
+    declared = (solution.get("summary") or {}).get("duration")
+    diag["joint_direct_declared_duration_s"] = declared
+    return _hybrid_solution(sequences[1], sequences[2], route_a, route_b,
+                            dur_matrix, dist_matrix, adjacency, points,
+                            "joint_direct", "vroom_local", service_s,
+                            declared=declared)
+
+
+def _hybrid_diagnostics_template():
+    """Tous les champs de diagnostic existent des le depart.
+
+    Un champ absent et un champ nul ne se distinguent pas dans une feuille de
+    calcul : declarer la structure complete garantit qu'une colonne vide
+    signifie "etape non atteinte" et jamais "champ oublie".
+    """
+    return {
+        "hybrid_error": "",
+        "hybrid_matrix_calls": 0,
+        # --- juge commun ---
+        "common_rescore_duration_s": None,
+        "common_rescore_distance_m": None,
+        "common_rescore_matrix_hash": None,
+        "common_rescore_service_s": HYBRID_SERVICE_S,
+        # --- bloc A ---
+        "joint_direct_valid": False,
+        "joint_direct_duration_s": None,
+        "joint_direct_distance_m": None,
+        "joint_direct_declared_duration_s": None,
+        "joint_direct_sizes": None,
+        "joint_direct_components": None,
+        "joint_direct_enclaves": None,
+        "joint_direct_error": "",
+        # --- bloc B ---
+        "graph_g5_k": None,
+        "graph_g5_edges": None,
+        "joint_nucleus_attempted": 0,
+        "joint_nucleus_valid": 0,
+        "joint_nucleus_best_duration_s": None,
+        "joint_nucleus_error": "",
+        "route_first_cycles": 0,
+        "route_first_unique": 0,
+        "route_first_best_duration_s": None,
+        # --- bloc C ---
+        "joint_alns_iterations": 0,
+        "joint_alns_accepted": 0,
+        "joint_alns_best_duration_s": None,
+        "joint_alns_best_distance_m": None,
+        "joint_alns_best_enclaves": None,
+        "joint_alns_seed": None,
+        "joint_finalists": 0,
+        "joint_finalists_local_vroom_solved": 0,
+        "joint_finalists_reused": 0,
+        # --- selection ---
+        "joint_selected_source": None,
+        "joint_selected_duration_s": None,
+        "joint_selected_distance_m": None,
+        "joint_selected_sizes": None,
+        "joint_selected_components": None,
+        "joint_selected_enclaves": None,
+        "joint_selection_window_s": CONNECTED_TIE_SECONDS,
+        "joint_solutions_considered": 0,
+        # --- discipline temporelle ---
+        "hybrid_stages": [],
+        "total_elapsed_ms": 0,
+        "soft_limit_reached": False,
+    }
+
+
+def hybrid_local_vroom_territorial(points, num_vehicles, max_per_vehicle,
+                                   start_idx, end_idx, headers,
+                                   solution_limit=None):
+    """Strategie experimentale : VROOM local conjoint + ALNS territoriale.
+
+    Meme contrat de retour que les autres partitions : (groups, err, meta).
+    Les ordres retenus remontent dans meta["hybrid_routes"], comme la
+    strategie connexe : l'appelant ne resequence rien.
+    """
+    diag = _hybrid_diagnostics_template()
+    meta = {"hybrid": diag}
+
+    if local_vroom is None:
+        diag["hybrid_error"] = "local_vroom module unavailable"
+        return None, diag["hybrid_error"], meta
+
+    config = local_vroom.get_config(refresh=True)
+    if not config.enabled:
+        diag["hybrid_error"] = local_vroom.ERR_DISABLED
+        return None, diag["hybrid_error"], meta
+
+    if num_vehicles != 2:
+        diag["hybrid_error"] = ("hybrid local vroom requires 2 vehicles, got %d"
+                                % num_vehicles)
+        return None, diag["hybrid_error"], meta
+
+    depots = {start_idx, end_idx}
+    indices = [i for i in range(len(points)) if i not in depots]
+    if not indices:
+        diag["hybrid_error"] = "no delivery points"
+        return [[] for _ in range(num_vehicles)], None, meta
+
+    bad = [points[i].get("id", i) for i in indices if not _finite_coords(points[i])]
+    if bad:
+        diag["hybrid_error"] = ("%d point(s) with invalid coordinates: %s"
+                                % (len(bad), bad[:5]))
+        return None, diag["hybrid_error"], meta
+
+    n = len(indices)
+    capacity = _exact_capacity(n, 2)
+    if capacity > max_per_vehicle:
+        diag["hybrid_error"] = ("cannot split %d points under capacity %d"
+                                % (n, max_per_vehicle))
+        return None, diag["hybrid_error"], meta
+
+    # Une seule optimisation experimentale a la fois par conteneur. Le refus
+    # est immediat : mettre deux resolutions lourdes en concurrence sur 512 Mo
+    # les ferait echouer toutes les deux plutot que d'en servir une.
+    lock = local_vroom.LocalVroomRunLock()
+    if not lock.acquire():
+        diag["hybrid_error"] = local_vroom.ERR_BUSY
+        return None, diag["hybrid_error"], meta
+
+    try:
+        return _hybrid_run(points, indices, start_idx, end_idx, capacity,
+                           headers, config, diag, meta)
+    finally:
+        lock.release()
+
+
+def _hybrid_run(points, indices, start_idx, end_idx, capacity, headers,
+                config, diag, meta):
+    """Corps de la strategie, verrou deja tenu."""
+    clock = _HybridClock(config.total_soft_limit_s)
+    ledger = local_vroom.LocalVroomLedger(
+        max_solves=config.max_solves,
+        soft_limit_s=config.total_soft_limit_s,
+        started_at=clock.t0,
+        config=config)
+    service_s = HYBRID_SERVICE_S
+    n = len(indices)
+
+    print("Hybride VROOM local: %d points -> %d/%d, capacite %d, budget %.0fs"
+          % (n, n // 2, n - n // 2, capacity, config.total_soft_limit_s),
+          flush=True)
+
+    # --- MATRICE ORS : le seul acces reseau de toute la strategie -----------
+    clock.begin("matrix", clock.remaining_s())
+    dur_matrix, dist_matrix, mmeta, err = _build_full_matrix_chunked(points, headers)
+    clock.end("done" if dur_matrix is not None else "matrix_failed")
+    meta.update(mmeta)
+    meta["hybrid"] = diag
+    diag["hybrid_matrix_calls"] = mmeta.get("calls", 0)
+    if dur_matrix is None:
+        diag["hybrid_error"] = "ORS matrix failed: %s" % err
+        return None, diag["hybrid_error"], meta
+
+    matrix_hash = _matrix_content_hash(dur_matrix, dist_matrix)
+    diag["common_rescore_matrix_hash"] = matrix_hash
+
+    # --- GRAPHE G5 : geographie seule, aucune arete routiere ----------------
+    adjacency, gmeta = build_knn_graph_g5(points, indices, k=5)
+    diag["graph_g5_k"] = gmeta["k"]
+    diag["graph_g5_edges"] = gmeta["edges"]
+
+    solutions = []
+
+    # =====================================================================
+    # BLOC A -- RESOLUTION VROOM CONJOINTE DIRECTE
+    # =====================================================================
+    clock.begin("joint_direct", min(config.per_solve_timeout_s + 2.0,
+                                    clock.remaining_s()))
+    stop_reason = "done"
+    if not ledger.can_attempt():
+        stop_reason = local_vroom.ERR_GLOBAL_TIME_LIMIT
+        ledger.record_skip_for_time()
+        diag["joint_direct_error"] = stop_reason
+    else:
+        try:
+            direct = hybrid_direct_joint_solve(
+                points, indices, dur_matrix, dist_matrix, adjacency,
+                start_idx, end_idx, capacity, ledger, clock, service_s, diag)
+            solutions.append(direct)
+            diag.update({
+                "joint_direct_valid": bool(direct["connected"]
+                                           and direct["cardinality_ok"]),
+                "joint_direct_duration_s": round(direct["duration_s"], 1),
+                "joint_direct_distance_m": round(direct["distance_m"], 1),
+                "joint_direct_sizes": direct["sizes"],
+                "joint_direct_components": direct["components"],
+                "joint_direct_enclaves": direct["boundary"]["enclave_points"],
+            })
+            print("  Bloc A: VROOM conjoint %s, duree rescoree %.1fmin, "
+                  "%.2fkm, composantes %s, %d enclaves"
+                  % (direct["sizes"], direct["duration_s"] / 60,
+                     direct["distance_m"] / 1000, direct["components"],
+                     direct["boundary"]["enclave_points"]), flush=True)
+        except local_vroom.LocalVroomError as exc:
+            # Un echec VROOM ne fait pas tomber la strategie : les blocs
+            # suivants travaillent sans solution directe, et la selection
+            # finale ne retiendra que ce qui est reellement valide.
+            stop_reason = exc.code
+            diag["joint_direct_error"] = exc.code
+            print("  Bloc A: echec VROOM local (%s)" % exc.code, flush=True)
+    clock.end(stop_reason)
+
+    return _hybrid_finish(points, indices, start_idx, end_idx, dur_matrix,
+                          dist_matrix, adjacency, solutions, clock, ledger,
+                          config, diag, meta, service_s)
+
+
+def _hybrid_finish(points, indices, start_idx, end_idx, dur_matrix, dist_matrix,
+                   adjacency, solutions, clock, ledger, config, diag, meta,
+                   service_s):
+    """Selection finale et mise en forme du retour.
+
+    Appelee quel que soit l'etat d'avancement : c'est ici que se traduit la
+    regle "aucune etape ne jette ce qui a deja ete obtenu". Meme si tous les
+    blocs posterieurs ont expire, ce qui existe est compare et retourne.
+    """
+    diag["joint_solutions_considered"] = len(solutions)
+    ledger.stop(local_vroom.ERR_GLOBAL_TIME_LIMIT if clock.soft_limit_reached()
+                else "completed")
+    diag.update(local_vroom.diagnostics(ledger, config))
+    diag.update(clock.as_diagnostics())
+
+    if not solutions:
+        diag["hybrid_error"] = diag["hybrid_error"] or "no valid solution produced"
+        return None, diag["hybrid_error"], meta
+
+    best = select_best_solution(solutions, tie_seconds=CONNECTED_TIE_SECONDS)
+    if best is None:
+        diag["hybrid_error"] = "no valid solution produced"
+        return None, diag["hybrid_error"], meta
+
+    diag.update({
+        "common_rescore_duration_s": round(best["duration_s"], 1),
+        "common_rescore_distance_m": round(best["distance_m"], 1),
+        "joint_selected_source": best["source"],
+        "joint_selected_duration_s": round(best["duration_s"], 1),
+        "joint_selected_distance_m": round(best["distance_m"], 1),
+        "joint_selected_sizes": best["sizes"],
+        "joint_selected_components": best["components"],
+        "joint_selected_enclaves": best["boundary"]["enclave_points"],
+    })
+
+    meta["hybrid_routes"] = [list(best["route_a"]), list(best["route_b"])]
+    meta["hybrid_membership_locked"] = True
+    meta["hybrid_sequencer"] = best["sequencer"]
+    # Ces deux cles alimentent le compte rendu commun a toutes les strategies
+    # pre-sequencees. Elles disent si un solveur a bien produit l'ordre retenu,
+    # jamais si "Vroom public" a ete appele -- il ne l'est jamais ici.
+    meta["connected_vroom_ok"] = best["sequencer"] == "vroom_local"
+    meta["connected_vroom_error"] = diag["joint_direct_error"] or None
+
+    print("  Retenue: %s pts, source=%s, composantes %s, %d enclaves, "
+          "duree %.1fmin, %.2fkm, %d solutions comparees, %d solves VROOM "
+          "(%dms)"
+          % (best["sizes"], best["source"], best["components"],
+             best["boundary"]["enclave_points"], best["duration_s"] / 60,
+             best["distance_m"] / 1000, len(solutions), ledger.attempted,
+             diag["total_elapsed_ms"]), flush=True)
+    for stage in diag["hybrid_stages"]:
+        print("    etape %-14s budget %.1fs, consomme %dms, arret=%s, "
+              "restant %.1fs"
+              % (stage["stage"], stage["budget_s"], stage["elapsed_ms"],
+                 stage["stop_reason"], stage["remaining_after_s"]), flush=True)
+
+    return [best["group_a"], best["group_b"]], None, meta
+
+
+# =========================
 # 5. NEAREST-NEIGHBOR FALLBACK
 # =========================
 def _nearest_neighbor_route(points, vehicle_points, start_idx, end_idx):
@@ -4982,6 +5510,18 @@ def optimize():
             # plus ET remplacerait l'ordre retenu par celui de Vroom, quel que
             # soit selected_sequencer.
             presequenced_routes = (matrix_meta or {}).get("connected_routes")
+        elif strategy == "hybrid_local_vroom_territorial":
+            groups, part_err, matrix_meta = hybrid_local_vroom_territorial(
+                points, num_vehicles, max_per_vehicle, start_idx, end_idx,
+                headers, solution_limit=ortools_solution_limit
+            )
+            # Meme contrat que la strategie connexe : l'appartenance est un
+            # engagement, et les ordres sont deja choisis par le juge commun.
+            # Les resequencer ici remplacerait le gagnant par un autre ordre.
+            if (matrix_meta or {}).get("hybrid_membership_locked"):
+                membership_locked = True
+                swap_lock_reason = "connected_partition_locked"
+            presequenced_routes = (matrix_meta or {}).get("hybrid_routes")
         else:
             groups, part_err = None, f"no partition function for '{strategy}'"
 

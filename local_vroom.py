@@ -120,17 +120,25 @@ class LocalVroomConfig:
         self.tmpdir = os.environ.get("LOCAL_VROOM_TMPDIR") or tempfile.gettempdir()
 
         # --- budgets de temps ---
+        # Calibres sur la mesure CI sous 512 Mo / 0,10 CPU : une resolution
+        # conjointe de 60 taches y prend 4,0 s. Le timeout par resolution est
+        # donc porte a 8 s (deux fois la mesure) et le minimum requis pour en
+        # DEMARRER une a 9 s, marge d'une seconde comprise.
         self.total_soft_limit_s = _env_float("LOCAL_VROOM_TOTAL_SOFT_LIMIT_S", 58.0, 1.0, 600.0)
-        self.per_solve_timeout_s = _env_float("LOCAL_VROOM_PER_SOLVE_TIMEOUT_S", 6.0, 0.2, 300.0)
-        self.min_remaining_to_start_s = _env_float("LOCAL_VROOM_MIN_REMAINING_TO_START_S", 7.0, 0.0, 600.0)
-        self.route_first_budget_s = _env_float("LOCAL_VROOM_ROUTE_FIRST_BUDGET_S", 4.0, 0.0, 600.0)
-        self.alns_budget_s = _env_float("LOCAL_VROOM_ALNS_BUDGET_S", 10.0, 0.0, 600.0)
+        self.per_solve_timeout_s = _env_float("LOCAL_VROOM_PER_SOLVE_TIMEOUT_S", 8.0, 0.2, 300.0)
+        self.min_remaining_to_start_s = _env_float("LOCAL_VROOM_MIN_REMAINING_TO_START_S", 9.0, 0.0, 600.0)
+        self.route_first_budget_s = _env_float("LOCAL_VROOM_ROUTE_FIRST_BUDGET_S", 3.0, 0.0, 600.0)
+        self.alns_budget_s = _env_float("LOCAL_VROOM_ALNS_BUDGET_S", 6.0, 0.0, 600.0)
 
         # --- budgets de resolutions ---
-        self.max_solves = _env_int("LOCAL_VROOM_MAX_SOLVES", 8, 0, 64)
+        # Quatre et non huit : 4 x 8 s de timeout laissent 26 s pour la matrice
+        # ORS, route-first et l'ALNS a l'interieur des 58 s. Monter a 8 reste
+        # possible par variable d'environnement, mais seulement quand Render
+        # aura montre qu'il en a le temps.
+        self.max_solves = _env_int("LOCAL_VROOM_MAX_SOLVES", 4, 0, 64)
         self.direct_solves = _env_int("LOCAL_VROOM_DIRECT_SOLVES", 1, 0, 8)
-        self.nucleus_solves = _env_int("LOCAL_VROOM_NUCLEUS_SOLVES", 2, 0, 16)
-        self.finalist_solves = _env_int("LOCAL_VROOM_FINALIST_SOLVES", 5, 0, 32)
+        self.nucleus_solves = _env_int("LOCAL_VROOM_NUCLEUS_SOLVES", 1, 0, 16)
+        self.finalist_solves = _env_int("LOCAL_VROOM_FINALIST_SOLVES", 2, 0, 32)
         self.max_concurrent_solves = _env_int("LOCAL_VROOM_MAX_CONCURRENT_SOLVES", 1, 1, 1)
 
         # --- reglages du binaire ---
