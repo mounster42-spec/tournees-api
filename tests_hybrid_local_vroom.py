@@ -248,10 +248,18 @@ class HybridTestCase(unittest.TestCase):
     """Socle commun : environnement active, solveur et matrice injectes."""
 
     n_tasks = 60
+    # Les budgets de recherche sont raccourcis pour la suite : leurs valeurs
+    # par defaut sont verifiees dans tests_local_vroom, et laisser tourner
+    # six secondes d'ALNS a chaque test rendrait la suite inutilisable. Les
+    # tests qui mesurent la recherche elle-meme les relevent explicitement.
+    alns_budget_s = "0.25"
+    route_first_budget_s = "0.5"
 
     def setUp(self):
         self.env_backup = dict(os.environ)
         os.environ["LOCAL_VROOM_EXPERIMENT_ENABLED"] = "true"
+        os.environ["LOCAL_VROOM_ALNS_BUDGET_S"] = self.alns_budget_s
+        os.environ["LOCAL_VROOM_ROUTE_FIRST_BUDGET_S"] = self.route_first_budget_s
         local_vroom.get_config(refresh=True)
 
         self.points = make_points(self.n_tasks)
@@ -695,14 +703,311 @@ class TestBlocBIntegration(HybridTestCase):
     def test_every_block_has_its_own_stage_record(self):
         _, _, meta = self.run_strategy()
         stages = {s["stage"] for s in meta["hybrid"]["hybrid_stages"]}
-        self.assertEqual(stages, {"matrix", "joint_direct", "joint_nucleus",
-                                  "route_first"})
+        # Les etapes des blocs A et B sont presentes ; la liste exhaustive de
+        # toutes les etapes est verifiee dans TestTimeDiscipline.
+        self.assertTrue({"matrix", "joint_direct", "joint_nucleus",
+                         "route_first"}.issubset(stages))
 
     def test_solve_budget_is_never_exceeded(self):
         _, _, meta = self.run_strategy()
         diag = meta["hybrid"]
         self.assertLessEqual(diag["local_vroom_attempted"],
                              diag["local_vroom_max_solves"])
+
+
+# =========================================================================
+# BLOC C
+# =========================================================================
+
+class TestBlocCAlns(HybridTestCase):
+
+    def _alns(self, budget_s=0.4, seeds=None):
+        indices = list(range(1, self.n_tasks + 1))
+        adjacency, _ = app.build_knn_graph_g5(self.points, indices, k=5)
+        if seeds is None:
+            half = self.n_tasks // 2
+            seeds = [{"group_a": indices[:half], "group_b": indices[half:]}]
+        clock = app._HybridClock(58.0)
+        clock.begin("joint_alns", budget_s)
+        finalists, stats = app.hybrid_territorial_alns(
+            self.points, indices, self.matrix.dur, self.matrix.dist,
+            adjacency, 0, 0, seeds, "abc123", clock, 0)
+        clock.end("done")
+        return finalists, stats, adjacency, indices
+
+    def test_alns_calls_neither_matrix_nor_vroom(self):
+        before = self.matrix.calls
+        finalists, stats, _, _ = self._alns()
+        self.assertEqual(self.matrix.calls, before)
+        self.assertEqual(len(self.solver.calls), 0)
+        self.assertGreater(stats["iterations"], 0)
+
+    def test_seed_is_derived_from_the_matrix_hash(self):
+        _, stats, _, _ = self._alns()
+        self.assertEqual(stats["seed"], app._hybrid_matrix_seed("abc123"))
+        other = app._hybrid_matrix_seed("def456")
+        self.assertNotEqual(stats["seed"], other)
+
+    def test_same_matrix_gives_the_same_finalists(self):
+        first, _, _, _ = self._alns(budget_s=0.4)
+        second, _, _, _ = self._alns(budget_s=0.4)
+        # Le budget etant temporel, le NOMBRE d'iterations varie ; le meilleur
+        # finaliste, lui, doit etre le meme puisque la suite de mouvements
+        # est identique.
+        self.assertEqual(first[0]["partition_key"], second[0]["partition_key"])
+        self.assertAlmostEqual(first[0]["proxy_cost"], second[0]["proxy_cost"])
+
+    def test_every_finalist_satisfies_the_hard_constraints(self):
+        finalists, _, adjacency, indices = self._alns()
+        half = self.n_tasks // 2
+        for finalist in finalists:
+            merged = sorted(finalist["group_a"] + finalist["group_b"])
+            self.assertEqual(merged, indices, "union incomplete ou doublon")
+            self.assertEqual(sorted([len(finalist["group_a"]),
+                                     len(finalist["group_b"])]),
+                             [half, self.n_tasks - half])
+            self.assertTrue(app.is_connected_partition(
+                finalist["group_a"], adjacency)["connected"])
+            self.assertTrue(app.is_connected_partition(
+                finalist["group_b"], adjacency)["connected"])
+
+    def test_finalists_are_unique_and_capped_at_twelve(self):
+        finalists, _, _, _ = self._alns()
+        keys = [f["partition_key"] for f in finalists]
+        self.assertEqual(len(keys), len(set(keys)))
+        self.assertLessEqual(len(finalists), 12)
+
+    def test_finalists_are_ranked_by_ors_cost(self):
+        finalists, _, _, _ = self._alns()
+        costs = [f["proxy_cost"] for f in finalists]
+        self.assertEqual(costs, sorted(costs))
+
+    def test_operators_cover_the_declared_families(self):
+        _, stats, _, _ = self._alns(budget_s=0.6)
+        used = set(stats["operators"])
+        for operator in ("swap_1_1", "swap_2_2", "chain", "destroy_repair"):
+            self.assertIn(operator, used)
+
+    def test_a_move_that_breaks_cardinality_is_refused(self):
+        indices = list(range(1, 11))
+        adjacency = {i: {j for j in indices if j != i} for i in indices}
+        self.assertFalse(app._hybrid_partition_valid(
+            indices[:6], indices[6:], indices, (5, 5), adjacency))
+        self.assertTrue(app._hybrid_partition_valid(
+            indices[:5], indices[5:], indices, (5, 5), adjacency))
+
+    def test_a_move_that_duplicates_a_point_is_refused(self):
+        indices = list(range(1, 11))
+        adjacency = {i: {j for j in indices if j != i} for i in indices}
+        self.assertFalse(app._hybrid_partition_valid(
+            [1, 2, 3, 4, 5], [5, 6, 7, 8, 9], indices, (5, 5), adjacency))
+
+    def test_a_disconnected_move_is_refused(self):
+        indices = [1, 2, 3, 4]
+        adjacency = {1: {2}, 2: {1}, 3: {4}, 4: {3}}
+        self.assertTrue(app._hybrid_partition_valid(
+            [1, 2], [3, 4], indices, (2, 2), adjacency))
+        self.assertFalse(app._hybrid_partition_valid(
+            [1, 3], [2, 4], indices, (2, 2), adjacency))
+
+    def test_haversine_only_locates_the_border(self):
+        """Le graphe G5 dit OU regarder, la matrice ORS dit CE QUE ca coute."""
+        indices = list(range(1, 7))
+        adjacency = {1: {2}, 2: {1, 3}, 3: {2, 4}, 4: {3, 5}, 5: {4, 6}, 6: {5}}
+        border_a, border_b = app._hybrid_border([1, 2, 3], [4, 5, 6], adjacency)
+        self.assertEqual(border_a, [3])
+        self.assertEqual(border_b, [4])
+
+
+class TestBlocCFinalists(HybridTestCase):
+
+    def test_at_most_four_solves_with_default_settings(self):
+        _, _, meta = self.run_strategy()
+        diag = meta["hybrid"]
+        self.assertLessEqual(diag["local_vroom_attempted"], 4)
+        self.assertEqual(diag["local_vroom_max_solves"], 4)
+        self.assertLessEqual(len(self.solver.calls), 4)
+
+    def test_a_fifth_solve_is_impossible(self):
+        self.run_strategy()
+        # Le budget par defaut est 1 directe + 1 noyau + 2 finalistes.
+        self.assertLessEqual(len(self.solver.calls), 4)
+        calls_before = len(self.solver.calls)
+        # Une resolution supplementaire sur un ledger epuise n'atteint jamais
+        # le solveur.
+        ledger = local_vroom.LocalVroomLedger(max_solves=4)
+        for _ in range(4):
+            ledger.record_attempt()
+        with self.assertRaises(local_vroom.LocalVroomError) as ctx:
+            self.solver({"vehicles": [], "jobs": []}, ledger=ledger,
+                        config=local_vroom.get_config())
+        self.assertEqual(ctx.exception.code, local_vroom.ERR_BUDGET_EXHAUSTED)
+        self.assertEqual(len(self.solver.calls), calls_before)
+
+    def test_budget_can_be_raised_to_eight_by_environment(self):
+        os.environ["LOCAL_VROOM_MAX_SOLVES"] = "8"
+        os.environ["LOCAL_VROOM_NUCLEUS_SOLVES"] = "2"
+        os.environ["LOCAL_VROOM_FINALIST_SOLVES"] = "5"
+        local_vroom.get_config(refresh=True)
+        _, _, meta = self.run_strategy()
+        diag = meta["hybrid"]
+        self.assertEqual(diag["local_vroom_max_solves"], 8)
+        self.assertGreater(diag["local_vroom_attempted"], 4)
+        self.assertLessEqual(diag["local_vroom_attempted"], 8)
+
+    def test_at_most_two_finalists_are_solved_by_default(self):
+        _, _, meta = self.run_strategy()
+        self.assertLessEqual(
+            meta["hybrid"]["joint_finalists_local_vroom_solved"], 2)
+
+    def test_an_already_solved_partition_is_never_solved_twice(self):
+        _, _, meta = self.run_strategy()
+        keys = []
+        for payload in self.solver.calls:
+            skilled_a = sorted(j["id"] for j in payload["jobs"]
+                               if j.get("skills") == [1])
+            skilled_b = sorted(j["id"] for j in payload["jobs"]
+                               if j.get("skills") == [2])
+            if skilled_a and skilled_b and not [
+                    j for j in payload["jobs"] if not j.get("skills")]:
+                keys.append(app.canonical_partition_key(skilled_a, skilled_b))
+        # Les requetes a partition entierement figee portent chacune une
+        # partition distincte : aucune n'est resolue deux fois.
+        self.assertEqual(len(keys), len(set(keys)))
+
+    def test_a_fixed_partition_goes_in_a_single_request(self):
+        _, _, meta = self.run_strategy()
+        fixed = [p for p in self.solver.calls
+                 if p["jobs"] and all(j.get("skills") for j in p["jobs"])]
+        for payload in fixed:
+            self.assertEqual(len(payload["vehicles"]), 2)
+            self.assertEqual(len(payload["jobs"]), self.n_tasks)
+
+    def test_finalist_partitions_are_respected_by_the_solver(self):
+        groups, err, meta = self.run_strategy()
+        self.assertIsNone(err)
+        self.assertEqual(sorted(groups[0] + groups[1]),
+                         list(range(1, self.n_tasks + 1)))
+
+
+class TestSelection(HybridTestCase):
+
+    def test_minimum_duration_wins_outside_the_window(self):
+        solutions = [
+            {"connected": True, "cardinality_ok": True, "duration_s": 1000.0,
+             "distance_m": 10.0, "boundary": {}, "partition_key": (),
+             "sequencer": "a", "route_a": [], "route_b": []},
+            {"connected": True, "cardinality_ok": True, "duration_s": 900.0,
+             "distance_m": 99999.0, "boundary": {}, "partition_key": (),
+             "sequencer": "b", "route_a": [], "route_b": []},
+        ]
+        best = app.select_best_solution(solutions, tie_seconds=30.0)
+        self.assertEqual(best["duration_s"], 900.0)
+
+    def test_inside_the_thirty_second_window_distance_decides(self):
+        solutions = [
+            {"connected": True, "cardinality_ok": True, "duration_s": 900.0,
+             "distance_m": 50000.0, "boundary": {}, "partition_key": (),
+             "sequencer": "a", "route_a": [], "route_b": []},
+            {"connected": True, "cardinality_ok": True, "duration_s": 925.0,
+             "distance_m": 40000.0, "boundary": {}, "partition_key": (),
+             "sequencer": "b", "route_a": [], "route_b": []},
+        ]
+        best = app.select_best_solution(solutions, tie_seconds=30.0)
+        self.assertEqual(best["distance_m"], 40000.0)
+
+    def test_the_window_is_exactly_thirty_seconds(self):
+        solutions = [
+            {"connected": True, "cardinality_ok": True, "duration_s": 900.0,
+             "distance_m": 50000.0, "boundary": {}, "partition_key": (),
+             "sequencer": "a", "route_a": [], "route_b": []},
+            {"connected": True, "cardinality_ok": True, "duration_s": 930.0,
+             "distance_m": 40000.0, "boundary": {}, "partition_key": (),
+             "sequencer": "b", "route_a": [], "route_b": []},
+            {"connected": True, "cardinality_ok": True, "duration_s": 930.1,
+             "distance_m": 10.0, "boundary": {}, "partition_key": (),
+             "sequencer": "c", "route_a": [], "route_b": []},
+        ]
+        best = app.select_best_solution(solutions, tie_seconds=30.0)
+        # 930,0 est DANS la fenetre, 930,1 est dehors malgre sa distance.
+        self.assertEqual(best["distance_m"], 40000.0)
+
+    def test_no_balancing_objective_between_the_two_routes(self):
+        """Un ecart de duree entre T1 et T2 n'est jamais penalise."""
+        balanced = [
+            {"connected": True, "cardinality_ok": True, "duration_s": 1000.0,
+             "distance_m": 100.0, "boundary": {}, "partition_key": (),
+             "sequencer": "equilibree", "route_a": [], "route_b": []},
+            {"connected": True, "cardinality_ok": True, "duration_s": 990.0,
+             "distance_m": 100.0, "boundary": {}, "partition_key": (),
+             "sequencer": "desequilibree", "route_a": [], "route_b": []},
+        ]
+        best = app.select_best_solution(balanced, tie_seconds=0.0)
+        self.assertEqual(best["sequencer"], "desequilibree")
+
+    def test_selection_is_reported(self):
+        _, _, meta = self.run_strategy()
+        diag = meta["hybrid"]
+        self.assertIsNotNone(diag["joint_selected_source"])
+        self.assertIsNotNone(diag["joint_selected_duration_s"])
+        self.assertIsNotNone(diag["joint_selected_sizes"])
+        self.assertEqual(diag["joint_selection_window_s"], 30.0)
+
+
+class TestTimeDiscipline(HybridTestCase):
+
+    def test_a_short_global_limit_still_returns_a_valid_result(self):
+        """Quand la limite souple est courte, la strategie ne rend pas rien.
+
+        Elle arrete la generation, ne lance plus de resolution, choisit parmi
+        ce qu'elle a et retourne proprement."""
+        os.environ["LOCAL_VROOM_TOTAL_SOFT_LIMIT_S"] = "10"
+        local_vroom.get_config(refresh=True)
+        groups, err, meta = self.run_strategy()
+        diag = meta["hybrid"]
+        self.assertIsNone(err)
+        self.assertEqual(sorted(len(g) for g in groups), [30, 30])
+        self.assertLessEqual(diag["total_elapsed_ms"], 14000)
+
+    def test_no_solve_starts_below_the_minimum_remaining(self):
+        """Sous le seuil, plus aucune resolution ne part.
+
+        La limite souple est fixee si bas qu'aucune resolution ne peut plus
+        etre lancee : le compteur doit rester a zero, pas simplement echouer
+        apres coup."""
+        os.environ["LOCAL_VROOM_TOTAL_SOFT_LIMIT_S"] = "2"
+        local_vroom.get_config(refresh=True)
+        groups, err, meta = self.run_strategy()
+        diag = meta["hybrid"]
+        self.assertEqual(diag["local_vroom_attempted"], 0)
+        self.assertEqual(len(self.solver.calls), 0)
+        self.assertGreaterEqual(diag["local_vroom_skipped_for_time"], 1)
+        # Route-first ne depend d'aucune resolution : un resultat valide sort
+        # quand meme.
+        self.assertIsNone(err)
+        self.assertEqual(sorted(len(g) for g in groups), [30, 30])
+
+    def test_every_stage_records_budget_and_stop_reason(self):
+        _, _, meta = self.run_strategy()
+        stages = meta["hybrid"]["hybrid_stages"]
+        expected = {"matrix", "joint_direct", "joint_nucleus", "route_first",
+                    "joint_alns", "alns_refine", "joint_finalists"}
+        self.assertEqual({s["stage"] for s in stages}, expected)
+        for stage in stages:
+            self.assertIsNotNone(stage["stop_reason"])
+            self.assertGreaterEqual(stage["elapsed_ms"], 0)
+            self.assertGreaterEqual(stage["remaining_after_s"], 0.0)
+
+    def test_stages_never_overrun_the_global_limit(self):
+        _, _, meta = self.run_strategy()
+        diag = meta["hybrid"]
+        self.assertLess(diag["total_elapsed_ms"], 58000)
+
+    def test_matrix_is_called_once_whatever_the_number_of_solutions(self):
+        _, _, meta = self.run_strategy()
+        self.assertEqual(self.matrix.calls, 1)
+        self.assertLessEqual(meta["hybrid"]["hybrid_matrix_calls"], 2)
+        self.assertGreater(meta["hybrid"]["joint_solutions_considered"], 5)
 
 
 if __name__ == "__main__":

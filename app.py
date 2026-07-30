@@ -3,6 +3,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import time
 import numpy as np
 import requests
@@ -4537,6 +4538,281 @@ def hybrid_route_first(points, indices, dur_matrix, dist_matrix, adjacency,
     return solutions, stats
 
 
+def _hybrid_partition_cost(dur_matrix, group_a, group_b, start_idx, end_idx):
+    """Cout ORS rapide d'une partition, ordres reconstruits au plus proche
+    voisin SUR LA MATRICE ORS.
+
+    Ce n'est pas un proxy haversine : chaque comparaison de l'ALNS se fait
+    bien sur les durees routieres. L'ordre n'est pas affine ici -- Or-opt et
+    2-opt coutent trop cher pour etre payes a chaque iteration -- il l'est
+    seulement sur les partitions retenues a la fin.
+    """
+    cost_a, route_a = _estimate_group_cost(dur_matrix, group_a, start_idx, end_idx, False)
+    cost_b, route_b = _estimate_group_cost(dur_matrix, group_b, start_idx, end_idx, False)
+    return cost_a + cost_b, route_a, route_b
+
+
+def _hybrid_partition_valid(group_a, group_b, indices, sizes, adjacency):
+    """Contraintes DURES, verifiees a chaque mouvement accepte.
+
+    Cardinalite exacte, union complete, aucun doublon, un seul tenant de
+    chaque cote. Un mouvement qui viole l'une d'elles n'est pas penalise :
+    il est refuse. Une tournee n'est pas "un peu" faisable.
+    """
+    if len(group_a) != sizes[0] or len(group_b) != sizes[1]:
+        return False
+    merged = list(group_a) + list(group_b)
+    if len(set(merged)) != len(merged):
+        return False
+    if sorted(merged) != indices:
+        return False
+    if not is_connected_partition(group_a, adjacency)["connected"]:
+        return False
+    return is_connected_partition(group_b, adjacency)["connected"]
+
+
+def _hybrid_border(group_a, group_b, adjacency):
+    """Points ayant au moins un voisin G5 dans l'autre territoire.
+
+    C'est la seule chose que l'haversine decide ici : OU regarder. Le gain
+    d'un mouvement, lui, est toujours mesure sur la matrice ORS.
+    """
+    sa, sb = set(group_a), set(group_b)
+    border_a = [i for i in group_a if any(j in sb for j in adjacency.get(i, ()))]
+    border_b = [i for i in group_b if any(j in sa for j in adjacency.get(i, ()))]
+    return border_a, border_b
+
+
+def _hybrid_alns_neighbour(rng, group_a, group_b, adjacency, dur_matrix,
+                           start_idx, end_idx):
+    """Un mouvement, choisi parmi les operateurs territoriaux.
+
+    Tous conservent la cardinalite par construction : ils ECHANGENT, ils ne
+    transferent pas. Le seul qui pourrait la rompre, destroy/repair, retire
+    autant de points de chaque cote qu'il en redistribue.
+    """
+    border_a, border_b = _hybrid_border(group_a, group_b, adjacency)
+    if not border_a or not border_b:
+        return None, "no_border"
+
+    operator = rng.choice(("swap_1_1", "swap_2_2", "chain", "destroy_repair"))
+    sa, sb = list(group_a), list(group_b)
+
+    if operator == "swap_1_1":
+        i = rng.choice(border_a)
+        j = rng.choice(border_b)
+        sa[sa.index(i)] = j
+        sb[sb.index(j)] = i
+        return (sorted(sa), sorted(sb)), operator
+
+    if operator == "swap_2_2":
+        if len(border_a) < 2 or len(border_b) < 2:
+            return None, operator
+        take_a = rng.sample(border_a, 2)
+        take_b = rng.sample(border_b, 2)
+        sa = [x for x in sa if x not in take_a] + take_b
+        sb = [x for x in sb if x not in take_b] + take_a
+        return (sorted(sa), sorted(sb)), operator
+
+    if operator == "chain":
+        # Petite chaine : un point de frontiere et ses voisins DU MEME
+        # territoire. Deplacer une chaine coherente plutot que des points
+        # isoles evite de decouper le territoire en confettis.
+        length = rng.randint(2, 3)
+        chain_a = _hybrid_chain(rng, border_a, set(group_a), adjacency, length)
+        chain_b = _hybrid_chain(rng, border_b, set(group_b), adjacency, length)
+        if len(chain_a) != len(chain_b) or not chain_a:
+            return None, operator
+        sa = [x for x in sa if x not in chain_a] + chain_b
+        sb = [x for x in sb if x not in chain_b] + chain_a
+        return (sorted(sa), sorted(sb)), operator
+
+    # destroy / repair : on retire k points de chaque cote, puis on
+    # REINSERE en routier -- chaque point rejoint le territoire ou son
+    # insertion coute le moins cher sur la matrice ORS.
+    k = rng.randint(3, 5)
+    k = min(k, len(border_a), len(border_b))
+    if k < 1:
+        return None, "destroy_repair"
+    removed = rng.sample(border_a, k) + rng.sample(border_b, k)
+    keep_a = [x for x in group_a if x not in removed]
+    keep_b = [x for x in group_b if x not in removed]
+    target_a = len(group_a)
+    for node in sorted(removed, key=lambda x: -_hybrid_insertion_gap(
+            dur_matrix, x, keep_a, keep_b, start_idx)):
+        gap_a = _hybrid_insertion_cost(dur_matrix, node, keep_a, start_idx)
+        gap_b = _hybrid_insertion_cost(dur_matrix, node, keep_b, start_idx)
+        if len(keep_a) >= target_a:
+            keep_b.append(node)
+        elif len(keep_b) >= len(group_b):
+            keep_a.append(node)
+        elif gap_a <= gap_b:
+            keep_a.append(node)
+        else:
+            keep_b.append(node)
+    return (sorted(keep_a), sorted(keep_b)), "destroy_repair"
+
+
+def _hybrid_chain(rng, border, group, adjacency, length):
+    """Chaine de `length` points connexes, partant d'un point de frontiere."""
+    if not border:
+        return []
+    chain = [rng.choice(border)]
+    while len(chain) < length:
+        candidates = [j for i in chain for j in adjacency.get(i, ())
+                      if j in group and j not in chain]
+        if not candidates:
+            break
+        chain.append(min(candidates))
+    return sorted(chain)
+
+
+def _hybrid_insertion_cost(dur_matrix, node, group, start_idx):
+    """Cout d'attache d'un point a un territoire, sur la matrice ORS."""
+    if not group:
+        return dur_matrix[start_idx][node]
+    return min(dur_matrix[other][node] for other in group)
+
+
+def _hybrid_insertion_gap(dur_matrix, node, group_a, group_b, start_idx):
+    """Ecart entre les deux attaches possibles : les points les plus
+    tranches sont replaces en premier, ceux qui hesitent en dernier."""
+    return abs(_hybrid_insertion_cost(dur_matrix, node, group_a, start_idx)
+               - _hybrid_insertion_cost(dur_matrix, node, group_b, start_idx))
+
+
+def hybrid_territorial_alns(points, indices, dur_matrix, dist_matrix, adjacency,
+                            start_idx, end_idx, seeds, matrix_hash, clock,
+                            service_s, max_finalists=12):
+    """BLOC C -- recherche a voisinage large sur les TERRITOIRES.
+
+    Aucun appel reseau, aucune resolution VROOM pendant la recherche : elle
+    ne consulte que la matrice deja chargee. L'haversine, via le graphe G5,
+    dit seulement ou se trouve la frontiere ; l'acceptation et le classement
+    ne regardent que les durees ORS.
+
+    La graine aleatoire derive de l'empreinte de matrice : deux runs sur la
+    meme matrice explorent exactement la meme suite de mouvements, donc un
+    resultat different ne peut pas venir du hasard.
+
+    Retourne (partitions_finalistes, stats). Les partitions sont uniques et
+    classees ; ce bloc ne resout rien, il propose.
+    """
+    stats = {"iterations": 0, "accepted": 0, "rejected": 0,
+             "seed": _hybrid_matrix_seed(matrix_hash), "operators": {}}
+    if not seeds:
+        return [], stats
+
+    rng = random.Random(stats["seed"])
+    sizes = (len(seeds[0]["group_a"]), len(seeds[0]["group_b"]))
+    sorted_indices = sorted(indices)
+
+    pool = {}
+
+    def remember(group_a, group_b, cost):
+        key = canonical_partition_key(group_a, group_b)
+        previous = pool.get(key)
+        if previous is None or cost < previous[0]:
+            pool[key] = (cost, list(group_a), list(group_b))
+        return key
+
+    incumbents = []
+    for seed in seeds:
+        cost, _, _ = _hybrid_partition_cost(dur_matrix, seed["group_a"],
+                                            seed["group_b"], start_idx, end_idx)
+        remember(seed["group_a"], seed["group_b"], cost)
+        incumbents.append((cost, list(seed["group_a"]), list(seed["group_b"])))
+
+    # Tour de role entre les graines : concentrer tout le budget sur une
+    # seule laisserait les autres bassins inexplores.
+    cursor = 0
+    while not clock.expired() and incumbents:
+        stats["iterations"] += 1
+        cost, group_a, group_b = incumbents[cursor % len(incumbents)]
+        cursor += 1
+
+        move, operator = _hybrid_alns_neighbour(
+            rng, group_a, group_b, adjacency, dur_matrix, start_idx, end_idx)
+        stats["operators"][operator] = stats["operators"].get(operator, 0) + 1
+        if move is None:
+            stats["rejected"] += 1
+            continue
+
+        new_a, new_b = move
+        if not _hybrid_partition_valid(new_a, new_b, sorted_indices, sizes,
+                                       adjacency):
+            stats["rejected"] += 1
+            continue
+
+        new_cost, _, _ = _hybrid_partition_cost(dur_matrix, new_a, new_b,
+                                                start_idx, end_idx)
+        remember(new_a, new_b, new_cost)
+        if new_cost < cost - 1e-9:
+            stats["accepted"] += 1
+            incumbents[(cursor - 1) % len(incumbents)] = (new_cost, new_a, new_b)
+        else:
+            stats["rejected"] += 1
+
+    ranked = sorted(pool.items(), key=lambda item: (item[1][0], item[0]))
+    finalists = [{"partition_key": key, "proxy_cost": cost,
+                  "group_a": group_a, "group_b": group_b}
+                 for key, (cost, group_a, group_b) in ranked[:max_finalists]]
+    stats["unique"] = len(pool)
+    return finalists, stats
+
+
+def hybrid_fixed_partition_solve(points, indices, dur_matrix, dist_matrix,
+                                 adjacency, start_idx, end_idx, capacity,
+                                 group_a, group_b, ledger, clock, service_s):
+    """BLOC C -- une partition FIGEE, resolue en une seule requete VROOM.
+
+    Les deux territoires partent dans le MEME appel, avec des skills qui
+    fixent l'appartenance : VROOM n'a plus qu'a ordonner. Deux appels a un
+    vehicule couteraient deux resolutions pour le meme resultat.
+    """
+    job_skills = {}
+    for i in group_a:
+        job_skills[i] = [1]
+    for i in group_b:
+        job_skills[i] = [2]
+
+    vehicle_ids = (1, 2)
+    payload = local_vroom.build_joint_payload(
+        job_ids=indices,
+        durations=dur_matrix,
+        start_index=start_idx,
+        end_index=end_idx,
+        max_tasks_per_vehicle=capacity,
+        service_times={i: service_s for i in indices} if service_s else None,
+        job_location_index={i: i for i in indices},
+        vehicle_ids=vehicle_ids,
+        job_skills=job_skills,
+        vehicle_skills={1: [1], 2: [2]},
+    )
+    solution = local_vroom.solve_vroom_local(
+        payload,
+        timeout_s=local_vroom.get_config().per_solve_timeout_s,
+        ledger=ledger,
+        cancellation_deadline=clock.deadline,
+    )
+    sequences = local_vroom.validate_joint_solution(
+        solution, indices, vehicle_ids,
+        max_tasks_per_vehicle=capacity,
+        start_index=start_idx, end_index=end_idx)
+
+    if sorted(sequences[1]) != sorted(group_a) or \
+            sorted(sequences[2]) != sorted(group_b):
+        raise local_vroom.LocalVroomError(
+            local_vroom.ERR_INVALID_SOLUTION,
+            "la partition figee n'a pas ete respectee")
+
+    route_a, route_b = _hybrid_routes(sequences, vehicle_ids, start_idx, end_idx)
+    return _hybrid_solution(
+        sequences[1], sequences[2], route_a, route_b, dur_matrix, dist_matrix,
+        adjacency, points, "joint_finalist", "vroom_local", service_s,
+        declared=(solution.get("summary") or {}).get("duration"))
+
+
 def _hybrid_diagnostics_template():
     """Tous les champs de diagnostic existent des le depart.
 
@@ -4802,6 +5078,106 @@ def _hybrid_run(points, indices, start_idx, end_idx, capacity, headers,
           % (rf_stats["cycles"], rf_stats["cuts"], rf_stats["connected"],
              rf_stats["unique"], len(rf_solutions)), flush=True)
     clock.end("budget_exhausted" if clock.expired() else "done")
+
+    # =====================================================================
+    # BLOC C -- ALNS TERRITORIALE PUIS FINALISTES VROOM
+    # =====================================================================
+    clock.begin("joint_alns", min(config.alns_budget_s, clock.remaining_s()))
+    finalists, alns_stats = hybrid_territorial_alns(
+        points, indices, dur_matrix, dist_matrix, adjacency, start_idx,
+        end_idx, solutions, diag["common_rescore_matrix_hash"], clock,
+        service_s)
+    diag["joint_alns_iterations"] = alns_stats["iterations"]
+    diag["joint_alns_accepted"] = alns_stats["accepted"]
+    diag["joint_alns_seed"] = alns_stats["seed"]
+    diag["joint_finalists"] = len(finalists)
+    print("  Bloc C: ALNS %d iterations, %d acceptees, %d partitions uniques, "
+          "%d finalistes, graine %d"
+          % (alns_stats["iterations"], alns_stats["accepted"],
+             alns_stats.get("unique", 0), len(finalists), alns_stats["seed"]),
+          flush=True)
+    clock.end("budget_exhausted" if clock.expired() else "done")
+
+    # Les partitions issues de l'ALNS n'ont qu'un ordre au plus proche voisin.
+    # On leur donne un ordre affine sur la matrice, sans reseau : sans cela
+    # elles seraient systematiquement battues par les solutions VROOM pour une
+    # raison d'ordonnancement, pas de territoire.
+    clock.begin("alns_refine", min(2.0, clock.remaining_s()))
+    already_solved = {s["partition_key"] for s in solutions}
+    best_alns = None
+    for finalist in finalists:
+        if clock.expired():
+            break
+        if finalist["partition_key"] in already_solved:
+            continue
+        _, route_a, route_b = _hybrid_partition_cost(
+            dur_matrix, finalist["group_a"], finalist["group_b"],
+            start_idx, end_idx)
+        route_a = _hybrid_refine_order(dur_matrix, route_a, clock.stage_deadline)
+        route_b = _hybrid_refine_order(dur_matrix, route_b, clock.stage_deadline)
+        solution = _hybrid_solution(
+            finalist["group_a"], finalist["group_b"], route_a, route_b,
+            dur_matrix, dist_matrix, adjacency, points, "joint_alns",
+            "matrix_local_search", service_s)
+        if not (solution["connected"] and solution["cardinality_ok"]):
+            continue
+        solutions.append(solution)
+        finalist["duration_s"] = solution["duration_s"]
+        if best_alns is None or solution["duration_s"] < best_alns["duration_s"]:
+            best_alns = solution
+    if best_alns is not None:
+        diag["joint_alns_best_duration_s"] = round(best_alns["duration_s"], 1)
+        diag["joint_alns_best_distance_m"] = round(best_alns["distance_m"], 1)
+        diag["joint_alns_best_enclaves"] = best_alns["boundary"]["enclave_points"]
+    clock.end("budget_exhausted" if clock.expired() else "done")
+
+    # --- finalistes VROOM : les meilleures partitions encore non resolues ---
+    clock.begin("joint_finalists", min(
+        config.finalist_solves * (config.per_solve_timeout_s + 2.0),
+        clock.remaining_s()))
+    stop_reason = "done"
+    solved = 0
+    for finalist in sorted(finalists, key=lambda f: f.get("duration_s",
+                                                          f["proxy_cost"])):
+        if solved >= config.finalist_solves:
+            stop_reason = "finalist_quota"
+            break
+        if clock.expired():
+            stop_reason = local_vroom.ERR_GLOBAL_TIME_LIMIT
+            break
+        # Une partition deja resolue par VROOM ne l'est jamais deux fois :
+        # la resolution est deterministe, le second appel rendrait le meme
+        # ordre pour le meme quart de budget.
+        if finalist["partition_key"] in already_solved:
+            ledger.record_reuse()
+            diag["joint_finalists_reused"] += 1
+            continue
+        if not ledger.can_attempt():
+            stop_reason = (local_vroom.ERR_BUDGET_EXHAUSTED
+                           if ledger.budget_left() <= 0
+                           else local_vroom.ERR_GLOBAL_TIME_LIMIT)
+            if ledger.budget_left() > 0:
+                ledger.record_skip_for_time()
+            break
+        try:
+            solution = hybrid_fixed_partition_solve(
+                points, indices, dur_matrix, dist_matrix, adjacency,
+                start_idx, end_idx, capacity, finalist["group_a"],
+                finalist["group_b"], ledger, clock, service_s)
+            solutions.append(solution)
+            already_solved.add(solution["partition_key"])
+            solved += 1
+        except local_vroom.LocalVroomError as exc:
+            stop_reason = exc.code
+            print("  Bloc C: finaliste rejete (%s)" % exc.code, flush=True)
+            if exc.code in (local_vroom.ERR_BUDGET_EXHAUSTED,
+                            local_vroom.ERR_GLOBAL_TIME_LIMIT):
+                break
+    diag["joint_finalists_local_vroom_solved"] = solved
+    print("  Bloc C: %d finaliste(s) resolus par VROOM, %d reutilises, "
+          "arret=%s" % (solved, diag["joint_finalists_reused"], stop_reason),
+          flush=True)
+    clock.end(stop_reason)
 
     return _hybrid_finish(points, indices, start_idx, end_idx, dur_matrix,
                           dist_matrix, adjacency, solutions, clock, ledger,
