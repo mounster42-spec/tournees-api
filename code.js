@@ -79,10 +79,38 @@ const BENCH_HEADERS_CONN = [
   "vroom_total_duration_s", "vroom_total_distance_m", "partition_solver"
 ];
 
+// Colonnes du recentrage ORS-first, strictement a la fin : reference a
+// cardinalite exacte, penalite de connexite, budgets par etape, source
+// ORS-first et arbitrage de la post-optimisation. Aucune colonne existante
+// n'est deplacee.
+const BENCH_HEADERS_ORSFIRST = [
+  "connected_ors_reference_available", "connected_ors_reference_duration_s",
+  "connected_ors_reference_distance_m", "connected_ors_reference_sizes",
+  "connected_ors_reference_components_t1",
+  "connected_ors_reference_components_t2",
+  "connected_ors_reference_time_limit_hit",
+  "connected_ors_reference_fallback_used",
+  "connected_ors_reference_solver_status", "connected_ors_reference_solve_ms",
+  "connectivity_penalty_duration_s", "connectivity_penalty_distance_m",
+  "connectivity_penalty_reliable", "connectivity_penalty_note",
+  "connected_stage_timings_text", "connected_stage_budget_exhausted",
+  "connected_generation_expired_after",
+  "connected_ors_repair_candidates_raw",
+  "connected_ors_repair_candidates_unique",
+  "connected_ors_repair_reached_ortools",
+  "connected_ors_repair_best_proxy_rank", "connected_ors_repair_is_winner",
+  "connected_prescore_refined", "connected_prescore_budget_exhausted",
+  "connected_winner_proxy_rank_rough", "connected_winner_proxy_rank_refined",
+  "connected_winner_ortools_rank",
+  "connected_matrix_hash", "connected_per_source_text",
+  "post_optimization_kept", "post_optimization_note"
+];
+
 const BENCH_HEADERS = BENCH_HEADERS_BASE
   .concat(BENCH_HEADERS_D3)
   .concat(BENCH_HEADERS_TERR)
-  .concat(BENCH_HEADERS_CONN);
+  .concat(BENCH_HEADERS_CONN)
+  .concat(BENCH_HEADERS_ORSFIRST);
 
 
 
@@ -643,7 +671,40 @@ function appendBenchmark(result, params, points, extra) {
     _cell(result.ortools_total_distance_m),
     _cell(result.vroom_total_duration_s),
     _cell(result.vroom_total_distance_m),
-    _cell(result.partition_solver)
+    _cell(result.partition_solver),
+
+    // --- recentrage ORS-first ---
+    _cell(result.connected_ors_reference_available),
+    _cell(result.connected_ors_reference_duration_s),
+    _cell(result.connected_ors_reference_distance_m),
+    _cellList(result.connected_ors_reference_sizes),
+    _cell(result.connected_ors_reference_components_t1),
+    _cell(result.connected_ors_reference_components_t2),
+    _cell(result.connected_ors_reference_time_limit_hit),
+    _cell(result.connected_ors_reference_fallback_used),
+    _cell(result.connected_ors_reference_solver_status),
+    _cell(result.connected_ors_reference_solve_ms),
+    _cell(result.connectivity_penalty_duration_s),
+    _cell(result.connectivity_penalty_distance_m),
+    _cell(result.connectivity_penalty_reliable),
+    _cell(result.connectivity_penalty_note),
+    _cell(result.connected_stage_timings_text),
+    _cell(result.connected_stage_budget_exhausted),
+    _cell(result.connected_generation_expired_after),
+    _cell(result.connected_ors_repair_candidates_raw),
+    _cell(result.connected_ors_repair_candidates_unique),
+    _cell(result.connected_ors_repair_reached_ortools),
+    _cell(result.connected_ors_repair_best_proxy_rank),
+    _cell(result.connected_ors_repair_is_winner),
+    _cell(result.connected_prescore_refined),
+    _cell(result.connected_prescore_budget_exhausted),
+    _cell(result.connected_winner_proxy_rank_rough),
+    _cell(result.connected_winner_proxy_rank_refined),
+    _cell(result.connected_winner_ortools_rank),
+    _cell(result.connected_matrix_hash),
+    _cell(result.connected_per_source_text),
+    _cell(result.post_optimization_kept),
+    _cell(result.post_optimization_note)
   ];
 
   sheet.appendRow(row);

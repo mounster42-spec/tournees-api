@@ -653,15 +653,25 @@ def _ortools_solver_stats(routing):
 
 
 def _solve_cvrp_ortools(cost_matrix, num_vehicles, capacity, start_idx, end_idx,
-                        solution_limit=None):
-    """Resout un CVRP localement et retourne UNIQUEMENT l'affectation.
+                        solution_limit=None, time_limit_s=None, detail=None):
+    """Resout un CVRP localement et retourne l'affectation.
 
-    L'ordre trouve par OR-Tools est volontairement jete : c'est Vroom qui
-    sequence ensuite, sur le reseau routier reel. On ne compare donc que la
-    qualite de la partition.
+    Historiquement, l'ordre trouve par OR-Tools etait jete : c'est Vroom qui
+    sequencait ensuite, on ne comparait donc que la qualite de la partition.
+    Jeter cet ordre revient a payer plusieurs secondes de recherche guidee pour
+    n'en garder que la moitie du resultat. L'argument `detail` -- un
+    dictionnaire rempli SUR PLACE -- permet desormais de le recuperer, sans
+    changer la valeur de retour : tous les appelants historiques et les
+    bouchons de test qui rendent un couple continuent de fonctionner a
+    l'identique.
 
     Entree : matrice de couts entiers, nb de vehicules, capacite par vehicule,
              index du depot de depart, index du depot d'arrivee.
+             time_limit_s : plafond DEDIE. None -> ORTOOLS_TIME_LIMIT_S. Sans
+             lui, une seule resolution peut consommer tout le budget d'un
+             pipeline qui en enchaine plusieurs.
+             detail : dict optionnel rempli avec routes, statut, nb de
+             solutions, temps ecoule, cardinalites et drapeau de troncature.
     Retour : (groups, None) ou (None, message_erreur).
              groups = [[indices vehicule 0], [indices vehicule 1], ...]
     """
@@ -672,6 +682,7 @@ def _solve_cvrp_ortools(cost_matrix, num_vehicles, capacity, start_idx, end_idx,
     # None -> ORTOOLS_SOLUTION_LIMIT, donc un appel sans l'argument reproduit
     # exactement le comportement actuel.
     effective_limit = solution_limit if solution_limit else ORTOOLS_SOLUTION_LIMIT
+    effective_time = time_limit_s if time_limit_s else ORTOOLS_TIME_LIMIT_S
 
     n = len(cost_matrix)
     depots = {start_idx, end_idx}
@@ -715,7 +726,7 @@ def _solve_cvrp_ortools(cost_matrix, num_vehicles, capacity, start_idx, end_idx,
         params.local_search_metaheuristic = (
             routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH)
         params.solution_limit = effective_limit
-        params.time_limit.FromSeconds(ORTOOLS_TIME_LIMIT_S)
+        params.time_limit.FromSeconds(effective_time)
         params.log_search = False
 
         t0 = time.time()
@@ -723,22 +734,33 @@ def _solve_cvrp_ortools(cost_matrix, num_vehicles, capacity, start_idx, end_idx,
         elapsed = time.time() - t0
 
         if solution is None:
+            if detail is not None:
+                detail.update({"solver_status": _ortools_status(routing),
+                               "elapsed_s": elapsed, "time_limit_hit": False,
+                               "routes": None, "sizes": None, "solutions": 0})
             return None, f"no solution (status={_ortools_status(routing)})"
 
         # Le garde-fou temps ne doit jamais trancher : s'il tranche, le
         # resultat depend de la machine et n'est plus reproductible.
-        if elapsed >= ORTOOLS_TIME_LIMIT_S - 0.5:
+        limit_hit = elapsed >= effective_time - 0.5
+        if limit_hit:
             print(f"  ATTENTION OR-Tools: arret sur time_limit ({elapsed:.1f}s), "
                   f"resultat NON deterministe", flush=True)
 
+        # Les ORDRES sont conserves en meme temps que l'affectation. Une route
+        # part du depot de depart, traverse les points du vehicule et finit sur
+        # le depot d'arrivee : elle est directement rescorable.
         groups = [[] for _ in range(num_vehicles)]
+        routes = [[] for _ in range(num_vehicles)]
         for v in range(num_vehicles):
             index = routing.Start(v)
             while not routing.IsEnd(index):
                 node = manager.IndexToNode(index)
+                routes[v].append(node)
                 if node not in depots:
                     groups[v].append(node)
                 index = solution.Value(routing.NextVar(index))
+            routes[v].append(manager.IndexToNode(routing.End(v)))
 
         # Objectif sans unite : cette fonction recoit une matrice d'entiers et
         # ne peut pas savoir s'il s'agit de metres (haversine) ou de secondes
@@ -751,9 +773,23 @@ def _solve_cvrp_ortools(cost_matrix, num_vehicles, capacity, start_idx, end_idx,
               f"branches={stats['branches']} failures={stats['failures']} "
               f"wall_time_ms={stats['wall_time_ms']}", flush=True)
 
+        if detail is not None:
+            detail.update({
+                "routes": routes,
+                "sizes": [len(g) for g in groups],
+                "solver_status": _ortools_status(routing),
+                "solutions": stats["solutions"],
+                "elapsed_s": elapsed,
+                "time_limit_hit": limit_hit,
+                "objective": solution.ObjectiveValue(),
+            })
         return groups, None
 
     except Exception as e:
+        if detail is not None:
+            detail.update({"solver_status": "exception", "error": str(e)[:200],
+                           "routes": None, "sizes": None, "solutions": 0,
+                           "time_limit_hit": False})
         return None, f"ortools error: {e}"
 
 
@@ -1435,6 +1471,27 @@ CONNECTED_LEGACY_FINALIST_SLOTS = _env_int("CONNECTED_LEGACY_FINALIST_SLOTS", 6,
 CONNECTED_MAX_GENERATION_S = _env_int("CONNECTED_MAX_GENERATION_S", 25, 1, 600)
 CONNECTED_ORS_NEIGHBOR_K = _env_int("CONNECTED_ORS_NEIGHBOR_K", 3, 0, 20)
 
+# --- budgets PAR ETAPE ---
+# Un deadline global unique ne protege rien quand les etapes couteuses sont
+# ordonnancees avant la premiere verification : sur un run reel, les deux
+# resolutions CVRP initiales consommaient onze secondes, la liste de candidates
+# etait construite, et la boucle d'examen expirait avant d'en lire une seule.
+# Chaque etape porte donc son propre plafond, et les etapes GARANTIES --
+# historique puis reparations ORS -- passent avant les sources residuelles.
+# Le plafond global CONNECTED_MAX_GENERATION_S reste une protection generale.
+CONNECTED_ORS_CVRP_TIME_LIMIT_S = _env_int("CONNECTED_ORS_CVRP_TIME_LIMIT_S", 8, 1, 600)
+CONNECTED_LEGACY_BUDGET_S = _env_int("CONNECTED_LEGACY_BUDGET_S", 5, 1, 600)
+CONNECTED_ORS_REPAIR_BUDGET_S = _env_int("CONNECTED_ORS_REPAIR_BUDGET_S", 10, 1, 600)
+CONNECTED_RESIDUAL_SOURCES_BUDGET_S = _env_int("CONNECTED_RESIDUAL_SOURCES_BUDGET_S", 5, 1, 600)
+CONNECTED_PRESCORE_BUDGET_S = _env_int("CONNECTED_PRESCORE_BUDGET_S", 3, 1, 600)
+# Plafond d'uniques par source residuelle : sans lui, le balayage produit a lui
+# seul des milliers de coupes et sature le jeu de candidates.
+CONNECTED_RESIDUAL_PER_SOURCE = _env_int("CONNECTED_RESIDUAL_PER_SOURCE", 12, 1, 500)
+# Candidates dont le proxy est AFFINE (Or-opt + 2-opt matriciels) avant le
+# classement de preselection. Les affiner toutes coute trop cher, n'en affiner
+# aucune classe mal : on affine les meilleures au proxy brut.
+CONNECTED_PRESCORE_REFINE_MAX = _env_int("CONNECTED_PRESCORE_REFINE_MAX", 36, 1, 500)
+
 # Plafonds d'appels payants. Ils ne bougent PAS avec la diversification :
 # davantage de candidates locales, autant d'appels reseau.
 CONNECTED_ORTOOLS_FINALISTS = _env_int("CONNECTED_ORTOOLS_FINALISTS", 12, 1, 60)
@@ -1445,6 +1502,65 @@ CONNECTED_TOP_VROOM = CONNECTED_VROOM_FINALISTS       # candidates a Vroom (nive
 # Part des 12 finalistes reservee a la diversite d'appartenance. Les places
 # restantes vont aux meilleurs scores, quelle que soit leur ressemblance.
 CONNECTED_DIVERSE_SHARE = 0.5
+
+# Places reservees aux reparations de la partition ORS de reference. Meme
+# raison que pour les places historiques : le proxy classe mal ces partitions,
+# et une source qui n'atteint jamais OR-Tools ne peut jamais etre evaluee.
+CONNECTED_ORS_REPAIR_FINALIST_SLOTS = _env_int("CONNECTED_ORS_REPAIR_FINALIST_SLOTS", 3, 0, 12)
+
+
+class _StageClock:
+    """Budgets PAR ETAPE, sous un plafond global.
+
+    Chaque etape declare son budget avant de demarrer et interroge `expired()`
+    pendant son execution. Une etape qui epuise son budget n'annule rien : les
+    candidates deja validees restent acquises, seule la production s'arrete.
+    Les temps mesures sont conserves pour le journal et pour Benchmark.
+    """
+
+    def __init__(self, global_deadline):
+        self.global_deadline = global_deadline
+        self.timings_ms = {}
+        self.exhausted = []
+        self.stage = None
+        self._t0 = None
+        self._deadline = None
+
+    def begin(self, stage, budget_s):
+        self.end()
+        self.stage = stage
+        self._t0 = time.time()
+        self._deadline = min(self._t0 + float(budget_s), self.global_deadline)
+        return self
+
+    def expired(self):
+        now = time.time()
+        if self.stage is None:
+            return now >= self.global_deadline
+        if now >= self._deadline:
+            if self.stage not in self.exhausted:
+                self.exhausted.append(self.stage)
+            return True
+        return False
+
+    def remaining(self):
+        if self.stage is None:
+            return max(0.0, self.global_deadline - time.time())
+        return max(0.0, self._deadline - time.time())
+
+    def end(self):
+        if self.stage is not None:
+            self.timings_ms[self.stage] = (self.timings_ms.get(self.stage, 0)
+                                           + int((time.time() - self._t0) * 1000))
+            self.stage = None
+        return self
+
+
+def _stage_timings_text(timings):
+    """Temps par etape, aplatis pour une feuille de calcul : "legacy=812;..."."""
+    if not timings:
+        return ""
+    return ";".join("%s=%d" % (k, timings[k]) for k in sorted(timings))
 
 
 def _symmetrised_ors(matrix, i, j):
@@ -1915,6 +2031,174 @@ def connected_local_search(ga, gb, adjacency, dur_matrix, start_idx, end_idx,
     return sorted(ga), sorted(gb), base, swaps
 
 
+def _exact_capacity(n_points, num_vehicles=2):
+    """Capacite par vehicule qui IMPOSE la cardinalite cible.
+
+    Avec deux vehicules, tous les points obligatoires et une capacite egale a
+    ceil(n/2), la somme des capacites vaut n (n pair) ou n+1 (n impair) : le
+    solveur ne peut donc rendre que floor(n/2) / ceil(n/2). Pour 60 collectes,
+    30/30 est la SEULE repartition admissible -- un 42/18 devient infaisable,
+    sans aucun terme d'equilibrage dans l'objectif. Pour 58 collectes, 29/29.
+    """
+    if num_vehicles <= 0:
+        return 0
+    return -(-int(n_points) // int(num_vehicles))
+
+
+def _refine_route_matrix(matrix, route):
+    """Or-opt puis 2-opt matriciels sur une route deja construite. Local,
+    deterministe, aucun appel reseau : c'est l'affinage deja utilise pour les
+    finalistes, applique ici a la reference."""
+    if not route or len(route) < 4:
+        return list(route)
+    return _two_opt_matrix(matrix, _or_opt_matrix(matrix, list(route)))
+
+
+def build_ors_reference(points, indices, target_a, dur_matrix, dist_matrix,
+                        adjacency, start_idx, end_idx,
+                        time_limit_s=None, xy=None):
+    """REFERENCE ORS a cardinalite exacte, sans contrainte de connexite.
+
+    C'est la meilleure partition que le solveur trouve sur les DUREES ORS
+    lorsqu'on lui impose seulement la cardinalite. Elle joue deux roles, et il
+    ne faut pas les confondre :
+      - reference de PERFORMANCE : elle donne le plancher auquel comparer la
+        solution connexe, d'ou la penalite de connexite ;
+      - GRAINE de partition : ses reparations sont les candidates ORS-first.
+    Elle n'est PAS une candidate : rien ne garantit qu'elle soit connexe.
+
+    Ce qui change par rapport a l'ancienne graine "non contrainte" : la
+    capacite passee au solveur valait len(indices), donc une repartition 42/18
+    etait admissible, et _normalize_sizes la ramenait ensuite a 30/30 en
+    deplacant les points les plus proches du centroide oppose -- un critere
+    HAVERSINE, aveugle a l'objectif ORS. Douze points pouvaient ainsi changer
+    de tournee sur un critere sans rapport avec la duree avant meme le debut de
+    la reparation. La cardinalite est desormais imposee DANS le solveur, et la
+    normalisation geographique disparait de la voie normale.
+
+    Retourne un dictionnaire compatible avec la structure unique de solution
+    (routes, duration_s, distance_m, sequencer, selection_reason,
+    partition_key), enrichi des diagnostics du solveur.
+    """
+    ref = {
+        "available": False, "group_a": [], "group_b": [],
+        "route_a": [], "route_b": [], "routes": [],
+        "duration_s": None, "distance_m": None,
+        "duration_raw_s": None, "distance_raw_m": None,
+        "sequencer": "ortools_cvrp", "selection_reason": "ors_reference",
+        "partition_key": None, "sizes": None, "cardinality_exact": False,
+        "fallback_used": False, "time_limit_hit": False,
+        "solver_status": None, "solutions": 0, "solve_ms": 0,
+        "components_t1": None, "components_t2": None, "error": "",
+    }
+    if not ORTOOLS_AVAILABLE:
+        ref["error"] = "ortools not installed"
+        return ref
+
+    n = len(indices)
+    if n < 2:
+        ref["error"] = "not enough delivery points"
+        return ref
+
+    limit = time_limit_s or CONNECTED_ORS_CVRP_TIME_LIMIT_S
+    capacity = _exact_capacity(n, 2)
+    t0 = time.time()
+
+    # --- voie normale : cardinalite imposee par la capacite ---
+    detail = {}
+    groups, err = _solve_cvrp_ortools(dur_matrix, 2, capacity, start_idx,
+                                      end_idx, time_limit_s=limit,
+                                      detail=detail)
+    ref["solver_status"] = detail.get("solver_status")
+    ref["solutions"] = detail.get("solutions", 0)
+    ref["time_limit_hit"] = bool(detail.get("time_limit_hit"))
+
+    sizes_ok = False
+    if groups and len(groups) == 2:
+        sizes = sorted((len(groups[0]), len(groups[1])))
+        sizes_ok = sizes == sorted((target_a, n - target_a))
+
+    if not sizes_ok:
+        # --- repli EXPLICITE : le CVRP exact a reellement echoue ---
+        # Il est diagnostique et clairement distingue de la voie normale : sans
+        # cela, une reference batie sur une normalisation geographique se ferait
+        # passer pour une reference a cardinalite exacte.
+        ref["fallback_used"] = True
+        ref["error"] = err or ("solver returned sizes %s, expected %s"
+                               % (sizes if groups and len(groups) == 2 else None,
+                                  sorted((target_a, n - target_a))))
+        detail = {}
+        groups, err2 = _solve_cvrp_ortools(dur_matrix, 2, n, start_idx, end_idx,
+                                           time_limit_s=limit, detail=detail)
+        if not groups or len(groups) != 2:
+            ref["error"] = (ref["error"] + " | fallback: " + str(err2))[:300]
+            ref["solve_ms"] = int((time.time() - t0) * 1000)
+            return ref
+        ref["solver_status"] = detail.get("solver_status")
+        ref["solutions"] = detail.get("solutions", 0)
+        ref["time_limit_hit"] = bool(detail.get("time_limit_hit"))
+        ga, gb = _normalize_sizes(groups[0], groups[1], indices, target_a,
+                                  xy if xy is not None else _local_xy(points, indices))
+        ref["selection_reason"] = "ors_reference_normalized_fallback"
+    else:
+        ga, gb = sorted(groups[0]), sorted(groups[1])
+        if len(ga) != target_a:
+            ga, gb = gb, ga
+        ref["selection_reason"] = "ors_reference_exact_cardinality"
+        ref["cardinality_exact"] = True
+
+    # --- ordres CONSERVES : la recherche guidee n'est plus payee pour rien ---
+    # Les routes du solveur sont reprises telles quelles quand elles decrivent
+    # encore les memes groupes, puis affinees par le MEME Or-opt/2-opt matriciel
+    # que les finalistes : comparer une reference brute a des candidates
+    # affinees surestimerait mecaniquement la penalite de connexite.
+    routes = detail.get("routes") or []
+    route_a = route_b = None
+    for route in routes:
+        body = [i for i in route if i != start_idx and i != end_idx]
+        if sorted(body) == sorted(ga):
+            route_a = list(route)
+        elif sorted(body) == sorted(gb):
+            route_b = list(route)
+    if route_a is None:
+        route_a = _nn_route_matrix(dur_matrix, sorted(ga), start_idx, end_idx)
+    if route_b is None:
+        route_b = _nn_route_matrix(dur_matrix, sorted(gb), start_idx, end_idx)
+
+    raw_dur, raw_dist = _rescore(dur_matrix, dist_matrix, route_a, route_b)
+    route_a = _refine_route_matrix(dur_matrix, route_a)
+    route_b = _refine_route_matrix(dur_matrix, route_b)
+    dur, dist = _rescore(dur_matrix, dist_matrix, route_a, route_b)
+
+    ia = is_connected_partition(ga, adjacency)
+    ib = is_connected_partition(gb, adjacency)
+    ref.update({
+        "available": True,
+        "group_a": sorted(ga), "group_b": sorted(gb),
+        "route_a": list(route_a), "route_b": list(route_b),
+        "routes": [list(route_a), list(route_b)],
+        "duration_s": dur, "distance_m": dist,
+        "duration_raw_s": raw_dur, "distance_raw_m": raw_dist,
+        "partition_key": canonical_partition_key(ga, gb),
+        "sizes": [len(ga), len(gb)],
+        "components_t1": ia["component_count"],
+        "components_t2": ib["component_count"],
+        "solve_ms": int((time.time() - t0) * 1000),
+    })
+    return ref
+
+
+def _reference_seeds(reference):
+    """Graines de partition issues de la reference ORS. Une seule source :
+    la resolution Haversine a ete retiree de la generation connectee, elle
+    dupliquait la strategie autonome ortools_haversine au prix de plusieurs
+    secondes prises sur les etapes garanties."""
+    if reference and reference.get("available"):
+        return [("ors_reference", list(reference["group_a"]),
+                 list(reference["group_b"]))]
+    return []
+
+
 def _farthest_pair(xy, indices):
     """Les deux points les plus eloignes, egalites departagees par les index."""
     seed_a, seed_b, best = indices[0], indices[min(1, len(indices) - 1)], -1.0
@@ -2304,31 +2588,8 @@ def _kmedoids_candidates(points, indices, target_a, adjacency, dur_matrix,
     return out
 
 
-def _unconstrained_partitions(indices, dur_matrix, hav_matrix, start_idx,
-                              end_idx):
-    """Les deux partitions NON CONTRAINTES du solveur : sur les durees ORS et
-    sur le vol d'oiseau.
-
-    Calculees UNE SEULE FOIS et partagees par la source historique et par les
-    reparations multiples. Chaque appel a _solve_cvrp_ortools coute plusieurs
-    secondes du budget de generation ; les dupliquer priverait les sources
-    suivantes de leur temps.
-    Retourne [(label, ga, gb), ...], eventuellement vide.
-    """
-    out = []
-    if not ORTOOLS_AVAILABLE:
-        return out
-    g, _err = _solve_cvrp_ortools(dur_matrix, 2, len(indices), start_idx, end_idx)
-    if g and len(g) == 2:
-        out.append(("ors_unconstrained", list(g[0]), list(g[1])))
-    gh, _err = _solve_cvrp_ortools(hav_matrix, 2, len(indices), start_idx, end_idx)
-    if gh and len(gh) == 2:
-        out.append(("haversine", list(gh[0]), list(gh[1])))
-    return out
-
-
 def legacy_connected_candidates(points, indices, target_a, adjacency, dur_matrix,
-                                start_idx, end_idx, unconstrained=None):
+                                start_idx, end_idx, seeds=None, clock=None):
     """SOURCE 0 -- reproduction EXACTE du generateur d'avant diversification.
 
     Cette source n'est pas une redite : le generateur d'origine terminait
@@ -2343,11 +2604,16 @@ def legacy_connected_candidates(points, indices, target_a, adjacency, dur_matrix
     Ses candidates sont etiquetees "legacy:<seed>" et beneficient d'une place
     reservee parmi les finalistes : la diversification ajoute des solutions,
     elle n'en retire jamais.
+
+    `seeds` remplace l'ancien argument `unconstrained` : la graine ORS est
+    desormais la reference a CARDINALITE EXACTE, ce qui rend _normalize_sizes
+    inoperante sur elle -- c'est voulu. `clock` borne la production sans jamais
+    annuler ce qui a deja ete produit.
     Retourne [(source, ga, gb), ...].
     """
     out = []
     xy = _local_xy(points, indices)
-    raw = list(unconstrained or [])
+    raw = list(seeds or [])
 
     # Balayage lineaire : les huit premieres coupes strictement separables,
     # dans l'ordre historique (cle canonique croissante).
@@ -2360,6 +2626,11 @@ def legacy_connected_candidates(points, indices, target_a, adjacency, dur_matrix
         raw.append(("two_means", ka, kb))
 
     for seed, ga, gb in raw:
+        if clock is not None and clock.expired() and out:
+            # Budget epuise : on garde ce qui est deja produit. Rendre une
+            # liste vide ferait perdre l'incumbent historique, exactement le
+            # defaut que cette source repare.
+            break
         ga, gb = _normalize_sizes(ga, gb, indices, target_a, xy)
         ga, gb, ok, _moves = repair_to_connected(
             ga, gb, adjacency, points, dur_matrix, start_idx, end_idx, target_a)
@@ -2393,8 +2664,9 @@ def _local_search_candidates(seeds, adjacency, dur_matrix, start_idx, end_idx,
 
 def _ors_repair_candidates(points, indices, target_a, adjacency, dur_matrix,
                            hav_matrix, start_idx, end_idx, budget,
-                           unconstrained=None):
-    """SOURCE 5 -- reparations multiples de la partition ORS non contrainte.
+                           seeds=None, clock=None):
+    """SOURCE ORS-FIRST -- reparations multiples de la partition ORS de
+    reference.
 
     La partition que le solveur trouve sans contrainte de connexite est la
     meilleure en duree ; elle est simplement morcelee. Elle n'a pas UNE
@@ -2402,27 +2674,33 @@ def _ors_repair_candidates(points, indices, target_a, adjacency, dur_matrix,
     deplacement en donnent une differente, toutes valides. Les produire toutes
     conserve la performance de la source tout en explorant plusieurs
     territoires.
-    """
-    out = []
-    labels = {"ors_unconstrained": "ors_repair", "haversine": "haversine_repair"}
-    seeds = [(labels.get(lbl, lbl), ga, gb)
-             for lbl, ga, gb in (unconstrained or [])]
-    if not seeds:
-        return out
 
+    GENERATEUR : chaque reparation est rendue des qu'elle est produite, pour
+    etre validee et dedupliquee immediatement. L'ancienne version construisait
+    la liste complete avant tout examen ; quand le budget expirait pendant la
+    construction, les douze reparations etaient calculees puis jetees sans
+    qu'une seule n'atteigne le banc d'essai.
+    """
+    raw_seeds = list(seeds or [])
+    if not raw_seeds:
+        return
+
+    produced = 0
     xy = _local_xy(points, indices)
-    for label, ga0, gb0 in seeds:
+    for label, ga0, gb0 in raw_seeds:
         for comp_rule in CONNECTED_COMPONENT_RULES:
             for move_rule in CONNECTED_MOVE_RULES:
+                if produced >= budget:
+                    return
+                if clock is not None and clock.expired():
+                    return
                 ga, gb = _normalize_sizes(ga0, gb0, indices, target_a, xy)
                 ga, gb, ok, _moves = repair_to_connected_ex(
                     ga, gb, adjacency, points, dur_matrix, start_idx, end_idx,
                     target_a, component_rule=comp_rule, move_rule=move_rule)
                 if ok:
-                    out.append((label, ga, gb))
-                if len(out) >= budget:
-                    return out
-    return out
+                    produced += 1
+                    yield ("ors_repair", ga, gb)
 
 
 def _boundary_nodes(ga, gb, adjacency):
@@ -2526,16 +2804,27 @@ def _border_chains(group, border, adjacency, length, max_chains=8):
 
 def generate_connected_candidates(points, indices, target_a, adjacency,
                                   dur_matrix, hav_matrix, start_idx, end_idx,
-                                  tree_edges=None, deadline=None):
-    """Partitions initiales diversifiees, puis reparees jusqu'a la connexite.
+                                  tree_edges=None, deadline=None,
+                                  reference=None, clock=None):
+    """Partitions connexes, produites et examinees ETAPE PAR ETAPE.
 
-    Six sources independantes -- balayage enrichi, coupures de l'arbre
-    couvrant, croissance de deux regions, 2-moyennes multi-germes, K-Medoids
-    ORS, reparations multiples de la partition ORS -- puis des perturbations
-    des meilleures. Chaque appartenance est dedupliquee AVANT la reparation
-    quand elle est deja connue, validee, reparee si besoin, puis dedupliquee a
-    nouveau. Aucune requete reseau : la matrice ORS recue est celle deja en
-    memoire.
+    Ordre impose, et c'est le coeur de cette version :
+      1. candidates du generateur HISTORIQUE, greffees sur la reference ORS ;
+      2. reparations ORS-FIRST de cette meme reference ;
+      3. sources RESIDUELLES -- coupures de l'arbre couvrant, croissance de
+         deux regions, 2-moyennes, K-Medoids, balayage enrichi -- puis optimum
+         local et perturbations, uniquement s'il reste du budget.
+
+    Chaque candidate est validee, reparee, dedupliquee et scoree DES QU'ELLE
+    EST PRODUITE. L'ancienne version construisait d'abord une grande liste
+    entrelacee puis l'examinait : quand le budget expirait pendant la
+    construction, les candidates etaient calculees puis jetees sans qu'aucune
+    n'atteigne le banc d'essai -- sur un run reel, seules les onze candidates
+    historiques ont survecu, les six autres sources ayant ete payees pour rien.
+
+    Les deux premieres etapes sont GARANTIES : une source residuelle ne peut
+    plus les faire sauter. Aucune requete reseau : la matrice ORS recue est
+    celle deja en memoire.
     Retourne (candidates, stats).
     """
     stats = {
@@ -2547,74 +2836,25 @@ def generate_connected_candidates(points, indices, target_a, adjacency,
         # si une source est muette parce qu'elle ne produit rien, parce que
         # tout est deja connu, ou parce que ses variantes sont morcelees.
         "per_source": {}, "legacy_keys": [], "expired_after": None,
+        "ors_repair_raw": 0, "ors_repair_unique": 0,
+        "stage_timings_ms": {}, "stage_budget_exhausted": [],
     }
     xy = _local_xy(points, indices)
     tree_edges = tree_edges or []
-    if deadline is None:
-        deadline = time.time() + CONNECTED_MAX_GENERATION_S
+    if clock is None:
+        if deadline is None:
+            deadline = time.time() + CONNECTED_MAX_GENERATION_S
+        clock = _StageClock(deadline)
 
-    def expired(stage=None):
-        if time.time() >= deadline:
-            stats["timeout"] = True
-            if stats["expired_after"] is None:
-                stats["expired_after"] = stage
-            return True
-        return False
+    def note_expiry(stage):
+        stats["timeout"] = True
+        if stats["expired_after"] is None:
+            stats["expired_after"] = stage
 
     def bucket(source):
         return stats["per_source"].setdefault(
             source, {"raw": 0, "duplicates": 0, "invalid_size": 0,
                      "disconnected": 0, "repair_failed": 0, "unique": 0})
-
-    # Les deux resolutions non contraintes servent A LA FOIS a la source
-    # historique et aux reparations multiples : on les calcule une seule fois.
-    unconstrained = _unconstrained_partitions(indices, dur_matrix, hav_matrix,
-                                              start_idx, end_idx)
-
-    # --- collecte des appartenances brutes, source par source ---
-    raw_budget = CONNECTED_MAX_RAW_CANDIDATES
-
-    # SOURCE 0 : les candidates du generateur historique, hors entrelacement.
-    # Elles passent AVANT tout le reste et ne peuvent donc jamais etre evincees
-    # par le plafond de partitions uniques.
-    legacy = legacy_connected_candidates(points, indices, target_a, adjacency,
-                                         dur_matrix, start_idx, end_idx,
-                                         unconstrained=unconstrained)
-
-    batches = []
-    batches.append(_ors_repair_candidates(points, indices, target_a, adjacency,
-                                          dur_matrix, hav_matrix, start_idx,
-                                          end_idx, raw_budget,
-                                          unconstrained=unconstrained))
-    if not expired("mst"):
-        batches.append(_mst_cut_candidates(points, indices, target_a, tree_edges,
-                                           raw_budget))
-    if not expired("region_growing"):
-        batches.append(_region_growing_candidates(points, indices, target_a,
-                                                  adjacency, dur_matrix,
-                                                  tree_edges, raw_budget))
-    if not expired("two_means"):
-        batches.append(_two_means_candidates(points, indices, target_a, adjacency,
-                                             dur_matrix, tree_edges, raw_budget))
-    if not expired("kmedoids"):
-        batches.append(_kmedoids_candidates(points, indices, target_a, adjacency,
-                                            dur_matrix, tree_edges, raw_budget))
-    if not expired("sweep"):
-        batches.append(_sweep_membership_candidates(points, indices, target_a,
-                                                    raw_budget))
-
-    # Entrelacement round-robin. Concatener les sources laisserait la premiere
-    # -- le balayage, qui produit a lui seul des milliers de coupes -- remplir
-    # le quota de partitions uniques avant que les autres aient ete essayees :
-    # on aurait beaucoup de candidates et une seule geometrie.
-    raw = []
-    for rank in range(max((len(b) for b in batches), default=0)):
-        for batch in batches:
-            if rank < len(batch):
-                raw.append(batch[rank])
-        if len(raw) >= raw_budget:
-            break
-    raw = raw[:raw_budget]
 
     seen = {}
     seen_raw = set()
@@ -2642,7 +2882,7 @@ def generate_connected_candidates(points, indices, target_a, adjacency,
         if not ok and allow_repair:
             if reason in ("invalid_size", "disconnected", "lost_points",
                           "duplicate"):
-                if repairs_used >= CONNECTED_MAX_REPAIRS or expired("repair"):
+                if repairs_used >= CONNECTED_MAX_REPAIRS:
                     stats["repair_failed"] += 1
                     b["repair_failed"] += 1
                     return False
@@ -2681,59 +2921,138 @@ def generate_connected_candidates(points, indices, target_a, adjacency,
                + _estimate_group_cost(dur_matrix, gb, start_idx, end_idx, False)[0])
         seen[key] = {"group_a": ga, "group_b": gb, "seed": source,
                      "est_duration_s": est, "partition_key": key,
-                     "legacy": source.startswith("legacy:")}
+                     "legacy": source.startswith("legacy:"),
+                     "ors_repair": source == "ors_repair"}
         stats["by_source"][source] = stats["by_source"].get(source, 0) + 1
         b["unique"] += 1
         stats["valid"] += 1
         return True
 
-    # Les candidates historiques d'abord, SANS aucun plafond ni garde-fou de
-    # temps : leur nombre est borne par construction (onze au plus) et elles
-    # portent l'incumbent qu'il ne faut jamais perdre.
+    seeds = _reference_seeds(reference)
+
+    # --- ETAPE 1 (GARANTIE) : le generateur historique ---
+    # Elle passe AVANT tout le reste et n'est jamais sautee : c'est elle qui
+    # porte l'incumbent dont la diversification avait fait perdre la trace.
+    clock.begin("legacy", CONNECTED_LEGACY_BUDGET_S)
+    try:
+        legacy = legacy_connected_candidates(points, indices, target_a,
+                                             adjacency, dur_matrix, start_idx,
+                                             end_idx, seeds=seeds, clock=clock)
+    finally:
+        clock.end()
     for source, ga, gb in legacy:
         if consider(source, ga, gb):
             stats["legacy_keys"].append(canonical_partition_key(ga, gb))
+    if "legacy" in clock.exhausted:
+        note_expiry("legacy")
 
-    for source, ga, gb in raw:
-        if len(seen) >= CONNECTED_MAX_UNIQUE_CANDIDATES or expired("consider"):
-            break
-        consider(source, ga, gb)
-
-    # --- optimum local des meilleures nouvelles candidates ---
-    # Meme montee de colline que la source historique : c'est elle qui
-    # transformait une coupe de balayage en incumbent.
-    if not expired("local_search") and len(seen) < CONNECTED_MAX_UNIQUE_CANDIDATES:
-        fresh = sorted((c for c in seen.values() if not c["legacy"]),
-                       key=lambda c: (c["est_duration_s"], c["partition_key"]))
-        for source, ga, gb in _local_search_candidates(
-                [(c["group_a"], c["group_b"]) for c in fresh], adjacency,
-                dur_matrix, start_idx, end_idx, CONNECTED_LOCAL_SEARCH_SEEDS):
-            if len(seen) >= CONNECTED_MAX_UNIQUE_CANDIDATES or expired("local_search"):
+    # --- ETAPE 2 (GARANTIE) : reparations ORS-first de la reference ---
+    # Budget RESERVE : aucune source optionnelle ne peut plus le consommer
+    # avant elle. C'est le correctif du defaut principal : ces douze
+    # reparations etaient calculees puis jetees sans jamais etre examinees.
+    clock.begin("ors_repair", CONNECTED_ORS_REPAIR_BUDGET_S)
+    try:
+        for source, ga, gb in _ors_repair_candidates(
+                points, indices, target_a, adjacency, dur_matrix, hav_matrix,
+                start_idx, end_idx, CONNECTED_MAX_RAW_CANDIDATES,
+                seeds=seeds, clock=clock):
+            stats["ors_repair_raw"] += 1
+            if consider(source, ga, gb):
+                stats["ors_repair_unique"] += 1
+            if len(seen) >= CONNECTED_MAX_UNIQUE_CANDIDATES:
                 break
-            consider(source, ga, gb, allow_repair=False)
+    finally:
+        clock.end()
+    if "ors_repair" in clock.exhausted:
+        note_expiry("ors_repair")
 
-    # --- perturbations des meilleures candidates ---
-    # Elles ne partent QUE de partitions deja valides : leurs voisines sont
-    # donc presque toutes valides elles aussi, ce qui evite de depenser le
-    # budget de reparation sur des variantes sans avenir.
-    if (CONNECTED_MAX_PERTURBATIONS > 0
-            and len(seen) < CONNECTED_TARGET_UNIQUE_CANDIDATES
-            and not expired("perturbation")):
-        best = sorted(seen.values(),
-                      key=lambda c: (c["est_duration_s"], c["partition_key"]))[:4]
-        variants = _perturbation_candidates(
-            [(c["group_a"], c["group_b"]) for c in best], indices, target_a,
-            adjacency, CONNECTED_MAX_PERTURBATIONS)
-        stats["perturbations"] = len(variants)
-        for source, ga, gb in variants:
-            if len(seen) >= CONNECTED_MAX_UNIQUE_CANDIDATES or expired("perturbation"):
+    # --- ETAPE 3 : sources RESIDUELLES, sur le temps restant seulement ---
+    # Chacune est appelee a son tour et ses candidates sont examinees tout de
+    # suite ; son nombre d'uniques est plafonne, sans quoi le balayage
+    # remplirait a lui seul le quota et il ne resterait qu'une geometrie.
+    clock.begin("residual", CONNECTED_RESIDUAL_SOURCES_BUDGET_S)
+    try:
+        residual = (
+            ("mst", lambda: _mst_cut_candidates(
+                points, indices, target_a, tree_edges,
+                CONNECTED_MAX_RAW_CANDIDATES)),
+            ("region_growing", lambda: _region_growing_candidates(
+                points, indices, target_a, adjacency, dur_matrix, tree_edges,
+                CONNECTED_MAX_RAW_CANDIDATES)),
+            ("two_means", lambda: _two_means_candidates(
+                points, indices, target_a, adjacency, dur_matrix, tree_edges,
+                CONNECTED_MAX_RAW_CANDIDATES)),
+            ("kmedoids", lambda: _kmedoids_candidates(
+                points, indices, target_a, adjacency, dur_matrix, tree_edges,
+                CONNECTED_MAX_RAW_CANDIDATES)),
+            ("sweep", lambda: _sweep_membership_candidates(
+                points, indices, target_a, CONNECTED_MAX_RAW_CANDIDATES)),
+        )
+        for name, build in residual:
+            if clock.expired():
+                note_expiry(name)
                 break
-            # Une voisine n'est retenue que si elle est valide TELLE QUELLE :
-            # la reparer effacerait justement la perturbation.
-            consider(source, ga, gb, allow_repair=False)
+            if len(seen) >= CONNECTED_MAX_UNIQUE_CANDIDATES:
+                break
+            kept = 0
+            for source, ga, gb in build():
+                if clock.expired():
+                    note_expiry(name)
+                    break
+                if (kept >= CONNECTED_RESIDUAL_PER_SOURCE
+                        or len(seen) >= CONNECTED_MAX_UNIQUE_CANDIDATES):
+                    break
+                if consider(source, ga, gb):
+                    kept += 1
+
+        # --- optimum local des meilleures nouvelles candidates ---
+        # Meme montee de colline que la source historique : c'est elle qui
+        # transformait une coupe de balayage en incumbent.
+        if not clock.expired() and len(seen) < CONNECTED_MAX_UNIQUE_CANDIDATES:
+            fresh = sorted((c for c in seen.values() if not c["legacy"]),
+                           key=lambda c: (c["est_duration_s"],
+                                          c["partition_key"]))
+            for source, ga, gb in _local_search_candidates(
+                    [(c["group_a"], c["group_b"]) for c in fresh], adjacency,
+                    dur_matrix, start_idx, end_idx,
+                    CONNECTED_LOCAL_SEARCH_SEEDS):
+                if clock.expired():
+                    note_expiry("local_search")
+                    break
+                if len(seen) >= CONNECTED_MAX_UNIQUE_CANDIDATES:
+                    break
+                consider(source, ga, gb, allow_repair=False)
+
+        # --- perturbations des meilleures candidates ---
+        # Elles ne partent QUE de partitions deja valides : leurs voisines sont
+        # donc presque toutes valides elles aussi, ce qui evite de depenser le
+        # budget de reparation sur des variantes sans avenir.
+        if (CONNECTED_MAX_PERTURBATIONS > 0
+                and len(seen) < CONNECTED_TARGET_UNIQUE_CANDIDATES
+                and not clock.expired()):
+            best = sorted(seen.values(),
+                          key=lambda c: (c["est_duration_s"],
+                                         c["partition_key"]))[:4]
+            variants = _perturbation_candidates(
+                [(c["group_a"], c["group_b"]) for c in best], indices, target_a,
+                adjacency, CONNECTED_MAX_PERTURBATIONS)
+            stats["perturbations"] = len(variants)
+            for source, ga, gb in variants:
+                if clock.expired():
+                    note_expiry("perturbation")
+                    break
+                if len(seen) >= CONNECTED_MAX_UNIQUE_CANDIDATES:
+                    break
+                # Une voisine n'est retenue que si elle est valide TELLE
+                # QUELLE : la reparer effacerait justement la perturbation.
+                consider(source, ga, gb, allow_repair=False)
+    finally:
+        clock.end()
 
     stats["unique"] = len(seen)
     stats["sources"] = dict(stats["by_source"])
+    stats["stage_timings_ms"] = dict(clock.timings_ms)
+    stats["stage_budget_exhausted"] = list(clock.exhausted)
     candidates = sorted(seen.values(),
                         key=lambda c: (c["est_duration_s"], c["partition_key"]))
     return candidates, stats
@@ -2782,8 +3101,10 @@ def _fallback_connected_candidates(points, indices, target_a, adjacency,
 
 def select_diverse_finalists(scored, limit,
                              diverse_share=CONNECTED_DIVERSE_SHARE,
-                             protected_keys=()):
-    """Choisit les finalistes en melangeant score et diversite d'appartenance.
+                             protected_keys=(),
+                             preferred_keys=()):
+    """Choisit les finalistes en melangeant score, sources reservees et
+    diversite d'appartenance.
 
     Prendre les `limit` meilleurs scores donne souvent douze variantes du meme
     decoupage a un point pres : le solveur les resequence toutes pour
@@ -2791,13 +3112,24 @@ def select_diverse_finalists(scored, limit,
     classee treizieme -- n'est jamais essayee. On reserve donc une partie des
     places a la distance d'appartenance et aux sources encore absentes.
 
-    Deux garanties, dans cet ordre :
-      - les partitions PROTEGEES entrent d'office. C'est la place reservee a
-        la meilleure candidate du generateur historique : un proxy defavorable
-        ne doit pas suffire a l'ecarter du banc d'essai OR-Tools, sinon la
-        diversification peut degrader le resultat au lieu de l'enrichir ;
-      - la MEILLEURE candidate au score est prise ensuite, sans condition.
-    La diversite ne remplit que les places restantes.
+    Ordre impose, et chaque etape est une garantie :
+      1. la MEILLEURE candidate au score entre en premier, sans condition. Le
+         faire en tete corrige un defaut reel de la version precedente : les
+         places reservees etaient servies d'abord et remplissaient a elles
+         seules le quota de score, dont la boucle sortait alors immediatement.
+         La meilleure candidate non protegee pouvait ainsi ne jamais atteindre
+         OR-Tools, alors que douze places etaient disponibles ;
+      2. les partitions PROTEGEES -- les candidates du generateur historique.
+         Un proxy defavorable ne doit pas suffire a les ecarter du banc
+         d'essai, sinon la diversification degrade au lieu d'enrichir ;
+      3. les partitions PREFEREES -- les reparations de la reference ORS. Meme
+         raison : une source qui n'atteint jamais OR-Tools ne peut jamais etre
+         evaluee ;
+      4. les meilleures candidates restantes au score, sur une part des places
+         encore libres ;
+      5. la diversite d'appartenance pour le reste.
+    Aucune partition n'est retenue deux fois : douze sequencements de la meme
+    appartenance ne sont qu'un seul essai.
     Retourne (finalistes, min_difference).
     """
     ordered = sorted(scored, key=_selection_key)
@@ -2806,17 +3138,38 @@ def select_diverse_finalists(scored, limit,
     if len(ordered) <= limit:
         return ordered, _min_pairwise_difference(ordered)
 
-    protected = set(protected_keys or ())
-    chosen = [c for c in ordered if c["partition_key"] in protected][:limit]
-    chosen_keys = [c["partition_key"] for c in chosen]
+    chosen = []
+    chosen_keys = []
 
-    quota = max(1, limit - int(limit * diverse_share))
-    for cand in ordered:                        # les meilleurs scores ensuite
+    def take(cand):
+        if len(chosen) >= limit or cand["partition_key"] in chosen_keys:
+            return False
+        chosen.append(cand)
+        chosen_keys.append(cand["partition_key"])
+        return True
+
+    take(ordered[0])                            # 1. meilleure au score
+
+    protected = set(protected_keys or ())
+    for cand in ordered:                        # 2. places reservees
+        if cand["partition_key"] in protected:
+            take(cand)
+
+    preferred = set(preferred_keys or ())
+    for cand in ordered:                        # 3. reparations ORS
+        if cand["partition_key"] in preferred:
+            take(cand)
+
+    # Les places reservees ne consomment PAS le quota de score : le partage
+    # score/diversite porte sur les places encore libres, jamais sur les
+    # douze. Sans cela, six places reservees suffisaient a supprimer toute
+    # selection au score.
+    free = limit - len(chosen)
+    quota = len(chosen) + max(1, free - int(free * diverse_share)) if free else limit
+    for cand in ordered:                        # 4. meilleurs scores ensuite
         if len(chosen) >= quota:
             break
-        if cand["partition_key"] not in chosen_keys:
-            chosen.append(cand)
-            chosen_keys.append(cand["partition_key"])
+        take(cand)
     used_sources = {_source_family(c.get("seed")) for c in chosen}
     rank_of = {c["partition_key"]: r for r, c in enumerate(ordered)}
 
@@ -3063,6 +3416,37 @@ def ortools_partition_ors_matrix_connected(points, num_vehicles, max_per_vehicle
         "connected_per_source": {},
         "connected_generation_expired_after": None,
         "connected_matrix_hash": None,
+        # --- reference ORS a cardinalite exacte, sans contrainte de connexite ---
+        "connected_ors_reference_available": False,
+        "connected_ors_reference_duration_s": None,
+        "connected_ors_reference_distance_m": None,
+        "connected_ors_reference_sizes": None,
+        "connected_ors_reference_components_t1": None,
+        "connected_ors_reference_components_t2": None,
+        "connected_ors_reference_time_limit_hit": False,
+        "connected_ors_reference_fallback_used": False,
+        "connected_ors_reference_solver_status": None,
+        "connected_ors_reference_solve_ms": 0,
+        "connected_ors_reference_error": "",
+        "connectivity_penalty_duration_s": None,
+        "connectivity_penalty_distance_m": None,
+        "connectivity_penalty_reliable": False,
+        "connectivity_penalty_note": "",
+        # --- budgets par etape ---
+        "connected_stage_timings_ms": {},
+        "connected_stage_budget_exhausted": [],
+        # --- source ORS-first ---
+        "connected_ors_repair_candidates_raw": 0,
+        "connected_ors_repair_candidates_unique": 0,
+        "connected_ors_repair_reached_ortools": 0,
+        "connected_ors_repair_best_proxy_rank": None,
+        "connected_ors_repair_is_winner": False,
+        # --- proxy de preselection : brut, affine, puis verdict OR-Tools ---
+        "connected_prescore_refined": 0,
+        "connected_prescore_budget_exhausted": False,
+        "connected_winner_proxy_rank_rough": None,
+        "connected_winner_proxy_rank_refined": None,
+        "connected_winner_ortools_rank": None,
     }
     meta = {"connected": diag}
 
@@ -3111,12 +3495,54 @@ def ortools_partition_ors_matrix_connected(points, num_vehicles, max_per_vehicle
 
     hav_matrix = _build_haversine_matrix(points)
 
+    # --- ETAPE 0 : reference ORS a CARDINALITE EXACTE ---
+    # Elle a son propre plafond de temps, distinct du budget de generation :
+    # sans cela, une seule resolution pouvait legalement consommer les vingt-
+    # cinq secondes de generation et laisser toutes les sources a sec.
+    clock = _StageClock(time.time() + CONNECTED_ORS_CVRP_TIME_LIMIT_S
+                        + CONNECTED_MAX_GENERATION_S)
+    clock.begin("ors_cvrp", CONNECTED_ORS_CVRP_TIME_LIMIT_S)
+    reference = build_ors_reference(points, indices, target_a, dur_matrix,
+                                    dist_matrix, adjacency, start_idx, end_idx,
+                                    time_limit_s=CONNECTED_ORS_CVRP_TIME_LIMIT_S,
+                                    xy=_local_xy(points, indices))
+    clock.end()
+    diag.update({
+        "connected_ors_reference_available": bool(reference["available"]),
+        "connected_ors_reference_duration_s": (
+            round(reference["duration_s"], 1)
+            if reference["duration_s"] is not None else None),
+        "connected_ors_reference_distance_m": (
+            round(reference["distance_m"], 1)
+            if reference["distance_m"] is not None else None),
+        "connected_ors_reference_sizes": reference["sizes"],
+        "connected_ors_reference_components_t1": reference["components_t1"],
+        "connected_ors_reference_components_t2": reference["components_t2"],
+        "connected_ors_reference_time_limit_hit": bool(reference["time_limit_hit"]),
+        "connected_ors_reference_fallback_used": bool(reference["fallback_used"]),
+        "connected_ors_reference_solver_status": reference["solver_status"],
+        "connected_ors_reference_solve_ms": reference["solve_ms"],
+        "connected_ors_reference_error": reference["error"],
+    })
+    if reference["available"]:
+        print("  Reference ORS %s: %s, %.1fs / %.0fm, composantes %s/%s, "
+              "statut=%s, limite=%s, repli=%s (%dms)"
+              % ("30/30" if reference["cardinality_exact"] else "repli",
+                 reference["sizes"], reference["duration_s"],
+                 reference["distance_m"], reference["components_t1"],
+                 reference["components_t2"], reference["solver_status"],
+                 "OUI" if reference["time_limit_hit"] else "non",
+                 "OUI" if reference["fallback_used"] else "non",
+                 reference["solve_ms"]), flush=True)
+    else:
+        print(f"  Reference ORS indisponible: {reference['error']}", flush=True)
+
     t_gen = time.time()
     try:
         cands, cstats = generate_connected_candidates(
             points, indices, target_a, adjacency, dur_matrix, hav_matrix,
             start_idx, end_idx, tree_edges=gmeta.get("tree_edges"),
-            deadline=time.time() + CONNECTED_MAX_GENERATION_S)
+            reference=reference, clock=clock)
     except Exception as exc:
         # La diversification est un ENRICHISSEMENT : si elle echoue, la
         # strategie doit continuer avec ce que la source de base sait faire,
@@ -3145,8 +3571,12 @@ def ortools_partition_ors_matrix_connected(points, num_vehicles, max_per_vehicle
         + by_source.get("region_growing_repaired", 0))
     diag["connected_candidates_two_means"] = by_source.get("two_means", 0)
     diag["connected_candidates_kmedoids"] = by_source.get("kmedoids", 0)
-    diag["connected_candidates_ors_repair"] = (by_source.get("ors_repair", 0)
-                                               + by_source.get("haversine_repair", 0))
+    diag["connected_candidates_ors_repair"] = by_source.get("ors_repair", 0)
+    diag["connected_ors_repair_candidates_raw"] = cstats.get("ors_repair_raw", 0)
+    diag["connected_ors_repair_candidates_unique"] = cstats.get("ors_repair_unique", 0)
+    diag["connected_stage_timings_ms"] = dict(cstats.get("stage_timings_ms") or {})
+    diag["connected_stage_timings_ms"].update(clock.timings_ms)
+    diag["connected_stage_budget_exhausted"] = list(clock.exhausted)
     diag["connected_candidates_perturbation"] = by_source.get("perturbation", 0)
     diag["connected_candidates_local_search"] = by_source.get("local_search", 0)
     diag["connected_candidates_legacy"] = sum(
@@ -3214,13 +3644,47 @@ def ortools_partition_ors_matrix_connected(points, num_vehicles, max_per_vehicle
             "comp_a": ia, "comp_b": ib,
             "boundary": boundary_metrics(ga, gb, adjacency, points),
             "duration_s": dur, "distance_m": dist,
+            "route_a": ra, "route_b": rb,
             "legacy": bool(c.get("legacy")),
+            "ors_repair": bool(c.get("ors_repair")),
+            "refined": False,
         })
     diag["connected_candidates_scored"] = len(rough)
 
-    # Rang proxy de chaque candidate, pour le journal de traçabilite.
+    # Rang proxy BRUT : plus proche voisin seul. C'est le classement dont on
+    # sait qu'il se trompe -- sur un jeu reel, sa meilleure candidate rendait
+    # 11456 s apres OR-Tools quand sa neuvieme en rendait 11347.
+    rank_rough = {c["partition_key"]: r
+                  for r, c in enumerate(sorted(rough, key=_selection_key))}
+
+    # --- proxy AFFINE : Or-opt + 2-opt matriciels, sans aucun appel reseau ---
+    # Affiner toutes les candidates coute trop cher, n'en affiner aucune classe
+    # mal : on affine les meilleures au proxy brut, sous budget dedie. Les
+    # ordres affines sont conserves et resservent tels quels au niveau 1.
+    clock.begin("prescore", CONNECTED_PRESCORE_BUDGET_S)
+    for cand in sorted(rough, key=_selection_key)[:CONNECTED_PRESCORE_REFINE_MAX]:
+        if clock.expired():
+            diag["connected_prescore_budget_exhausted"] = True
+            break
+        ra = _estimate_group_cost(dur_matrix, cand["group_a"], start_idx,
+                                  end_idx, True)[1]
+        rb = _estimate_group_cost(dur_matrix, cand["group_b"], start_idx,
+                                  end_idx, True)[1]
+        dur, dist = _rescore(dur_matrix, dist_matrix, ra, rb)
+        cand.update({"route_a": ra, "route_b": rb, "duration_s": dur,
+                     "distance_m": dist, "refined": True})
+        diag["connected_prescore_refined"] += 1
+    clock.end()
+    diag["connected_stage_timings_ms"].update(clock.timings_ms)
+    diag["connected_stage_budget_exhausted"] = list(clock.exhausted)
+
+    # Rang proxy AFFINE : c'est LUI qui choisit les douze finalistes.
     proxy_rank = {c["partition_key"]: r
                   for r, c in enumerate(sorted(rough, key=_selection_key))}
+    print(f"  Proxy: {diag['connected_prescore_refined']} candidate(s) affinee(s) "
+          f"sur {len(rough)}, budget epuise="
+          f"{'oui' if diag['connected_prescore_budget_exhausted'] else 'non'}",
+          flush=True)
 
     # --- places reservees aux candidates historiques ---
     # Les candidates du generateur d'avant diversification entrent d'office
@@ -3240,9 +3704,22 @@ def ortools_partition_ors_matrix_connected(points, num_vehicles, max_per_vehicle
         diag["connected_legacy_seed"] = best_legacy["seed"]
         diag["connected_legacy_finalist_slots"] = len(protected_keys)
 
-    # --- finalistes : incumbent historique, puis score, puis diversite ---
+    # --- places reservees aux reparations ORS-first ---
+    # Meme raisonnement que pour les candidates historiques : une source qui
+    # n'atteint jamais OR-Tools ne peut jamais etre evaluee, et on ne saurait
+    # donc jamais si l'approche ORS-first vaut mieux que le reste.
+    repair_rough = sorted((c for c in rough if c["ors_repair"]),
+                          key=_selection_key)
+    preferred_keys = tuple(c["partition_key"]
+                           for c in repair_rough[:CONNECTED_ORS_REPAIR_FINALIST_SLOTS])
+    if repair_rough:
+        diag["connected_ors_repair_best_proxy_rank"] = proxy_rank[
+            repair_rough[0]["partition_key"]]
+
+    # --- finalistes : meilleure au score, historique, ORS-first, diversite ---
     finalist_bases, min_diff = select_diverse_finalists(
-        rough, CONNECTED_ORTOOLS_FINALISTS, protected_keys=protected_keys)
+        rough, CONNECTED_ORTOOLS_FINALISTS, protected_keys=protected_keys,
+        preferred_keys=preferred_keys)
     finalist_keys = {b["partition_key"] for b in finalist_bases}
     diag["connected_candidates_selected_diverse"] = len(finalist_bases)
     diag["connected_candidate_min_difference"] = min_diff
@@ -3250,8 +3727,24 @@ def ortools_partition_ors_matrix_connected(points, num_vehicles, max_per_vehicle
         protected_keys and protected_keys[0] in finalist_keys)
     diag["connected_legacy_finalists"] = sum(
         1 for k in protected_keys if k in finalist_keys)
+    diag["connected_ors_repair_reached_ortools"] = sum(
+        1 for b in finalist_bases if b["ors_repair"])
     print(f"  Finalistes: {len(finalist_bases)} sur {len(rough)} candidates, "
-          f"ecart d'appartenance minimal={min_diff} points", flush=True)
+          f"ecart d'appartenance minimal={min_diff} points, "
+          f"dont {diag['connected_legacy_finalists']} historique(s) et "
+          f"{diag['connected_ors_repair_reached_ortools']} reparation(s) ORS",
+          flush=True)
+    if repair_rough:
+        best_repair = repair_rough[0]
+        print("    [ORS-first] %d brutes, %d uniques, meilleure cle=%s "
+              "rang proxy=%d proxy=%.1fs/%.0fm finaliste=%s"
+              % (diag["connected_ors_repair_candidates_raw"],
+                 diag["connected_ors_repair_candidates_unique"],
+                 _short_key(best_repair["partition_key"]),
+                 proxy_rank[best_repair["partition_key"]],
+                 best_repair["duration_s"], best_repair["distance_m"],
+                 "oui" if best_repair["partition_key"] in finalist_keys else "NON"),
+              flush=True)
 
     # Journal compact des candidates HISTORIQUES : c'est la trace qui manquait
     # pour savoir ce qu'etait devenu sweep_2 d'un run a l'autre.
@@ -3264,12 +3757,16 @@ def ortools_partition_ors_matrix_connected(points, num_vehicles, max_per_vehicle
                  "oui" if c["partition_key"] in finalist_keys else "NON"),
               flush=True)
 
-    # Affinage Or-opt + 2-opt reserve aux finalistes : le faire sur toutes les
-    # candidates coute cher et ne change pas la preselection.
+    # Affinage Or-opt + 2-opt des finalistes. Les candidates deja affinees a la
+    # preselection reutilisent leurs ordres : les recalculer rendrait exactement
+    # le meme resultat pour le meme prix.
     scored = []
     for base in finalist_bases:
-        ra = _estimate_group_cost(dur_matrix, base["group_a"], start_idx, end_idx, True)[1]
-        rb = _estimate_group_cost(dur_matrix, base["group_b"], start_idx, end_idx, True)[1]
+        if base.get("refined") and base.get("route_a") and base.get("route_b"):
+            ra, rb = base["route_a"], base["route_b"]
+        else:
+            ra = _estimate_group_cost(dur_matrix, base["group_a"], start_idx, end_idx, True)[1]
+            rb = _estimate_group_cost(dur_matrix, base["group_b"], start_idx, end_idx, True)[1]
         sol = _make_connected_solution(base, ra, rb, dur_matrix, dist_matrix,
                                        "heuristic")
         scored.append(sol)
@@ -3277,6 +3774,7 @@ def ortools_partition_ors_matrix_connected(points, num_vehicles, max_per_vehicle
     scored.sort(key=_selection_key)
 
     # --- niveau 2 : OR-Tools sur les meilleures, sequencement seul ---
+    clock.begin("ortools_finalists", CONNECTED_MAX_GENERATION_S)
     ortools_sols = []
     if ORTOOLS_AVAILABLE:
         for cand in scored[:CONNECTED_TOP_ORTOOLS]:
@@ -3301,8 +3799,16 @@ def ortools_partition_ors_matrix_connected(points, num_vehicles, max_per_vehicle
             # de Benchmark doivent decrire OR-Tools seul.
             diag["ortools_total_duration_s"] = round(ortools_best["duration_s"], 1)
             diag["ortools_total_distance_m"] = round(ortools_best["distance_m"], 1)
+    clock.end()
+
+    # Rang OR-Tools de chaque partition : c'est le verdict auquel comparer les
+    # deux rangs proxy. Sans lui, rien ne permet de dire si l'affinage du proxy
+    # a rapproche le classement de la realite.
+    ortools_rank = {s["partition_key"]: r for r, s in
+                    enumerate(sorted(ortools_sols, key=_selection_key))}
 
     # --- niveau 3 : Vroom sur les 3 meilleures, 2 appels chacune ---
+    clock.begin("vroom_finalists", CONNECTED_MAX_GENERATION_S)
     # Les reponses sont MEMORISEES par partition : apres la selection, aucune
     # candidate deja evaluee n'est rappelee. C'est ce rappel final qui, avant
     # correction, remplacait silencieusement l'ordre OR-Tools par celui de
@@ -3337,6 +3843,9 @@ def ortools_partition_ors_matrix_connected(points, num_vehicles, max_per_vehicle
     if vroom_best is not None:
         diag["vroom_total_duration_s"] = round(vroom_best["duration_s"], 1)
         diag["vroom_total_distance_m"] = round(vroom_best["distance_m"], 1)
+    clock.end()
+    diag["connected_stage_timings_ms"].update(clock.timings_ms)
+    diag["connected_stage_budget_exhausted"] = list(clock.exhausted)
 
     # --- selection finale, sur l'ensemble complet des solutions ---
     incumbent = select_best_solution(solutions)
@@ -3346,6 +3855,13 @@ def ortools_partition_ors_matrix_connected(points, num_vehicles, max_per_vehicle
     diag["final_selection_reason"] = incumbent["selection_reason"]
     diag["connected_solutions_considered"] = len(solutions)
     diag["connected_legacy_is_winner"] = bool(incumbent.get("legacy"))
+    diag["connected_ors_repair_is_winner"] = bool(incumbent.get("ors_repair"))
+    diag["connected_winner_proxy_rank_rough"] = rank_rough.get(
+        incumbent["partition_key"])
+    diag["connected_winner_proxy_rank_refined"] = proxy_rank.get(
+        incumbent["partition_key"])
+    diag["connected_winner_ortools_rank"] = ortools_rank.get(
+        incumbent["partition_key"])
 
     # Meilleure solution issue de la partition historique, tous sequenceurs
     # confondus. La comparer au gagnant repond a la seule question qui compte :
@@ -3393,6 +3909,42 @@ def ortools_partition_ors_matrix_connected(points, num_vehicles, max_per_vehicle
         "connected_selected_distance_m": round(incumbent["distance_m"], 1),
     })
 
+    # --- penalite de connexite ---
+    # C'est le seul chiffre qui dise ce que la contrainte territoriale coute
+    # REELLEMENT sur ce jeu : l'ecart entre la meilleure solution connexe et la
+    # meilleure partition a cardinalite exacte sans contrainte de connexite.
+    # Il n'etait mesurable par aucun champ jusqu'ici, faute d'une reference a
+    # cardinalite exacte : la comparer a l'ancienne graine 42/18 normalisee au
+    # centroide haversine n'aurait rien voulu dire.
+    if reference["available"] and reference["duration_s"] is not None:
+        pen_dur = incumbent["duration_s"] - reference["duration_s"]
+        pen_dist = incumbent["distance_m"] - reference["distance_m"]
+        diag["connectivity_penalty_duration_s"] = round(pen_dur, 1)
+        diag["connectivity_penalty_distance_m"] = round(pen_dist, 1)
+        # La penalite n'est mathematiquement positive que si la reference est
+        # bien un plancher. Elle ne l'est plus des que le solveur a ete
+        # tronque par sa limite de temps, ou des que le repli l'a fabriquee par
+        # normalisation geographique. Le dire vaut mieux que laisser croire a
+        # une garantie qui n'existe pas.
+        reliable = not (reference["time_limit_hit"] or reference["fallback_used"])
+        diag["connectivity_penalty_reliable"] = reliable
+        if not reliable:
+            diag["connectivity_penalty_note"] = (
+                "reference not proven optimal: "
+                + ("time_limit_hit " if reference["time_limit_hit"] else "")
+                + ("fallback_used" if reference["fallback_used"] else "")).strip()
+        elif pen_dur < 0:
+            diag["connectivity_penalty_note"] = (
+                "negative penalty with an untruncated reference: the reference "
+                "search was stopped by solution_limit, not proven optimal")
+        print("  Penalite de connexite: %+.1fs / %+.0fm par rapport a la "
+              "reference ORS %s (%s)"
+              % (pen_dur, pen_dist, reference["sizes"],
+                 "fiable" if reliable else diag["connectivity_penalty_note"]),
+              flush=True)
+    else:
+        diag["connectivity_penalty_note"] = "no ORS reference available"
+
     # Les ORDRES gagnants remontent avec l'appartenance. Sans eux, l'appelant
     # devait reconstruire une sequence -- deux appels Vroom de plus -- et
     # l'ordre retourne n'etait alors plus celui annonce par selected_sequencer.
@@ -3410,6 +3962,10 @@ def ortools_partition_ors_matrix_connected(points, num_vehicles, max_per_vehicle
           f"{len(solutions)} solutions comparees, "
           f"{diag['connected_vroom_calls']} appels Vroom "
           f"({int((time.time() - t0) * 1000)}ms)", flush=True)
+    print("  Temps par etape: %s | budgets epuises: %s"
+          % (_stage_timings_text(diag["connected_stage_timings_ms"]),
+             ",".join(diag["connected_stage_budget_exhausted"]) or "aucun"),
+          flush=True)
 
     return [ga, gb], None, meta
 
@@ -4103,17 +4659,91 @@ def apply_or_opt_and_routing_2opt(points, routes_idx):
             # best_s serait alors un metrage, jamais a placer dans une duree.
             # Champ interne, transporte jusqu'a post_process_swaps, jamais expose
             # dans la reponse JSON publique.
+            # before_* : les MEMES mesures pour l'ordre ENTRANT, sur la MEME
+            # matrice. Elles ne changent rien pour les strategies qui les
+            # ignorent, et elles sont la seule facon de comparer l'ordre d'avant
+            # et celui d'apres sans payer un appel Matrix de plus.
             road_metrics.append({"km": road_km, "min": road_min,
-                                 "duration_s": best_s if dur_matrix else None})
+                                 "duration_s": best_s if dur_matrix else None,
+                                 "before_km": round(_matrix_route_cost(
+                                     dist_matrix, list(range(n))) / 1000, 2),
+                                 "before_duration_s": (before_s if dur_matrix
+                                                       else None)})
         else:
             print(f"  Matrice ORS T{v+1} indisponible, fallback haversine", flush=True)
             route = _or_opt(points, route)
             road_metrics.append({"km": _compute_route_distance(points, route),
-                                 "min": None, "duration_s": None})
+                                 "min": None, "duration_s": None,
+                                 "before_km": None,
+                                 "before_duration_s": None})
 
         improved_routes.append(route)
 
     return improved_routes, road_metrics
+
+
+def arbitrate_post_optimization(routes_before, routes_after, road_metrics,
+                                sequencer, boundary=None, partition_key=None,
+                                tie_seconds=CONNECTED_TIE_SECONDS):
+    """Soumet la post-optimisation Or-opt/2-opt a la MEME regle de selection
+    que le reste du pipeline connexe.
+
+    Elle intervenait jusqu'ici APRES select_best_solution() et remplacait ses
+    routes sans condition. Or elle n'optimise que la DUREE : un gain d'une
+    seconde paye par trois cents metres passait quand meme, alors que la regle
+    metier departage a la distance des que l'ecart de duree tient dans la
+    fenetre de trente secondes. La post-optimisation devient donc une candidate
+    de plus, jamais un ecrasement.
+
+    Les deux ordres sont mesures sur les MEMES matrices par-tournee : aucune
+    requete supplementaire, et aucune comparaison entre estimateurs differents.
+    L'appartenance est verifiee identique -- Or-opt et 2-opt reordonnent, ils
+    ne deplacent aucun point entre tournees.
+
+    Retourne (routes, metrics, kept, note).
+    """
+    after_metrics = list(road_metrics or [])
+    if not routes_before or not routes_after or not after_metrics:
+        return routes_after, after_metrics, True, "no_comparison_possible"
+    if len(routes_before) != len(routes_after) != len(after_metrics):
+        return routes_after, after_metrics, True, "shape_mismatch"
+    for a, b in zip(routes_before, routes_after):
+        if set(a) != set(b):
+            # Ne devrait jamais arriver : ce serait un changement
+            # d'appartenance, que la partition verrouillee interdit.
+            return routes_before, after_metrics, False, "membership_changed"
+    if not all(m.get("duration_s") is not None
+               and m.get("before_duration_s") is not None
+               and m.get("km") is not None and m.get("before_km") is not None
+               for m in after_metrics):
+        return routes_after, after_metrics, True, "metrics_incomplete"
+
+    before_metrics = [{"km": m["before_km"], "min": (round(m["before_duration_s"] / 60, 1)
+                                                     if m["before_duration_s"] is not None
+                                                     else None),
+                       "duration_s": m["before_duration_s"],
+                       "before_km": m["before_km"],
+                       "before_duration_s": m["before_duration_s"]}
+                      for m in after_metrics]
+
+    def _sol(routes, metrics, tag):
+        return {
+            "route_a": list(routes[0]) if routes else [],
+            "route_b": list(routes[1]) if len(routes) > 1 else [],
+            "duration_s": sum(m["duration_s"] for m in metrics),
+            "distance_m": sum(m["km"] for m in metrics) * 1000.0,
+            "connected": True, "cardinality_ok": True,
+            "boundary": boundary or {},
+            "partition_key": partition_key,
+            "sequencer": tag,
+        }
+
+    before = _sol(routes_before, before_metrics, sequencer or "heuristic")
+    after = _sol(routes_after, after_metrics, "or2opt")
+    winner = select_best_solution([before, after], tie_seconds=tie_seconds)
+    if winner is after:
+        return routes_after, after_metrics, True, "or2opt_kept"
+    return routes_before, before_metrics, False, "or2opt_rejected"
 
 
 # =========================
@@ -4247,6 +4877,11 @@ def optimize():
     # Routes deja sequencees par la strategie de partition (connexe). Non nul
     # signifie : l'ordre est CHOISI, personne ne doit le refaire.
     presequenced_routes = None
+    # Verdict de l'arbitrage de la post-optimisation. "not_applicable" tant
+    # qu'aucune strategie pre-sequencee n'a tourne : les autres strategies
+    # conservent exactement leur comportement.
+    or2opt_kept = None
+    or2opt_note = "not_applicable"
 
     # optimization_path decrit UNIQUEMENT la strategie de partition et n'est
     # jamais suffixe. Les etapes communes reellement executees sont listees
@@ -4406,6 +5041,24 @@ def optimize():
             "order_survived_swaps": None,
             "pointsets_changed_by_swaps": None,
         }
+
+        # 4bis. La post-optimisation passe sous LE MEME CONTRAT que le reste :
+        # elle n'optimise que la duree, la regle metier departage a la distance
+        # dans la fenetre de trente secondes. Elle devient donc une candidate
+        # de plus, jamais un ecrasement. Restreint au mode connexe : c'est le
+        # seul ou la selection a deja tranche avant cette etape.
+        if presequenced_routes is not None:
+            conn_diag = (matrix_meta or {}).get("connected") or {}
+            routes_idx, road_metrics, or2opt_kept, or2opt_note = (
+                arbitrate_post_optimization(
+                    routes_before_or2opt, routes_idx, road_metrics,
+                    conn_diag.get("selected_sequencer"),
+                    boundary={"cut_edges": conn_diag.get("connected_cut_edges") or 0,
+                              "enclave_points": conn_diag.get("connected_enclave_points") or 0}))
+            if not or2opt_kept and "or2opt" in post_processing:
+                post_processing.remove("or2opt")
+            print(f"Post-optimisation Or-opt/2-opt: {or2opt_note} "
+                  f"(retenue={or2opt_kept})", flush=True)
 
     # 5. POST-PROCESSING : swap des points frontiere
     # Une partition verrouillee interdit les swaps meme si Vroom a echoue :
@@ -4611,6 +5264,43 @@ def optimize():
         "partition_sizes": [max(0, len(r) - 2) for r in routes_idx] if routes_idx else [],
         "points_signature": _points_signature(points),
         "d2_probe": d2_probe,
+
+        # --- recentrage ORS-first : reference, budgets, arbitrage ---
+        # Ajoutees STRICTEMENT A LA FIN : aucune colonne existante de Benchmark
+        # ne bouge et aucune n'est reordonnee.
+        "connected_ors_reference_available": _conn_get(matrix_meta, "connected_ors_reference_available", False),
+        "connected_ors_reference_duration_s": _conn_get(matrix_meta, "connected_ors_reference_duration_s", None),
+        "connected_ors_reference_distance_m": _conn_get(matrix_meta, "connected_ors_reference_distance_m", None),
+        "connected_ors_reference_sizes": _conn_get(matrix_meta, "connected_ors_reference_sizes", None),
+        "connected_ors_reference_components_t1": _conn_get(matrix_meta, "connected_ors_reference_components_t1", None),
+        "connected_ors_reference_components_t2": _conn_get(matrix_meta, "connected_ors_reference_components_t2", None),
+        "connected_ors_reference_time_limit_hit": _conn_get(matrix_meta, "connected_ors_reference_time_limit_hit", False),
+        "connected_ors_reference_fallback_used": _conn_get(matrix_meta, "connected_ors_reference_fallback_used", False),
+        "connected_ors_reference_solver_status": _conn_get(matrix_meta, "connected_ors_reference_solver_status", None),
+        "connected_ors_reference_solve_ms": _conn_get(matrix_meta, "connected_ors_reference_solve_ms", 0),
+        "connected_ors_reference_error": _conn_get(matrix_meta, "connected_ors_reference_error", ""),
+        "connectivity_penalty_duration_s": _conn_get(matrix_meta, "connectivity_penalty_duration_s", None),
+        "connectivity_penalty_distance_m": _conn_get(matrix_meta, "connectivity_penalty_distance_m", None),
+        "connectivity_penalty_reliable": _conn_get(matrix_meta, "connectivity_penalty_reliable", False),
+        "connectivity_penalty_note": _conn_get(matrix_meta, "connectivity_penalty_note", ""),
+        "connected_stage_timings_ms": _conn_get(matrix_meta, "connected_stage_timings_ms", {}),
+        # Meme information, aplatie : une feuille de calcul ne lit pas un objet.
+        "connected_stage_timings_text": _stage_timings_text(
+            _conn_get(matrix_meta, "connected_stage_timings_ms", {})),
+        "connected_stage_budget_exhausted": ";".join(
+            _conn_get(matrix_meta, "connected_stage_budget_exhausted", []) or []),
+        "connected_ors_repair_candidates_raw": _conn_get(matrix_meta, "connected_ors_repair_candidates_raw", 0),
+        "connected_ors_repair_candidates_unique": _conn_get(matrix_meta, "connected_ors_repair_candidates_unique", 0),
+        "connected_ors_repair_reached_ortools": _conn_get(matrix_meta, "connected_ors_repair_reached_ortools", 0),
+        "connected_ors_repair_best_proxy_rank": _conn_get(matrix_meta, "connected_ors_repair_best_proxy_rank", None),
+        "connected_ors_repair_is_winner": _conn_get(matrix_meta, "connected_ors_repair_is_winner", False),
+        "connected_prescore_refined": _conn_get(matrix_meta, "connected_prescore_refined", 0),
+        "connected_prescore_budget_exhausted": _conn_get(matrix_meta, "connected_prescore_budget_exhausted", False),
+        "connected_winner_proxy_rank_rough": _conn_get(matrix_meta, "connected_winner_proxy_rank_rough", None),
+        "connected_winner_proxy_rank_refined": _conn_get(matrix_meta, "connected_winner_proxy_rank_refined", None),
+        "connected_winner_ortools_rank": _conn_get(matrix_meta, "connected_winner_ortools_rank", None),
+        "post_optimization_kept": or2opt_kept,
+        "post_optimization_note": or2opt_note,
     }
 
     for v in range(num_vehicles):
