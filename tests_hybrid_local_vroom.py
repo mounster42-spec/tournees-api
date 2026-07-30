@@ -883,6 +883,31 @@ class TestBlocCFinalists(HybridTestCase):
             self.assertEqual(len(payload["vehicles"]), 2)
             self.assertEqual(len(payload["jobs"]), self.n_tasks)
 
+    def test_a_persistent_error_stops_the_finalist_loop(self):
+        """Une cause qui se reproduira n'est pas reessayee douze fois.
+
+        Binaire absent, budget epuise, temps ecoule : le finaliste suivant
+        echouerait a l'identique. Seule une solution invalide, propre a une
+        partition, laisse sa chance a la suivante."""
+        self.solver.mode = "fail"
+        _, _, meta = self.run_strategy()
+        # Direct, noyaux, puis un seul finaliste avant l'arret.
+        self.assertLessEqual(len(self.solver.calls), 3)
+        self.assertEqual(
+            meta["hybrid"]["joint_finalists_local_vroom_solved"], 0)
+
+    def test_nucleus_uses_a_route_first_seed_when_the_direct_solve_fails(self):
+        """Route-first passe avant les noyaux justement pour cela.
+
+        Sans graine, la variante a noyaux serait sautee des que la resolution
+        directe echoue, et le budget resterait inutilise."""
+        self.solver.mode = "fail"
+        _, _, meta = self.run_strategy()
+        diag = meta["hybrid"]
+        self.assertGreaterEqual(diag["route_first_unique"], 1)
+        self.assertEqual(diag["joint_nucleus_attempted"], 1)
+        self.assertNotEqual(diag["joint_nucleus_error"], "no seed solution")
+
     def test_finalist_partitions_are_respected_by_the_solver(self):
         groups, err, meta = self.run_strategy()
         self.assertIsNone(err)

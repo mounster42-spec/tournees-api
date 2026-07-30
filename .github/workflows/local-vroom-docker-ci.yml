@@ -236,6 +236,114 @@ jobs:
           echo "survivants: [$survivors]" | tee artifacts/vroom-survivors.txt
           test -z "$survivors"
 
+      - name: Strategie experimentale complete, quatre scenarios
+        run: |
+          set -euo pipefail
+          # Quatre reglages sur la MEME image et le MEME binaire :
+          #   default   : les budgets de production ;
+          #   max8      : le plafond releve par variable d'environnement ;
+          #   tight     : une limite globale courte, arret propre attendu ;
+          #   noblocks  : route-first et ALNS a budget nul, blocs B/C expires.
+          run_case() {
+            label="$1"; shift
+            echo "=== scenario $label ==="
+            docker exec "$@" tournees-ci python tools/synthetic_strategy_run.py \
+              --tasks 60 --label "$label" --output "/tmp/strategy-$label.json" \
+              2>&1 | tee "artifacts/strategy-$label.log"
+            docker cp "tournees-ci:/tmp/strategy-$label.json" \
+              "artifacts/strategy-$label.json"
+          }
+
+          run_case default
+          run_case max8 \
+            -e LOCAL_VROOM_MAX_SOLVES=8 \
+            -e LOCAL_VROOM_NUCLEUS_SOLVES=2 \
+            -e LOCAL_VROOM_FINALIST_SOLVES=5
+          run_case tight -e LOCAL_VROOM_TOTAL_SOFT_LIMIT_S=12
+          run_case noblocks \
+            -e LOCAL_VROOM_ROUTE_FIRST_BUDGET_S=0 \
+            -e LOCAL_VROOM_ALNS_BUDGET_S=0
+
+      - name: Verifier les quatre scenarios
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, sys
+
+          def load(label):
+              with open("artifacts/strategy-%s.json" % label) as handle:
+                  return json.load(handle)
+
+          cases = {label: load(label)
+                   for label in ("default", "max8", "tight", "noblocks")}
+          problems = []
+
+          for label, report in cases.items():
+              print("=== %s ===" % label)
+              print(json.dumps(report, indent=2, sort_keys=True))
+              if not report.get("ok"):
+                  problems += ["[%s] %s" % (label, p)
+                               for p in report.get("problems", ["echec"])]
+              # Invariants valables dans TOUS les scenarios.
+              if report.get("api_vroom_calls"):
+                  problems.append("[%s] appel VROOM public" % label)
+              if report.get("api_matrix_calls"):
+                  problems.append("[%s] appel Matrix reel" % label)
+              if (report.get("declared_matrix_calls") or 0) > 2:
+                  problems.append("[%s] plus de 2 appels Matrix" % label)
+              if report.get("sizes") != [30, 30]:
+                  problems.append("[%s] cardinalites %s au lieu de 30/30"
+                                  % (label, report.get("sizes")))
+              if report.get("children_after"):
+                  problems.append("[%s] processus enfants restants" % label)
+              if report.get("tmp_after"):
+                  problems.append("[%s] fichiers temporaires residuels" % label)
+
+          default = cases["default"]
+          if default.get("max_solves") != 4:
+              problems.append("le plafond par defaut n'est pas 4")
+          if (default.get("solves_attempted") or 0) > 4:
+              problems.append("cinquieme resolution avec les valeurs par defaut")
+          if (default.get("joint_finalists_local_vroom_solved") or 0) > 2:
+              problems.append("plus de deux finalistes resolus par defaut")
+          if not default.get("joint_direct_valid"):
+              problems.append("la resolution directe n'est pas valide")
+          if (default.get("joint_nucleus_attempted") or 0) < 1:
+              problems.append("aucune variante a noyaux tentee")
+          if (default.get("route_first_unique") or 0) < 1:
+              problems.append("route-first n'a produit aucune partition")
+          if (default.get("joint_alns_iterations") or 0) < 1:
+              problems.append("l'ALNS n'a fait aucune iteration")
+          if (default.get("joint_finalists") or 0) < 1:
+              problems.append("aucun finaliste construit")
+
+          max8 = cases["max8"]
+          if max8.get("max_solves") != 8:
+              problems.append("le plafond ne monte pas a 8 par environnement")
+          if (max8.get("solves_attempted") or 0) <= 4:
+              problems.append("le plafond releve ne change rien au nombre de solves")
+          if (max8.get("solves_attempted") or 0) > 8:
+              problems.append("neuvieme resolution avec un plafond de 8")
+
+          tight = cases["tight"]
+          if (tight.get("total_elapsed_ms") or 0) > 16000:
+              problems.append("la limite globale courte n'a pas ete respectee")
+
+          noblocks = cases["noblocks"]
+          if (noblocks.get("route_first_unique") or 0) != 0:
+              problems.append("route-first a tourne malgre un budget nul")
+          if (noblocks.get("joint_alns_iterations") or 0) != 0:
+              problems.append("l'ALNS a tourne malgre un budget nul")
+          if noblocks.get("error"):
+              problems.append("aucun resultat quand les blocs B et C expirent")
+
+          if problems:
+              for item in problems:
+                  print("ECHEC:", item)
+              sys.exit(1)
+          print("OK: quatre scenarios conformes")
+          PY
+
       - name: Journaux du conteneur
         if: always()
         run: docker logs tournees-ci > artifacts/container.log 2>&1 || true
@@ -320,6 +428,27 @@ jobs:
           cat artifacts/constrained-solve.log
           docker cp tournees-mem:/tmp/constrained.json artifacts/constrained.json || true
 
+      - name: Strategie complete sous contrainte
+        run: |
+          set -euo pipefail
+          start=$(date +%s%3N)
+          set +e
+          docker exec tournees-mem python tools/synthetic_strategy_run.py \
+            --tasks 60 --label constrained \
+            --output /tmp/strategy-constrained.json \
+            > artifacts/strategy-constrained.log 2>&1
+          strategy_exit=$?
+          set -e
+          end=$(date +%s%3N)
+          echo "strategy_exit=$strategy_exit" | tee -a artifacts/constrained-exit.txt
+          echo "strategy_outer_wall_s=$(awk "BEGIN{printf \"%.3f\", ($end - $start)/1000}")" \
+            | tee -a artifacts/constrained-exit.txt
+          cat artifacts/strategy-constrained.log
+          docker cp tournees-mem:/tmp/strategy-constrained.json \
+            artifacts/strategy-constrained.json || true
+          docker stats --no-stream --format '{{.Name}} {{.MemUsage}} {{.MemPerc}}' \
+            tournees-mem | tee artifacts/service-strategy-memory.txt
+
       - name: Etat du conteneur apres la resolution
         if: always()
         run: |
@@ -350,6 +479,7 @@ jobs:
                   return ""
 
           solve = read_json("artifacts/constrained.json", {}) or {}
+          strategy = read_json("artifacts/strategy-constrained.json", {}) or {}
           inspect = read_json("artifacts/docker-inspect-constrained.json", [{}]) or [{}]
           state = (inspect[0] or {}).get("State", {})
 
@@ -399,6 +529,25 @@ jobs:
               "vroom_version": solve.get("vroom_version"),
               "ledger": solve.get("ledger"),
               "exceeds_58s": bool(solve_wall is not None and solve_wall > 58.0),
+
+              # --- strategie complete sous la meme contrainte ---
+              "strategy_ok": bool(strategy.get("ok")),
+              "strategy_sizes": strategy.get("sizes"),
+              "strategy_components": strategy.get("components"),
+              "strategy_wall_s": strategy.get("wall_s"),
+              "strategy_total_elapsed_ms": strategy.get("total_elapsed_ms"),
+              "strategy_soft_limit_reached": strategy.get("soft_limit_reached"),
+              "strategy_solves": strategy.get("solves_attempted"),
+              "strategy_selected_source": strategy.get("selected_source"),
+              "strategy_selected_duration_s": strategy.get("selected_duration_s"),
+              "strategy_service_peak_rss_mb": (
+                  None if strategy.get("service_peak_rss_kb") is None
+                  else round(strategy["service_peak_rss_kb"] / 1024.0, 1)),
+              "strategy_stages": strategy.get("stages"),
+              "service_memory_during_strategy": read_text(
+                  "artifacts/service-strategy-memory.txt"),
+              "strategy_exceeds_58s": bool(
+                  (strategy.get("total_elapsed_ms") or 0) > 58000),
               "caveat": ("Mesure sur runner GitHub sous quota Docker. "
                          "Estimation de dimensionnement, pas une preuve Render."),
           }
@@ -427,10 +576,19 @@ jobs:
               problems.append("cardinalites %s au lieu de 30/30" % report["sizes"])
           if remaining:
               problems.append("processus vroom restants: %s" % remaining)
+          if not report["strategy_ok"]:
+              problems.append("la strategie complete a echoue sous contrainte: %s"
+                              % strategy.get("problems"))
+          if report["strategy_sizes"] not in (None, [30, 30]):
+              problems.append("strategie: cardinalites %s au lieu de 30/30"
+                              % report["strategy_sizes"])
+
           if report["exceeds_58s"]:
               # Signale bruyamment, mais ce n'est pas en soi un echec du job :
               # c'est l'information de dimensionnement que le job doit produire.
               print("ATTENTION: la resolution depasse 58 s sous 0,10 CPU")
+          if report["strategy_exceeds_58s"]:
+              print("ATTENTION: la strategie complete depasse 58 s sous 0,10 CPU")
 
           if problems:
               for item in problems:
@@ -537,6 +695,44 @@ jobs:
 
           echo "--- un seul port dans le Dockerfile ---"
           test "$(grep -c '^EXPOSE' Dockerfile)" -eq 1
+
+          echo "--- la strategie experimentale ne peut pas appeler le reseau ---"
+          python - <<'PY'
+          import inspect
+          import sys
+          import app
+
+          # Le code de recherche est lu a la source : route-first et l'ALNS ne
+          # doivent contenir AUCUNE reference a un point de sortie reseau. La
+          # seule fonction autorisee a en avoir une est l'entree de strategie,
+          # qui appelle le constructeur de matrice ORS.
+          offline = [
+              app.hybrid_route_first,
+              app.hybrid_territorial_alns,
+              app._hybrid_alns_neighbour,
+              app._hybrid_build_cycles,
+              app._hybrid_refine_order,
+              app._hybrid_partition_cost,
+              app.build_knn_graph_g5,
+              app.score_routes_on_matrix,
+          ]
+          forbidden = ("requests.", "_post_matrix", "_post_vroom",
+                       "ORS_VROOM_URL", "ORS_MATRIX_URL",
+                       "_build_full_matrix_chunked", "_fetch_ors_matrix",
+                       "urlopen", "socket")
+          failures = []
+          for function in offline:
+              source = inspect.getsource(function)
+              for needle in forbidden:
+                  if needle in source:
+                      failures.append("%s reference %s"
+                                      % (function.__name__, needle))
+          for item in failures:
+              print("ECHEC:", item)
+          if failures:
+              sys.exit(1)
+          print("OK: %d fonctions de recherche sans acces reseau" % len(offline))
+          PY
 
           exit $fail
 

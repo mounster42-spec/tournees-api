@@ -132,6 +132,18 @@ class FakeVroom:
         shutil.rmtree(self.dir, ignore_errors=True)
 
 
+_TEMP_DIRS = []
+
+
+def tearDownModule():
+    """Les repertoires temporaires des configs de test sont supprimes ici.
+
+    Chaque make_config() en cree un ; sans ce nettoyage, chaque execution de
+    la suite en abandonnait une trentaine dans le /tmp du systeme."""
+    while _TEMP_DIRS:
+        shutil.rmtree(_TEMP_DIRS.pop(), ignore_errors=True)
+
+
 def make_config(**overrides):
     """Config isolee : jamais celle du processus, pour ne pas fuiter d'un test
     a l'autre."""
@@ -143,6 +155,7 @@ def make_config(**overrides):
         os.environ.clear()
         os.environ.update(env_backup)
     config.tmpdir = tempfile.mkdtemp(prefix="lvtmp-")
+    _TEMP_DIRS.append(config.tmpdir)
     for key, value in overrides.items():
         setattr(config, key, value)
     return config

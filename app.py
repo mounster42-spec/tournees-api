@@ -5010,12 +5010,35 @@ def _hybrid_run(points, indices, start_idx, end_idx, capacity, headers,
     clock.end(stop_reason)
 
     # =====================================================================
-    # BLOC B -- NOYAUX PUIS ROUTE-FIRST
+    # BLOC B -- ROUTE-FIRST PUIS NOYAUX
     # =====================================================================
-    # La graine des noyaux est la meilleure solution deja obtenue. Sans
-    # solution du bloc A, la variante n'aurait aucune frontiere a redessiner :
-    # on saute alors les noyaux plutot que de depenser une resolution a
-    # l'aveugle.
+    # Route-first passe EN PREMIER bien qu'il vienne apres dans l'enonce : il
+    # ne depend d'aucun solveur, donc il garantit aux noyaux une graine meme
+    # quand la resolution directe a echoue. Dans le cas nominal l'ordre ne
+    # change rien -- la graine reste la meilleure solution connue.
+    # --- route-first : aucun appel reseau, budget dur ----------------------
+    clock.begin("route_first", min(config.route_first_budget_s,
+                                   clock.remaining_s()))
+    n_idx = len(indices)
+    rf_solutions, rf_stats = hybrid_route_first(
+        points, indices, dur_matrix, dist_matrix, adjacency, start_idx,
+        end_idx, n_idx // 2, clock, service_s)
+    solutions.extend(rf_solutions)
+    diag["route_first_cycles"] = rf_stats["cycles"]
+    diag["route_first_unique"] = rf_stats["unique"]
+    if rf_solutions:
+        diag["route_first_best_duration_s"] = round(
+            min(s["duration_s"] for s in rf_solutions), 1)
+    print("  Bloc B: route-first %d cycles, %d decoupes, %d connexes, "
+          "%d partitions uniques, %d affinees"
+          % (rf_stats["cycles"], rf_stats["cuts"], rf_stats["connected"],
+             rf_stats["unique"], len(rf_solutions)), flush=True)
+    clock.end("budget_exhausted" if clock.expired() else "done")
+
+    # La graine des noyaux est la meilleure solution deja obtenue : direct si
+    # elle existe, sinon la meilleure decoupe route-first. Sans aucune des
+    # deux, la variante n'aurait pas de frontiere a redessiner et on saute
+    # plutot que de depenser une resolution a l'aveugle.
     clock.begin("joint_nucleus", min(
         config.nucleus_solves * (config.per_solve_timeout_s + 2.0),
         clock.remaining_s()))
@@ -5059,25 +5082,6 @@ def _hybrid_run(points, indices, start_idx, end_idx, capacity, headers,
         if best_nucleus is not None:
             diag["joint_nucleus_best_duration_s"] = round(best_nucleus, 1)
     clock.end(stop_reason)
-
-    # --- route-first : aucun appel reseau, budget dur ----------------------
-    clock.begin("route_first", min(config.route_first_budget_s,
-                                   clock.remaining_s()))
-    n_idx = len(indices)
-    rf_solutions, rf_stats = hybrid_route_first(
-        points, indices, dur_matrix, dist_matrix, adjacency, start_idx,
-        end_idx, n_idx // 2, clock, service_s)
-    solutions.extend(rf_solutions)
-    diag["route_first_cycles"] = rf_stats["cycles"]
-    diag["route_first_unique"] = rf_stats["unique"]
-    if rf_solutions:
-        diag["route_first_best_duration_s"] = round(
-            min(s["duration_s"] for s in rf_solutions), 1)
-    print("  Bloc B: route-first %d cycles, %d decoupes, %d connexes, "
-          "%d partitions uniques, %d affinees"
-          % (rf_stats["cycles"], rf_stats["cuts"], rf_stats["connected"],
-             rf_stats["unique"], len(rf_solutions)), flush=True)
-    clock.end("budget_exhausted" if clock.expired() else "done")
 
     # =====================================================================
     # BLOC C -- ALNS TERRITORIALE PUIS FINALISTES VROOM
@@ -5170,8 +5174,12 @@ def _hybrid_run(points, indices, start_idx, end_idx, capacity, headers,
         except local_vroom.LocalVroomError as exc:
             stop_reason = exc.code
             print("  Bloc C: finaliste rejete (%s)" % exc.code, flush=True)
-            if exc.code in (local_vroom.ERR_BUDGET_EXHAUSTED,
-                            local_vroom.ERR_GLOBAL_TIME_LIMIT):
+            # Seule une solution invalide est propre a CETTE partition : le
+            # finaliste suivant peut encore reussir. Toute autre cause --
+            # binaire absent, budget epuise, temps ecoule -- se reproduira a
+            # l'identique, et douze tentatives ne feraient qu'allonger les
+            # journaux.
+            if exc.code != local_vroom.ERR_INVALID_SOLUTION:
                 break
     diag["joint_finalists_local_vroom_solved"] = solved
     print("  Bloc C: %d finaliste(s) resolus par VROOM, %d reutilises, "
