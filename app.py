@@ -2058,14 +2058,28 @@ def optimize():
     if err:
         return jsonify({"error": err}), 400
 
-    ortools_limit_override_applied = (strategy == "ortools_ors_matrix"
-                                      and ortools_solution_limit is not None)
-    if strategy == "kmeans":
-        ortools_limit_effective = None
-    elif ortools_limit_override_applied:
-        ortools_limit_effective = ortools_solution_limit
-    else:
+    # Depuis le lot territorial, la partition de ortools_ors_matrix ne passe
+    # PLUS par _solve_cvrp_ortools : aucune limite de solutions OR-Tools ne s'y
+    # applique, et la surcharge par requete n'atteint donc plus aucun solveur.
+    # Seule ortools_haversine utilise encore le solveur CVRP.
+    #   kmeans             -> None, aucun solveur OR-Tools
+    #   ortools_haversine  -> constante globale, la surcharge ne l'atteint pas
+    #   ortools_ors_matrix -> None, balayage geometrique
+    if strategy == "ortools_haversine":
+        partition_solver = "ortools_cvrp"
         ortools_limit_effective = ORTOOLS_SOLUTION_LIMIT
+    elif strategy == "ortools_ors_matrix":
+        partition_solver = "territorial_projection"
+        ortools_limit_effective = None
+    else:
+        # kmeans : le moteur exact, vroom_multi ou kmeans_fallback, est deja
+        # rapporte par partition_engine.
+        partition_solver = None
+        ortools_limit_effective = None
+
+    # Plus aucun solveur ne lit la surcharge : l'annoncer appliquee serait faux.
+    # La valeur demandee reste visible dans ortools_solution_limit_requested.
+    ortools_limit_override_applied = False
 
     # Resoudre les index depart / arrivee
     start_idx = 0
@@ -2289,6 +2303,7 @@ def optimize():
         "ortools_solution_limit": ortools_limit_effective,
         "ortools_solution_limit_requested": ortools_solution_limit,
         "ortools_solution_limit_override_applied": ortools_limit_override_applied,
+        "partition_solver": partition_solver,
 
         # --- lot D-3 : cout et pilotage des swaps ---
         "max_swap_candidates": swap_stats["max_swap_candidates"],
