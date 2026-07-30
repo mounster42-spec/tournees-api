@@ -362,11 +362,13 @@ class TestGlobalSelection(unittest.TestCase):
         pts = two_lines()
         _, _, meta, _ = run_partition(pts, ordered, shuffled)
         diag = meta["connected"]
-        # heuristiques + OR-Tools + Vroom, toutes dans le meme ensemble
-        self.assertGreaterEqual(diag["connected_solutions_considered"],
-                                diag["connected_candidates_scored"]
-                                + diag["connected_candidates_ortools"]
-                                + diag["connected_candidates_vroom"])
+        # heuristiques des finalistes + OR-Tools + Vroom : un seul ensemble
+        self.assertEqual(diag["connected_solutions_considered"],
+                         diag["connected_candidates_selected_diverse"]
+                         + diag["connected_candidates_ortools"]
+                         + diag["connected_candidates_vroom"])
+        self.assertGreater(diag["connected_candidates_ortools"], 0)
+        self.assertGreater(diag["connected_candidates_vroom"], 0)
 
 
 # ------------------------------------------------ Test E : echec de Vroom
