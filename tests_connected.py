@@ -338,7 +338,7 @@ class TestWiringAndInvariants(unittest.TestCase):
     def test_13_swaps_locked_for_connected(self):
         self.assertIn('swap_lock_reason = "connected_partition_locked"', self.src)
         self.assertIn("connected_partition_locked", app.SWAP_STOP_REASONS)
-        locked = self.src.index("if routes_idx and vroom_ok and membership_locked:")
+        locked = self.src.index("and membership_locked:")
         swaps = self.src.index("elif routes_idx and vroom_ok:")
         self.assertLess(locked, swaps)
         self.assertNotIn("post_process_swaps(", self.src[locked:swaps])

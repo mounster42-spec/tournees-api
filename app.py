@@ -1750,16 +1750,105 @@ def _rescore(dur_matrix, dist_matrix, route_a, route_b):
 
 
 def _selection_key(cand):
-    """Ordre lexicographique impose. L'equilibre entre tournees n'y figure pas.
-    La duree est arrondie au palier de tolerance pour que le kilometrage puisse
-    departager deux solutions pratiquement equivalentes en temps."""
+    """Ordre de PRESELECTION rapide. L'equilibre entre tournees n'y figure pas.
+
+    Cette cle CLASSE les candidates -- pour choisir les 12 envoyees a OR-Tools
+    puis les 3 envoyees a Vroom -- elle ne DESIGNE PAS le gagnant final. Le
+    gagnant sort de select_best_solution(), appliquee a l'ensemble complet des
+    solutions. L'ancienne version arrondissait la duree au palier de tolerance
+    (round(duree / 30)) : deux solutions distantes d'une seconde pouvaient
+    tomber dans deux paliers differents alors que trois solutions distantes de
+    60s pouvaient s'enchainer dans le meme, ce qui rendait la comparaison pair
+    a pair non transitive. La duree exacte supprime le probleme.
+    """
     return (0 if cand["connected"] else 1,
             0 if cand["cardinality_ok"] else 1,
             cand["components_total"],
-            round(cand["duration_s"] / CONNECTED_TIE_SECONDS),
+            cand["duration_s"],
             cand["distance_m"],
             cand["boundary"]["cut_edges"] + cand["boundary"]["enclave_points"],
             _partition_key(cand["group_a"], cand["group_b"]))
+
+
+# Rang de departage des sequenceurs. Il n'intervient QUE sur une egalite
+# parfaite -- meme duree ORS, meme distance ORS, meme qualite de frontiere,
+# meme partition -- c'est-a-dire quand les deux ordres sont interchangeables.
+# Aucun sequenceur n'est donc avantage dans la comparaison des metriques : ce
+# rang evite seulement qu'un ordre issu d'un solveur soit annonce sous
+# l'etiquette "heuristic" alors qu'un solveur l'a bel et bien produit.
+_SEQUENCER_RANK = {"ortools": 0, "vroom": 1, "heuristic": 2}
+
+
+def _solution_tiebreak(sol):
+    """Departage DANS la fenetre de tolerance : distance ORS exacte d'abord,
+    puis qualite geographique, puis criteres purement deterministes."""
+    boundary = sol.get("boundary") or {}
+    sequencer = sol.get("sequencer") or ""
+    return (
+        sol["distance_m"],
+        boundary.get("cut_edges", 0) + boundary.get("enclave_points", 0),
+        sol.get("partition_key") or (),
+        _SEQUENCER_RANK.get(sequencer, 9),
+        sequencer,
+        tuple(sol.get("route_a") or ()) + tuple(sol.get("route_b") or ()),
+    )
+
+
+def select_best_solution(solutions, tie_seconds=CONNECTED_TIE_SECONDS):
+    """Selection FINALE, sur l'ensemble complet des solutions.
+
+    Une comparaison pair a pair avec tolerance n'est pas transitive : A ~ B et
+    B ~ C n'impliquent pas A ~ C, et l'ordre d'examen changeait alors le
+    gagnant. Ici la fenetre est calculee UNE FOIS, a partir du minimum global :
+
+      1. ne retenir que les solutions valides (connexes, cardinalite exacte) ;
+      2. best = min(duration_s) ;
+      3. fenetre = {s : s.duration_s <= best + tie_seconds} ;
+      4. dans la fenetre, distance ORS totale minimale ;
+      5. egalite -> departage deterministe stable.
+
+    Les durees et distances comparees sont les SECONDES et METRES ORS exacts,
+    recalcules depuis les ordres reellement produits. Jamais des minutes
+    arrondies, jamais un cout interne OR-Tools, jamais une duree brute Vroom.
+    Retourne la solution gagnante, ou None si la liste est vide.
+    """
+    if not solutions:
+        return None
+    valid = [s for s in solutions
+             if s.get("connected") and s.get("cardinality_ok")]
+    pool = valid if valid else list(solutions)
+    best_duration = min(s["duration_s"] for s in pool)
+    window = [s for s in pool if s["duration_s"] <= best_duration + tie_seconds]
+    return min(window, key=_solution_tiebreak)
+
+
+# Une seule structure de solution circule du scoring jusqu'a la reponse : les
+# routes, les metriques et le sequenceur voyagent ensemble et ne peuvent donc
+# plus etre desynchronises par une variable ecrasee plus loin.
+_SELECTION_REASONS = {
+    "heuristic": "level1_heuristic",
+    "ortools": "level2_ortools",
+    "vroom": "level3_vroom",
+}
+
+
+def _make_connected_solution(base, route_a, route_b, dur_matrix, dist_matrix,
+                             sequencer):
+    """Fabrique une solution complete a partir d'une candidate et de DEUX
+    ordres. Les metriques sont systematiquement rescorees sur la MEME matrice
+    ORS : c'est la seule facon de comparer OR-Tools et Vroom sans biais."""
+    dur, dist = _rescore(dur_matrix, dist_matrix, route_a, route_b)
+    sol = dict(base)
+    sol.update({
+        "route_a": list(route_a),
+        "route_b": list(route_b),
+        "duration_s": dur,
+        "distance_m": dist,
+        "sequencer": sequencer,
+        "selection_reason": _SELECTION_REASONS.get(sequencer, sequencer),
+        "partition_key": _partition_key(base["group_a"], base["group_b"]),
+    })
+    return sol
 
 
 def ortools_partition_ors_matrix_connected(points, num_vehicles, max_per_vehicle,
@@ -1803,6 +1892,13 @@ def ortools_partition_ors_matrix_connected(points, num_vehicles, max_per_vehicle
         "vroom_total_distance_m": None,
         "connected_enum_ms": 0,
         "connected_score_ms": 0,
+        # --- selection symetrique OR-Tools / Vroom ---
+        "connected_solutions_considered": 0,
+        "connected_selection_window_s": CONNECTED_TIE_SECONDS,
+        "connected_selected_duration_s": None,
+        "connected_selected_distance_m": None,
+        "connected_vroom_cache_hits": 0,
+        "connected_vroom_error": "",
     }
     meta = {"connected": diag}
 
@@ -1861,19 +1957,19 @@ def ortools_partition_ors_matrix_connected(points, num_vehicles, max_per_vehicle
         return None, diag["connected_error"], meta
 
     # --- niveau 1 : heuristique locale sur la matrice ORS ---
+    # TOUTES les solutions produites -- heuristique, OR-Tools, Vroom -- vont
+    # dans une seule liste. Le gagnant en sort a la toute fin, par
+    # select_best_solution(). Aucun sequenceur n'ecrase l'autre en chemin.
     t_score = time.time()
+    solutions = []
     scored = []
     allset = set(indices)
     for c in cands:
         ga, gb = c["group_a"], c["group_b"]
         ia = is_connected_partition(ga, adjacency)
         ib = is_connected_partition(gb, adjacency)
-        ra = _estimate_group_cost(dur_matrix, ga, start_idx, end_idx, True)[1]
-        rb = _estimate_group_cost(dur_matrix, gb, start_idx, end_idx, True)[1]
-        dur, dist = _rescore(dur_matrix, dist_matrix, ra, rb)
-        scored.append({
+        base = {
             "group_a": ga, "group_b": gb, "seed": c["seed"],
-            "route_a": ra, "route_b": rb, "duration_s": dur, "distance_m": dist,
             "connected": ia["connected"] and ib["connected"],
             "cardinality_ok": (len(ga) == target_a and len(gb) == n - target_a
                                and set(ga) | set(gb) == allset
@@ -1881,16 +1977,18 @@ def ortools_partition_ors_matrix_connected(points, num_vehicles, max_per_vehicle
             "components_total": ia["component_count"] + ib["component_count"] - 2,
             "comp_a": ia, "comp_b": ib,
             "boundary": boundary_metrics(ga, gb, adjacency, points),
-            "sequencer": "heuristic",
-        })
+        }
+        ra = _estimate_group_cost(dur_matrix, ga, start_idx, end_idx, True)[1]
+        rb = _estimate_group_cost(dur_matrix, gb, start_idx, end_idx, True)[1]
+        sol = _make_connected_solution(base, ra, rb, dur_matrix, dist_matrix,
+                                       "heuristic")
+        scored.append(sol)
+        solutions.append(sol)
     diag["connected_candidates_scored"] = len(scored)
     scored.sort(key=_selection_key)
 
-    # Incumbent : jamais remplace par une solution moins bonne.
-    incumbent = scored[0]
-    diag["final_selection_reason"] = "level1_heuristic"
-
     # --- niveau 2 : OR-Tools sur les meilleures, sequencement seul ---
+    ortools_sols = []
     if ORTOOLS_AVAILABLE:
         for cand in scored[:CONNECTED_TOP_ORTOOLS]:
             ra = _tsp_order_ortools(dur_matrix, cand["group_a"], start_idx, end_idx)
@@ -1898,38 +1996,62 @@ def ortools_partition_ors_matrix_connected(points, num_vehicles, max_per_vehicle
             if ra is None or rb is None:
                 continue
             diag["connected_candidates_ortools"] += 1
-            dur, dist = _rescore(dur_matrix, dist_matrix, ra, rb)
-            variant = dict(cand)
-            variant.update({"route_a": ra, "route_b": rb, "duration_s": dur,
-                            "distance_m": dist, "sequencer": "ortools"})
-            if _selection_key(variant) < _selection_key(incumbent):
-                incumbent = variant
-                diag["final_selection_reason"] = "level2_ortools"
-        diag["ortools_total_duration_s"] = round(incumbent["duration_s"], 1)
-        diag["ortools_total_distance_m"] = round(incumbent["distance_m"], 1)
+            sol = _make_connected_solution(cand, ra, rb, dur_matrix, dist_matrix,
+                                           "ortools")
+            solutions.append(sol)
+            ortools_sols.append(sol)
+        # La MEME fonction de selection sert partout : ces deux colonnes
+        # decrivent OR-Tools seul, avec la regle appliquee au reste.
+        ortools_best = select_best_solution(ortools_sols)
+        if ortools_best is not None:
+            # Le MEILLEUR OR-Tools, pas l'incumbent courant : ces deux colonnes
+            # de Benchmark doivent decrire OR-Tools seul.
+            diag["ortools_total_duration_s"] = round(ortools_best["duration_s"], 1)
+            diag["ortools_total_distance_m"] = round(ortools_best["distance_m"], 1)
 
     # --- niveau 3 : Vroom sur les 3 meilleures, 2 appels chacune ---
-    finalists = sorted(scored, key=_selection_key)[:CONNECTED_TOP_VROOM]
+    # Les reponses sont MEMORISEES par partition : apres la selection, aucune
+    # candidate deja evaluee n'est rappelee. C'est ce rappel final qui, avant
+    # correction, remplacait silencieusement l'ordre OR-Tools par celui de
+    # Vroom tout en laissant selected_sequencer annoncer "ortools".
+    vroom_cache = {}
+    vroom_sols = []
+    finalists = scored[:CONNECTED_TOP_VROOM]
     for cand in finalists:
-        ra, da, _ = _resequence_single(points, cand["group_a"], start_idx, end_idx, headers)
-        rb, db, _ = _resequence_single(points, cand["group_b"], start_idx, end_idx, headers)
+        pkey = cand["partition_key"]
+        if pkey in vroom_cache:
+            diag["connected_vroom_cache_hits"] += 1
+            continue
+        ra, _da, _ = _resequence_single(points, cand["group_a"], start_idx, end_idx, headers)
+        rb, _db, _ = _resequence_single(points, cand["group_b"], start_idx, end_idx, headers)
         diag["connected_vroom_calls"] += 2
         if ra is None or rb is None:
-            # Rate limit ou erreur : on garde la solution OR-Tools, sans echouer.
+            # Rate limit, erreur reseau ou reponse invalide : la meilleure
+            # solution OR-Tools reste en lice, le run ne tombe pas.
+            vroom_cache[pkey] = None
             diag["connected_fallback_used"] = True
+            diag["connected_vroom_error"] = (diag["connected_vroom_error"]
+                                             or "vroom unavailable")
             diag["connected_error"] = diag["connected_error"] or "vroom unavailable, kept OR-Tools order"
             break
         diag["connected_candidates_vroom"] += 1
-        dur, dist = _rescore(dur_matrix, dist_matrix, ra, rb)
-        variant = dict(cand)
-        variant.update({"route_a": ra, "route_b": rb, "duration_s": dur,
-                        "distance_m": dist, "sequencer": "vroom"})
-        if diag["vroom_total_duration_s"] is None or dur < diag["vroom_total_duration_s"]:
-            diag["vroom_total_duration_s"] = round(dur, 1)
-            diag["vroom_total_distance_m"] = round(dist, 1)
-        if _selection_key(variant) < _selection_key(incumbent):
-            incumbent = variant
-            diag["final_selection_reason"] = "level3_vroom"
+        sol = _make_connected_solution(cand, ra, rb, dur_matrix, dist_matrix,
+                                       "vroom")
+        vroom_cache[pkey] = sol
+        solutions.append(sol)
+        vroom_sols.append(sol)
+    vroom_best = select_best_solution(vroom_sols)
+    if vroom_best is not None:
+        diag["vroom_total_duration_s"] = round(vroom_best["duration_s"], 1)
+        diag["vroom_total_distance_m"] = round(vroom_best["distance_m"], 1)
+
+    # --- selection finale, sur l'ensemble complet des solutions ---
+    incumbent = select_best_solution(solutions)
+    if incumbent is None:
+        diag["connected_error"] = "no scorable connected solution"
+        return None, diag["connected_error"], meta
+    diag["final_selection_reason"] = incumbent["selection_reason"]
+    diag["connected_solutions_considered"] = len(solutions)
 
     diag["connected_score_ms"] = int((time.time() - t_score) * 1000)
 
@@ -1959,12 +2081,26 @@ def ortools_partition_ors_matrix_connected(points, num_vehicles, max_per_vehicle
         "connected_enclave_points": b["enclave_points"],
         "connected_selected_seed": incumbent["seed"],
         "selected_sequencer": incumbent["sequencer"],
+        "connected_selected_duration_s": round(incumbent["duration_s"], 1),
+        "connected_selected_distance_m": round(incumbent["distance_m"], 1),
     })
+
+    # Les ORDRES gagnants remontent avec l'appartenance. Sans eux, l'appelant
+    # devait reconstruire une sequence -- deux appels Vroom de plus -- et
+    # l'ordre retourne n'etait alors plus celui annonce par selected_sequencer.
+    # Les routes memorisees sont reutilisees telles quelles : aucun rappel.
+    meta["connected_routes"] = [list(incumbent["route_a"]),
+                                list(incumbent["route_b"])]
+    meta["connected_vroom_ok"] = not diag["connected_fallback_used"]
+    meta["connected_vroom_error"] = diag["connected_vroom_error"] or None
 
     print(f"  Retenue: {[len(ga), len(gb)]} pts, seed={incumbent['seed']}, "
           f"sequenceur={incumbent['sequencer']}, composantes 1/1, "
           f"{b['cut_edges']} aretes coupees, {b['enclave_points']} enclaves, "
-          f"duree {incumbent['duration_s'] / 60:.1f}min "
+          f"duree {incumbent['duration_s'] / 60:.1f}min, "
+          f"{incumbent['distance_m'] / 1000:.2f}km, "
+          f"{len(solutions)} solutions comparees, "
+          f"{diag['connected_vroom_calls']} appels Vroom "
           f"({int((time.time() - t0) * 1000)}ms)", flush=True)
 
     return [ga, gb], None, meta
@@ -2800,6 +2936,10 @@ def optimize():
     # valide, seule la partition change.
     routes_idx, vroom_ok, vroom_error = None, False, None
 
+    # Routes deja sequencees par la strategie de partition (connexe). Non nul
+    # signifie : l'ordre est CHOISI, personne ne doit le refaire.
+    presequenced_routes = None
+
     # optimization_path decrit UNIQUEMENT la strategie de partition et n'est
     # jamais suffixe. Les etapes communes reellement executees sont listees
     # a part dans post_processing.
@@ -2883,6 +3023,12 @@ def optimize():
             if conn_diag.get("connected_membership_locked"):
                 membership_locked = True
                 swap_lock_reason = "connected_partition_locked"
+            # La strategie connexe a DEJA choisi les ordres : elle a compare
+            # OR-Tools et Vroom sur la meme matrice ORS et retourne les routes
+            # du gagnant. Les reseqencer ici couterait deux appels Vroom de
+            # plus ET remplacerait l'ordre retenu par celui de Vroom, quel que
+            # soit selected_sequencer.
+            presequenced_routes = (matrix_meta or {}).get("connected_routes")
         else:
             groups, part_err = None, f"no partition function for '{strategy}'"
 
@@ -2905,13 +3051,24 @@ def optimize():
 
         partition_engine = strategy
 
-        print(f"Sequencement Vroom des groupes {strategy}...", flush=True)
-        routes_idx, _seq_dur, vroom_ok, vroom_error = _sequence_groups(
-            points, groups, start_idx, end_idx, headers
-        )
+        if presequenced_routes is not None:
+            routes_idx = [list(r) for r in presequenced_routes]
+            vroom_ok = bool((matrix_meta or {}).get("connected_vroom_ok"))
+            vroom_error = (matrix_meta or {}).get("connected_vroom_error")
+            print(f"Sequencement deja fait par {strategy} "
+                  f"(sequenceur retenu: "
+                  f"{(matrix_meta or {}).get('connected', {}).get('selected_sequencer')}), "
+                  f"aucun appel Vroom supplementaire", flush=True)
+        else:
+            print(f"Sequencement Vroom des groupes {strategy}...", flush=True)
+            routes_idx, _seq_dur, vroom_ok, vroom_error = _sequence_groups(
+                points, groups, start_idx, end_idx, headers
+            )
 
     # 3. 2-OPT haversine : seulement si Vroom a echoue (Vroom deja optimal pour la duree ORS)
-    if routes_idx and not vroom_ok:
+    # Un ordre deja sequence sur la matrice ORS ne passe pas par ce repli :
+    # le 2-opt haversine le degraderait au lieu de le sauver.
+    if routes_idx and not vroom_ok and presequenced_routes is None:
         print("2-opt par tournee (fallback haversine)...", flush=True)
         routes_idx = apply_two_opt(points, routes_idx)
         post_processing.append("haversine_2opt")
@@ -2943,7 +3100,10 @@ def optimize():
         }
 
     # 5. POST-PROCESSING : swap des points frontiere
-    if routes_idx and vroom_ok and membership_locked:
+    # Une partition verrouillee interdit les swaps meme si Vroom a echoue :
+    # sans cette precision, un echec Vroom rendait swap_stop_reason
+    # "vroom_error" alors que la vraie raison reste le verrou territorial.
+    if routes_idx and (vroom_ok or presequenced_routes is not None) and membership_locked:
         # Aucun appel : les swaps deplacent des points entre tournees, ce que la
         # partition territoriale interdit par construction.
         swap_stats["swap_stop_reason"] = swap_lock_reason
@@ -2988,6 +3148,20 @@ def optimize():
     print(f"Appels API: vroom={_API_STATS['vroom']} matrix={_API_STATS['matrix']} "
           f"total={_api_calls_total()} | duree calcul={int((time.time()-t_start)*1000)}ms", flush=True)
     print(f"Sonde D-2: {d2_probe}", flush=True)
+
+    # Metriques des routes REELLEMENT retournees, apres post-optimisation.
+    # Elles decrivent routes_idx tel qu'il part dans la reponse : c'est le
+    # seul couple duree/distance qu'un lecteur de Benchmark peut confronter
+    # aux tournees affichees. None des qu'une tournee n'a pas de mesure ORS.
+    final_post_optimizer = "+".join(post_processing) if post_processing else "none"
+    if road_metrics and all(m.get("duration_s") is not None for m in road_metrics):
+        final_total_duration_s = round(sum(m["duration_s"] for m in road_metrics), 1)
+    else:
+        final_total_duration_s = None
+    if road_metrics and all(m.get("km") is not None for m in road_metrics):
+        final_total_distance_m = round(sum(m["km"] for m in road_metrics) * 1000.0, 1)
+    else:
+        final_total_distance_m = None
 
     # 6. FORMAT RESPONSE (compatible code.js)
     response = {
@@ -3062,6 +3236,17 @@ def optimize():
         "ortools_total_distance_m": _conn_get(matrix_meta, "ortools_total_distance_m", None),
         "vroom_total_duration_s": _conn_get(matrix_meta, "vroom_total_duration_s", None),
         "vroom_total_distance_m": _conn_get(matrix_meta, "vroom_total_distance_m", None),
+        "connected_solutions_considered": _conn_get(matrix_meta, "connected_solutions_considered", 0),
+        "connected_selection_window_s": _conn_get(matrix_meta, "connected_selection_window_s", None),
+        "connected_selected_duration_s": _conn_get(matrix_meta, "connected_selected_duration_s", None),
+        "connected_selected_distance_m": _conn_get(matrix_meta, "connected_selected_distance_m", None),
+        "connected_vroom_cache_hits": _conn_get(matrix_meta, "connected_vroom_cache_hits", 0),
+        "connected_vroom_error": _conn_get(matrix_meta, "connected_vroom_error", ""),
+
+        # --- post-optimisation intra-tournee, communes a toutes les strategies ---
+        "final_post_optimizer": final_post_optimizer,
+        "final_total_duration_s": final_total_duration_s,
+        "final_total_distance_m": final_total_distance_m,
         "elapsed_ms": int((time.time() - t_start) * 1000),
         "api_calls": {
             "vroom": _API_STATS["vroom"],

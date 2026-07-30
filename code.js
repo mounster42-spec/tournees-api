@@ -853,11 +853,14 @@ function _buildStandaloneCarteHtml_(payloadJson) {
 
   // Les libellés viennent du Sheet et peuvent contenir n'importe quoi.
   // Échapper "<" neutralise </script> et <!-- , qui sortiraient du bloc.
-  // U+2028 et U+2029 sont des terminateurs de ligne en JavaScript.
+  // U+2028 et U+2029 sont des terminateurs de ligne en JavaScript. Ils
+  // doivent donc etre ecrits en forme echappee dans la regex : places tels
+  // quels, ils cassent le litteral et le fichier ne se parse plus. Et jamais
+  // l'espace ordinaire U+0020, qui n'a rien a neutraliser ici.
   const safe = payloadJson
     .replace(/</g, "\\u003c")
-    .replace(/ /g, "\\u2028")
-    .replace(/ /g, "\\u2029");
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
 
   return tpl.replace("</head>",
     "<script>window.TOURNEES_PAYLOAD = " + safe + ";</script>\n</head>");

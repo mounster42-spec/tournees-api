@@ -279,7 +279,7 @@ class TestLockAndStructure(unittest.TestCase):
         """Verification STRUCTURELLE : la branche verrouillee precede la branche
         des swaps et ne les appelle pas. L'appel effectif de /optimize demande
         un contexte Flask complet, hors perimetre de ces tests hors reseau."""
-        locked_at = self.src.index("if routes_idx and vroom_ok and membership_locked:")
+        locked_at = self.src.index("and membership_locked:")
         swaps_at = self.src.index("elif routes_idx and vroom_ok:")
         self.assertLess(locked_at, swaps_at,
                         "la branche verrouillee doit etre testee en premier")
