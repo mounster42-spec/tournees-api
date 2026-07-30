@@ -1,0 +1,19 @@
+# Depot Git imbrique, sans rapport avec le service : il ne doit jamais entrer
+# dans le contexte de build ni dans l'image.
+CLI/
+
+.git/
+.github/
+.claude/
+__pycache__/
+**/__pycache__/
+*.pyc
+artifacts/
+
+# Fichiers cote Google Sheets / navigateur : jamais lus par le serveur Flask.
+carte_tournee.html
+code.js
+collecte.gs
+
+# Les tests tournent sur le runner CI, pas dans l'image de production.
+tests_*.py

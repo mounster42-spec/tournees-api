@@ -1,0 +1,17 @@
+# Dependances de l'IMAGE DOCKER uniquement. requirements.txt reste inchange :
+# il pilote encore le service Render en runtime Python natif, et le modifier
+# risquerait de perturber un deploiement en cours.
+#
+# Les versions ci-dessous sont exactement celles resolues par le dernier build
+# Render (Python 3.14.3). Les epingler rend l'image reproductible : sans cela,
+# un rebuild dans trois mois embarquerait un autre numpy ou un autre OR-Tools
+# et l'experimentation ne serait plus comparable.
+#
+# Seules les dependances directes sont epinglees ; les transitives sont
+# resolues par pip, comme aujourd'hui sur Render.
+flask==3.1.3
+gunicorn==26.0.0
+requests==2.34.2
+numpy==2.5.1
+scikit-learn==1.9.0
+ortools==9.15.6755
