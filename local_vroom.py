@@ -225,6 +225,24 @@ def binary_version(config=None):
 # Les deux sont non bloquants : une seconde optimisation est refusee tout de
 # suite, elle n'attend pas.
 
+_THREAD_LOCKS = {}
+_THREAD_LOCKS_GUARD = threading.Lock()
+
+
+def _thread_lock_for(path):
+    """Un seul verrou memoire par chemin, partage par tout le processus.
+
+    Sans ce partage, deux objets LocalVroomRunLock construits dans deux threads
+    du meme worker auraient chacun leur verrou et ne s'excluraient pas."""
+    key = os.path.abspath(path)
+    with _THREAD_LOCKS_GUARD:
+        lock = _THREAD_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _THREAD_LOCKS[key] = lock
+        return lock
+
+
 class LocalVroomRunLock:
 
     def __init__(self, path=None):
@@ -232,8 +250,9 @@ class LocalVroomRunLock:
             os.environ.get("LOCAL_VROOM_TMPDIR") or tempfile.gettempdir(),
             "local_vroom.lock",
         )
-        self._thread_lock = threading.Lock()
+        self._thread_lock = _thread_lock_for(self._path)
         self._fd = None
+        self._held = False
 
     @property
     def path(self):
@@ -241,8 +260,11 @@ class LocalVroomRunLock:
 
     def acquire(self):
         """Tentative non bloquante. Retourne True si le verrou est pris."""
+        if self._held:
+            return False
         if not self._thread_lock.acquire(blocking=False):
             return False
+        self._held = True
         if fcntl is None:                 # pragma: no cover - Windows local
             return True                   # le verrou memoire suffit hors conteneur
         try:
@@ -254,6 +276,7 @@ class LocalVroomRunLock:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:               # deja tenu par un autre worker
                 os.close(fd)
+                self._held = False
                 self._thread_lock.release()
                 return False
             self._fd = fd
@@ -265,6 +288,8 @@ class LocalVroomRunLock:
             return True
 
     def release(self):
+        if not self._held:
+            return
         if self._fd is not None:
             try:
                 fcntl.flock(self._fd, fcntl.LOCK_UN)
@@ -275,8 +300,8 @@ class LocalVroomRunLock:
             except OSError:
                 pass
             self._fd = None
-        if self._thread_lock.locked():
-            self._thread_lock.release()
+        self._held = False
+        self._thread_lock.release()
 
     def __enter__(self):
         if not self.acquire():
