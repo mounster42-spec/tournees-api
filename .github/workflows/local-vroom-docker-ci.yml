@@ -698,40 +698,54 @@ jobs:
 
           echo "--- la strategie experimentale ne peut pas appeler le reseau ---"
           python - <<'PY'
-          import inspect
+          import ast
           import sys
-          import app
 
-          # Le code de recherche est lu a la source : route-first et l'ALNS ne
-          # doivent contenir AUCUNE reference a un point de sortie reseau. La
-          # seule fonction autorisee a en avoir une est l'entree de strategie,
-          # qui appelle le constructeur de matrice ORS.
-          offline = [
-              app.hybrid_route_first,
-              app.hybrid_territorial_alns,
-              app._hybrid_alns_neighbour,
-              app._hybrid_build_cycles,
-              app._hybrid_refine_order,
-              app._hybrid_partition_cost,
-              app.build_knn_graph_g5,
-              app.score_routes_on_matrix,
-          ]
+          # Analyse SYNTAXIQUE d'app.py, sans l'importer : le controle ne
+          # depend donc d'aucune dependance installee, et il porte sur le code
+          # tel qu'il est ecrit. Route-first et l'ALNS ne doivent contenir
+          # aucune reference a un point de sortie reseau ; la seule fonction
+          # autorisee a en avoir une est l'entree de strategie, qui appelle le
+          # constructeur de matrice ORS.
+          offline = {
+              "hybrid_route_first",
+              "hybrid_territorial_alns",
+              "_hybrid_alns_neighbour",
+              "_hybrid_build_cycles",
+              "_hybrid_refine_order",
+              "_hybrid_partition_cost",
+              "build_knn_graph_g5",
+              "score_routes_on_matrix",
+          }
           forbidden = ("requests.", "_post_matrix", "_post_vroom",
                        "ORS_VROOM_URL", "ORS_MATRIX_URL",
                        "_build_full_matrix_chunked", "_fetch_ors_matrix",
                        "urlopen", "socket")
+
+          with open("app.py", encoding="utf-8") as handle:
+              source = handle.read()
+          tree = ast.parse(source)
+
+          found = {}
+          for node in ast.walk(tree):
+              if isinstance(node, ast.FunctionDef) and node.name in offline:
+                  found[node.name] = ast.get_source_segment(source, node) or ""
+
+          missing = offline - set(found)
+          if missing:
+              print("ECHEC: fonctions introuvables dans app.py:", sorted(missing))
+              sys.exit(1)
+
           failures = []
-          for function in offline:
-              source = inspect.getsource(function)
+          for name, body in sorted(found.items()):
               for needle in forbidden:
-                  if needle in source:
-                      failures.append("%s reference %s"
-                                      % (function.__name__, needle))
+                  if needle in body:
+                      failures.append("%s reference %s" % (name, needle))
           for item in failures:
               print("ECHEC:", item)
           if failures:
               sys.exit(1)
-          print("OK: %d fonctions de recherche sans acces reseau" % len(offline))
+          print("OK: %d fonctions de recherche sans acces reseau" % len(found))
           PY
 
           exit $fail

@@ -172,10 +172,23 @@ def run(n_tasks=60):
         "soft_limit_s": config.total_soft_limit_s,
 
         # --- ressources ---
-        "vroom_peak_rss_kb": child_peak_rss_kb(),
+        # ATTENTION a la lecture de child_peak_rss_kb : Python cree le
+        # subprocess par fork() puis exec(). Le pic de RSS attribue a l'enfant
+        # inclut donc la photographie en copie-sur-ecriture du parent, ici un
+        # service charge de numpy, scikit-learn et OR-Tools. Ce chiffre suit la
+        # taille du PARENT, il ne mesure pas l'empreinte propre de VROOM. La
+        # seule mesure decisive est celle du conteneur entier sous 512 Mo.
+        "child_peak_rss_kb": child_peak_rss_kb(),
+        "child_peak_rss_note": ("inclut la photographie copie-sur-ecriture du "
+                                "parent au fork ; ce n'est pas l'empreinte "
+                                "propre de vroom"),
         "service_peak_rss_kb": self_peak_rss_kb(),
         "children_after": child_processes(),
-        "tmp_after": sorted(os.listdir(config.tmpdir))
+        # Le fichier de verrou vit dans ce repertoire par construction et doit
+        # y rester : ce qui ne doit PAS survivre, ce sont les repertoires de
+        # travail d'une resolution.
+        "tmp_after": sorted(name for name in os.listdir(config.tmpdir)
+                            if name != "local_vroom.lock")
         if os.path.isdir(config.tmpdir) else [],
     }
 
