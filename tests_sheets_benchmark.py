@@ -468,9 +468,10 @@ class TestMenuWiring(unittest.TestCase):
                 sequence.append(("separateur", ""))
         self.assertEqual(sequence, [
             ("sous-menu", "Tournées"),
+            ("Sélectionner les points par ID", "ouvrirSelectionParId"),
             ("MENU_OPTIMISER_LABEL", "runHybridLocalVroomTerritorial"),
-            ("Afficher la dernière carte", "afficherDerniereCarte"),
-            ("Exporter la dernière carte", "exporterCartePartageable"),
+            ("Ouvrir la carte", "ouvrirLaCarte"),
+            ("Exporter la carte", "exporterCartePartageable"),
             ("Ouvrir le benchmark", "ouvrirBenchmark"),
             ("separateur", ""),
             ("sous-menu", "Méthodes de comparaison"),
@@ -478,13 +479,20 @@ class TestMenuWiring(unittest.TestCase):
             ("ORS connecté — comparaison", "runOrtoolsOrsMatrixConnected"),
         ])
 
+    def test_the_old_duplicate_map_entries_are_gone(self):
+        """Deux entrees carte se ressemblaient trop. Il n'en reste qu'une."""
+        flat = re.sub(r"\s+", " ", self.code)
+        self.assertNotIn('"Afficher la dernière carte"', flat)
+        self.assertNotIn('"Ouvrir la dernière carte"', flat)
+        self.assertEqual(flat.count('.addItem("Ouvrir la carte"'), 1)
+
     def test_the_export_entry_says_export_because_it_writes_to_drive(self):
         """Le libellé doit décrire le comportement réel : l'action crée un
         fichier Drive avant de proposer un lien, elle ne télécharge pas
         directement."""
         self.assertIn("DriveApp.createFile", self.code)
         flat = re.sub(r"\s+", " ", self.code)
-        self.assertIn('.addItem("Exporter la dernière carte", '
+        self.assertIn('.addItem("Exporter la carte", '
                       '"exporterCartePartageable")', flat)
 
     def test_the_comparison_submenu_holds_exactly_two_methods(self):
@@ -863,6 +871,101 @@ class TestMapDownloadButton(unittest.TestCase):
         export = extract_function(read_code(), "exporterCarteDepuisDialogue")
         self.assertNotIn("getCarteGeometrie", export)
         self.assertNotIn("UrlFetchApp", export)
+
+
+class TestWebApp(unittest.TestCase):
+    """La Web App sert la meme page sur ordinateur et sur telephone, et ne
+    montre rien a qui n'a pas acces au classeur."""
+
+    def setUp(self):
+        self.code = read_code()
+
+    def test_doget_never_relies_on_an_active_spreadsheet(self):
+        """Ni classeur actif, ni interface, ni feuille active : aucune de ces
+        notions n'existe hors du classeur."""
+        body = extract_function(self.code, "doGet")
+        for interdit in ("getActive()", "getActiveSpreadsheet",
+                         "getActiveSheet", "getUi()", "getActiveRange"):
+            self.assertNotIn(interdit, body,
+                             "doGet depend de %s" % interdit)
+
+    def test_the_workbook_is_found_by_a_stored_identifier(self):
+        self.assertIn('const PROP_SPREADSHEET_ID = "TOURNEES_SPREADSHEET_ID";',
+                      self.code)
+        body = extract_function(self.code, "doGet")
+        self.assertIn("getProperty(PROP_SPREADSHEET_ID)", body)
+        self.assertIn("SpreadsheetApp.openById(id)", body)
+        # L'identifiant est enregistre depuis le classeur, a l'ouverture.
+        self.assertIn("_memoriserClasseur_();",
+                      extract_function(self.code, "onOpen"))
+
+    def test_access_is_checked_before_anything_is_served(self):
+        body = extract_function(self.code, "doGet")
+        controle = body.index("SpreadsheetApp.openById(id)")
+        service = body.index("createHtmlOutputFromFile(MAP_HTML_FILE)")
+        self.assertLess(controle, service,
+                        "la page est servie avant le controle des droits")
+        self.assertIn("Accès refusé", body)
+        self.assertIn("compte autorisé à accéder à ce", body)
+
+    def test_the_refusal_page_carries_no_map_data(self):
+        page = extract_function(self.code, "_pageMessage_")
+        for interdit in ("getCarteTourneesPayload", "TOURNEES_PAYLOAD",
+                         "routes", "geometr", "MAP_DATA_SHEET"):
+            self.assertNotIn(interdit, page,
+                             "la page de message expose %s" % interdit)
+
+    def test_the_payload_reader_leaks_nothing_without_access(self):
+        body = extract_function(self.code, "getCarteTourneesPayload")
+        self.assertIn("catch (e)", body)
+        self.assertIn("return null;", body)
+
+    def test_the_workbook_helper_falls_back_to_open_by_id(self):
+        body = extract_function(self.code, "_classeur_")
+        self.assertIn("SpreadsheetApp.getActive()", body)
+        self.assertIn("SpreadsheetApp.openById(id)", body)
+
+    def test_a_single_responsive_page_serves_every_device(self):
+        """Aucune version mobile separee : le meme gabarit partout."""
+        body = extract_function(self.code, "doGet")
+        self.assertIn("MAP_HTML_FILE", body)
+        self.assertIn("viewport-fit=cover", body)
+        # Dialogue, export autonome et Web App lisent le MEME gabarit. Trois
+        # usages, une seule page : c'est ce qui garantit qu'il n'existe pas
+        # de version mobile a maintenir a part.
+        self.assertEqual(
+            self.code.count("createHtmlOutputFromFile(MAP_HTML_FILE)"), 3)
+        self.assertEqual(self.code.count("const MAP_HTML_FILE"), 1)
+
+    def test_the_web_app_page_is_served_without_an_injected_payload(self):
+        """Servi sans payload, le gabarit passe par google.script.run : c'est
+        ce qui lui donne le trace routier et les memes boutons."""
+        body = extract_function(self.code, "doGet")
+        self.assertNotIn("_buildStandaloneCarteHtml_", body)
+
+    def test_opening_the_map_survives_a_blocked_popup(self):
+        body = extract_function(self.code, "ouvrirLaCarte")
+        self.assertIn("window.open(", body)
+        self.assertIn("min-height:44px", body)
+        self.assertIn("bloqué la fenêtre", body)
+
+    def test_a_missing_deployment_is_explained_not_a_dead_link(self):
+        body = extract_function(self.code, "ouvrirLaCarte")
+        self.assertIn("if (!url)", body)
+        self.assertIn("pas encore déployée", body)
+        self.assertIn("Exporter la carte", body)
+
+    def test_no_permission_is_ever_changed_by_the_code(self):
+        for interdit in ("setSharing", "addEditor", "addViewer", "ANYONE",
+                         "DriveApp.getFileById", "setAccess"):
+            self.assertNotIn(interdit, self.code,
+                             "le code modifie un partage : %s" % interdit)
+
+    def test_the_backend_is_untouched_by_the_web_app(self):
+        with open(os.path.join(HERE, "app.py"), encoding="utf-8") as handle:
+            backend = handle.read()
+        routes = sorted(re.findall(r'@app\.route\("([^"]+)"', backend))
+        self.assertEqual(routes, ["/", "/healthz", "/map-geometry", "/optimize"])
 
 
 class TestMapResponsive(unittest.TestCase):

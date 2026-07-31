@@ -1184,8 +1184,44 @@ const MAP_DATA_SHEET = "_CarteData";
 const MAP_COLORS = ["#1f5fa9", "#d35400"];   // Tournée 1 bleu, Tournée 2 orange foncé
 
 
+// Identifiant du classeur, mémorisé depuis le classeur lui-même.
+// SpreadsheetApp.getActive() ne veut rien dire dans une Web App : il n'y a
+// ni classeur actif, ni interface. Sans cet identifiant explicite, doGet
+// n'aurait aucun moyen fiable de retrouver les données.
+const PROP_SPREADSHEET_ID = "TOURNEES_SPREADSHEET_ID";
+
+
+/** Enregistre l'ID du classeur. Appelé depuis le classeur, jamais ailleurs. */
+function _memoriserClasseur_() {
+  try {
+    PropertiesService.getScriptProperties()
+      .setProperty(PROP_SPREADSHEET_ID, SpreadsheetApp.getActive().getId());
+  } catch (e) {
+    // Contexte sans classeur actif : rien à mémoriser, rien à signaler.
+  }
+}
+
+
+/**
+ * Le classeur, dans les deux contextes.
+ *
+ * Depuis le classeur, getActive() suffit. Depuis la Web App il rend null :
+ * on ouvre alors explicitement par identifiant. openById s'exécute avec les
+ * droits de l'utilisateur accédant et LÈVE s'il n'a pas accès — c'est
+ * exactement la barrière voulue, et elle est portée par Google, pas par nous.
+ */
+function _classeur_() {
+  const actif = SpreadsheetApp.getActive();
+  if (actif) return actif;
+  const id = PropertiesService.getScriptProperties()
+    .getProperty(PROP_SPREADSHEET_ID);
+  if (!id) throw new Error("Classeur non mémorisé.");
+  return SpreadsheetApp.openById(id);
+}
+
+
 function _mapDataSheet_(createIfMissing) {
-  const ss = SpreadsheetApp.getActive();
+  const ss = _classeur_();
   let sh = ss.getSheetByName(MAP_DATA_SHEET);
   if (!sh && createIfMissing) {
     sh = ss.insertSheet(MAP_DATA_SHEET);
@@ -1208,10 +1244,132 @@ function _saveCartePayload_(payload) {
  * alors « Aucune tournée récente disponible ».
  */
 function getCarteTourneesPayload() {
-  const sh = _mapDataSheet_(false);
-  if (!sh) return null;
-  const v = sh.getRange(1, 1).getValue();
-  return v ? String(v) : null;
+  try {
+    const sh = _mapDataSheet_(false);
+    if (!sh) return null;
+    const v = sh.getRange(1, 1).getValue();
+    return v ? String(v) : null;
+  } catch (e) {
+    // Utilisateur sans accès au classeur : aucune donnée ne sort d'ici.
+    return null;
+  }
+}
+
+
+// =========================
+// WEB APP
+// =========================
+// Une seule page responsive, la même sur ordinateur, Android et iPhone.
+//
+// doGet n'utilise NI SpreadsheetApp.getActive(), NI getUi(), NI aucune notion
+// de feuille active : rien de tout cela n'existe hors du classeur. Le
+// classeur est retrouvé par son identifiant mémorisé, puis ouvert avec les
+// droits de l'utilisateur qui consulte la page.
+
+/** Page de message. Ne contient jamais la moindre donnée de tournée. */
+function _pageMessage_(titre, message) {
+  const esc = function (s) {
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+                    .replace(/>/g, "&gt;");
+  };
+  return HtmlService.createHtmlOutput(
+      '<div style="font-family:Arial,Helvetica,sans-serif;max-width:520px;'
+    + 'margin:12vh auto;padding:0 24px;line-height:1.6;color:#222">'
+    + "<h1 style=\"font-size:19px\">" + esc(titre) + "</h1>"
+    + "<p>" + esc(message) + "</p></div>")
+    .setTitle("Carte des tournées")
+    .addMetaTag("viewport", "width=device-width, initial-scale=1");
+}
+
+
+/**
+ * Point d'entrée de la Web App.
+ *
+ * L'accès est vérifié AVANT de servir quoi que ce soit : openById lève pour
+ * un utilisateur sans droits sur le classeur, et la page d'erreur ne porte
+ * aucune adresse, aucun point, aucune métrique.
+ */
+function doGet(e) {
+  const id = PropertiesService.getScriptProperties()
+    .getProperty(PROP_SPREADSHEET_ID);
+
+  if (!id) {
+    return _pageMessage_("Carte indisponible",
+      "Le classeur n'a pas encore été associé à cette application. "
+      + "Ouvrez le classeur une fois, puis rechargez cette page.");
+  }
+
+  try {
+    // Contrôle des droits, et lui seul : la valeur n'est pas utilisée ici.
+    SpreadsheetApp.openById(id).getName();
+  } catch (err) {
+    return _pageMessage_("Accès refusé",
+      "Vous devez être connecté avec un compte autorisé à accéder à ce "
+      + "classeur.");
+  }
+
+  if (!getCarteTourneesPayload()) {
+    return _pageMessage_("Aucune carte disponible",
+      "Lancez une optimisation depuis le classeur, puis rouvrez cette page.");
+  }
+
+  // Le gabarit est servi SANS payload injecté : la page le demande ensuite
+  // par google.script.run, qui fonctionne aussi dans une Web App. C'est ce
+  // qui lui donne le tracé routier et les mêmes boutons que le dialogue.
+  return HtmlService.createHtmlOutputFromFile(MAP_HTML_FILE)
+    .setTitle("Carte des tournées")
+    .addMetaTag("viewport",
+                "width=device-width, initial-scale=1, viewport-fit=cover");
+}
+
+
+/**
+ * Entrée de menu « Ouvrir la carte ».
+ *
+ * Un menu Apps Script ne peut pas ouvrir un onglet lui-même. On affiche donc
+ * une petite fenêtre qui tente window.open, et qui garde en toutes
+ * circonstances un grand bouton : un pop-up bloqué n'est pas une erreur, il
+ * suffit de cliquer.
+ */
+function ouvrirLaCarte() {
+  const url = getWebAppUrl();
+
+  if (!url) {
+    SpreadsheetApp.getUi().showModalDialog(
+      HtmlService.createHtmlOutput(
+          '<div style="font-family:Arial,sans-serif;font-size:13px;'
+        + 'line-height:1.6;padding:16px">'
+        + "<b>La Web App n'est pas encore déployée.</b><br><br>"
+        + "Dans l'éditeur Apps Script : <i>Déployer &rsaquo; Nouveau "
+        + "déploiement &rsaquo; Application Web</i>, en exécutant "
+        + "« en tant qu'utilisateur accédant » et en limitant l'accès aux "
+        + "utilisateurs connectés.<br><br>"
+        + "En attendant, <b>Exporter la carte</b> reste disponible."
+        + "</div>").setWidth(460).setHeight(240),
+      "Ouvrir la carte");
+    return;
+  }
+
+  const esc = function (s) {
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+                    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  };
+
+  SpreadsheetApp.getUi().showModalDialog(
+    HtmlService.createHtmlOutput(
+        '<div style="font-family:Arial,sans-serif;font-size:13px;'
+      + 'line-height:1.6;padding:16px;text-align:center">'
+      + '<a id="lien" href="' + esc(url) + '" target="_blank" '
+      + 'style="display:inline-block;min-height:44px;line-height:44px;'
+      + 'padding:0 22px;background:#1a73e8;color:#fff;border-radius:6px;'
+      + 'text-decoration:none;font-weight:bold">Ouvrir la carte</a>'
+      + '<div style="margin-top:14px;color:#5f6368">'
+      + "Si rien ne s'ouvre, votre navigateur a bloqué la fenêtre : "
+      + "cliquez sur le bouton ci-dessus.</div>"
+      + "<script>try{window.open("
+      + JSON.stringify(url) + ",'_blank');}catch(e){}<\/script>"
+      + "</div>").setWidth(420).setHeight(210),
+    "Ouvrir la carte");
 }
 
 
@@ -1724,11 +1882,16 @@ function runHybridLocalVroomTerritorial() { runOptimisation(EXP_STRATEGY); }
  * l'éditeur Apps Script, et le backend les accepte toujours.
  */
 function onOpen() {
+  // Le classeur est mémorisé à chaque ouverture : c'est la seule occasion où
+  // son identifiant est connu de façon fiable, et la Web App en dépend.
+  _memoriserClasseur_();
+
   const ui = SpreadsheetApp.getUi();
   ui.createMenu("Tournées")
+    .addItem("Sélectionner les points par ID", "ouvrirSelectionParId")
     .addItem(MENU_OPTIMISER_LABEL, "runHybridLocalVroomTerritorial")
-    .addItem("Afficher la dernière carte", "afficherDerniereCarte")
-    .addItem("Exporter la dernière carte", "exporterCartePartageable")
+    .addItem("Ouvrir la carte", "ouvrirLaCarte")
+    .addItem("Exporter la carte", "exporterCartePartageable")
     .addItem("Ouvrir le benchmark", "ouvrirBenchmark")
     .addSeparator()
     .addSubMenu(
