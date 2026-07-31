@@ -7,17 +7,27 @@
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
-  html,body{height:100%;margin:0;font-family:Arial,Helvetica,sans-serif;color:#222}
+  html,body{margin:0;font-family:Arial,Helvetica,sans-serif;color:#222;
+            overflow:hidden}
 
-  /* Colonne : panneau en haut, carte qui prend le reste. Evite qu'une carte
-     en 100vh depasse sous le panneau. */
-  #layout{display:flex;flex-direction:column;height:100%}
-  #panel{flex:0 0 auto;background:#fafafa;border-bottom:1px solid #ddd;
-         padding:10px 14px;display:flex;flex-wrap:wrap;gap:18px;align-items:flex-start}
+  /* 100dvh suit la barre d'adresse mobile qui se retracte ; 100vh reste le
+     repli pour les navigateurs qui l'ignorent. Declares dans cet ordre : le
+     second gagne quand il est compris. */
+  html,body{height:100vh;height:100dvh}
 
-  /* min-height : filet de securite si le conteneur parent n'a aucune hauteur,
-     sans quoi Leaflet rendrait une carte vide. */
-  #map{flex:1 1 auto;width:100%;min-height:320px}
+  /* ORDINATEUR : panneau lateral etroit a gauche, carte a droite.
+     La carte est l'element principal, elle ne se contente plus du reste. */
+  #layout{display:flex;flex-direction:row;height:100%;
+          padding-left:env(safe-area-inset-left);
+          padding-right:env(safe-area-inset-right)}
+  #panel{flex:0 0 290px;background:#fafafa;border-right:1px solid #ddd;
+         padding:12px 14px;overflow-y:auto;-webkit-overflow-scrolling:touch;
+         display:flex;flex-direction:column;gap:14px}
+  #map{flex:1 1 auto;height:100%;min-height:0}
+
+  /* Poignee du tiroir : masquee sur ordinateur, seule commande du panneau
+     sur telephone. */
+  #drawer-handle{display:none}
 
   #empty{display:none;flex:1 1 auto;align-items:center;justify-content:center;
          text-align:center;padding:40px 20px;color:#555;font-size:15px;line-height:1.6}
@@ -38,8 +48,8 @@
       vertical-align:middle;margin-right:5px;border:1px solid rgba(0,0,0,.2)}
   .dash{display:inline-block;width:22px;border-top:3px dashed #666;
         vertical-align:middle;margin-right:5px}
-  .toggles label{margin-right:12px;cursor:pointer;white-space:nowrap}
-  .toggles button{font-size:12px;padding:3px 9px;cursor:pointer}
+  .toggles button{font:inherit;min-height:44px;padding:0 12px;cursor:pointer;
+    border:1px solid #999;border-radius:6px;background:#fff;margin-top:4px}
   .warn{color:#b00;font-size:12px}
   .alert{color:#fff;background:#c0392b;padding:6px 8px;border-radius:3px;
          font-size:12px;margin-bottom:4px}
@@ -51,31 +61,85 @@
        border:2px solid;background:#fff}
   .pin-depot{width:30px;height:30px;line-height:28px;font-size:9px}
 
-  @media (max-width:640px){
-    #panel{gap:10px;padding:8px 10px}
-    .block,table.sum th,table.sum td{font-size:11px}
+  /* Boutons et cases : 44 px, le minimum tactile. Sur ordinateur la souris
+     s'en accommode ; sur telephone c'est la difference entre viser et rater. */
+  .actions{display:flex;flex-wrap:wrap;gap:8px}
+  .actions button{font:inherit;min-height:44px;padding:0 14px;cursor:pointer;
+    border:1px solid #1a73e8;border-radius:6px;background:#fff;color:#1a73e8;
+    flex:1 1 auto}
+  .actions button.primaire{background:#1a73e8;color:#fff}
+  .actions button:disabled{opacity:.5;cursor:default}
+  .toggles label{display:inline-flex;align-items:center;min-height:44px;
+                 margin-right:12px;cursor:pointer;white-space:nowrap}
+  .toggles input[type=checkbox]{width:20px;height:20px;margin-right:6px}
+
+  /* Bloc technique : ferme par defaut. Rien n'est retire du payload, tout
+     reste consultable en un clic. */
+  details.tech{border-top:1px solid #e0e0e0;padding-top:8px}
+  details.tech>summary{cursor:pointer;font-weight:bold;font-size:12px;
+    min-height:44px;display:flex;align-items:center;color:#5f6368}
+  details.tech .block{margin-top:6px}
+
+  /* TELEPHONE : la carte prend tout l'ecran, le panneau devient un tiroir
+     bas, replie par defaut. Le paysage etait le pire cas -- 74 % de panneau
+     pour 101 px de carte visible -- et c'est lui que cette bascule corrige. */
+  @media (max-width:820px), (max-height:520px){
+    #layout{flex-direction:column}
+    #map{flex:1 1 auto;width:100%;min-height:0}
+    #panel{position:relative;flex:0 0 auto;max-height:45vh;
+           border-right:none;border-top:1px solid #ddd;
+           padding:0 12px 12px;gap:12px;
+           padding-bottom:calc(12px + env(safe-area-inset-bottom))}
+    /* Replie : seule la poignee reste visible. */
+    #panel.replie{max-height:none;overflow:hidden}
+    #panel.replie>*:not(#drawer-handle){display:none}
+    #drawer-handle{display:flex;align-items:center;justify-content:space-between;
+      position:sticky;top:0;background:#fafafa;min-height:44px;
+      border:0;width:100%;font:inherit;font-weight:bold;cursor:pointer;
+      padding:0;color:#222}
+    #drawer-handle .chev{color:#5f6368;font-size:16px;padding-left:10px}
+    .actions button{flex:1 1 100%}
+  }
+
+  @media (max-width:400px){
+    .block,table.sum th,table.sum td{font-size:12px}
   }
 </style>
 </head>
 <body>
 <div id="layout">
 
-  <div id="panel">
-    <div class="block" id="summary"></div>
-    <div class="block" id="legend"></div>
-    <div class="block toggles" id="toggles"></div>
-    <div class="block" id="territorial"></div>
-    <!-- Actions et état du tracé routier. Masqué hors Apps Script : dans un
-         fichier exporté, ni le bouton ni le chargement n'ont de sens. -->
-    <div class="block" id="actions" style="display:none">
-      <button id="btn-download" type="button">Télécharger la carte</button>
-      <span id="geo-status"></span>
-      <span id="download-result"></span>
-    </div>
-  </div>
-
-  <div id="empty"></div>
   <div id="map"></div>
+  <div id="empty"></div>
+
+  <div id="panel">
+    <!-- Poignée du tiroir : n'apparaît que sur téléphone, où le panneau est
+         replié par défaut pour laisser l'écran à la carte. -->
+    <button id="drawer-handle" type="button" aria-expanded="false">
+      <span id="drawer-resume">Détails</span><span class="chev">▲</span>
+    </button>
+
+    <div class="block" id="summary"></div>
+    <div class="block toggles" id="toggles"></div>
+
+    <!-- Actions et état du tracé. Masqué hors Apps Script : dans un fichier
+         exporté, ni les boutons ni le chargement n'ont de sens. -->
+    <div class="block" id="actions" style="display:none">
+      <div class="actions">
+        <button id="btn-fullscreen" type="button" class="primaire">Ouvrir en grand</button>
+        <button id="btn-download" type="button">Exporter</button>
+      </div>
+      <div id="geo-status"></div>
+      <div id="download-result"></div>
+    </div>
+
+    <details class="tech" id="technique">
+      <summary>Détails techniques</summary>
+      <div class="block" id="legend"></div>
+      <div class="block" id="meta"></div>
+      <div class="block" id="territorial"></div>
+    </details>
+  </div>
 </div>
 
 <script>
@@ -322,6 +386,7 @@ function drawDepots(){
 
 function buildSummary(payload){
   var rows = "", totalKm = 0, totalMin = 0, kmKnown = false, minKnown = false;
+  var totalPts = 0;
 
   for (var i = 0; i < payload.routes.length; i++){
     var r = payload.routes[i];
@@ -332,6 +397,7 @@ function buildSummary(payload){
     for (var j = 0; j < pts.length; j++){
       if (pts[j].role === "collection" && hasValidCoords(pts[j])) n++;
     }
+    totalPts += n;
 
     var km = r.distance_km, mn = r.duration_min;
     if (km !== null && km !== undefined && km !== "" && isFinite(Number(km))){
@@ -352,14 +418,28 @@ function buildSummary(payload){
         + "<th class='num'>" + (kmKnown ? fmt(totalKm,2,"km") : "—") + "</th>"
         + "<th class='num'>" + (minKnown ? fmt(totalMin,1,"min") : "—") + "</th></tr>";
 
+  // Le nom interne de la stratégie et la signature du jeu n'aident pas à
+  // conduire une tournée : ils partent sous « Détails techniques ». La date,
+  // elle, situe la carte et reste en vue.
   var meta = "";
   if (payload.strategy) meta += "Stratégie : " + esc(payload.strategy);
-  if (payload.points_signature) meta += " | jeu " + esc(payload.points_signature);
-  if (payload.generated_at) meta += "<br>" + esc(payload.generated_at);
+  if (payload.points_signature) meta += "<br>Jeu : " + esc(payload.points_signature);
+  document.getElementById("meta").innerHTML =
+    "<h2>Origine</h2><div class='meta'>" + (meta || "—") + "</div>";
+
+  var titre = payload.generated_at
+    ? "<div class='meta'>" + esc(payload.generated_at) + "</div>" : "";
 
   document.getElementById("summary").innerHTML =
-    "<h2>Récapitulatif</h2><table class='sum'>" + rows + "</table>"
-    + (meta ? "<div class='meta'>" + meta + "</div>" : "");
+    "<h2>Récapitulatif</h2>" + titre
+    + "<table class='sum'>" + rows + "</table>"
+    + "<div class='meta'>" + (usesRoadGeometry
+        ? "Itinéraire routier" : "Tracé indicatif") + "</div>";
+
+  // Résumé d'une ligne, affiché sur la poignée du tiroir quand il est replié.
+  document.getElementById("drawer-resume").textContent =
+    (kmKnown ? fmt(totalKm, 1, "km") : "—") + " · "
+    + (minKnown ? fmt(totalMin, 0, "min") : "—") + " · " + totalPts + " collectes";
 }
 
 
@@ -567,16 +647,54 @@ function renderCarte(payload){
     return;
   }
 
-  // Le dialogue Apps Script peut encore se redimensionner après le premier
-  // rendu : on réaligne, puis on recadre pour rester exact.
-  window.addEventListener("resize", function(){
-    map.invalidateSize();
-    if (allLatLngs.length > 1) map.fitBounds(L.latLngBounds(allLatLngs).pad(0.08));
-  });
-  setTimeout(function(){
-    map.invalidateSize();
-    if (allLatLngs.length > 1) map.fitBounds(L.latLngBounds(allLatLngs).pad(0.08));
-  }, 0);
+  initTiroir();
+
+  // Le dialogue peut encore se redimensionner après le premier rendu, et un
+  // téléphone qui bascule en paysage change tout. Les deux événements sont
+  // écoutés : orientationchange arrive avant que les dimensions soient à
+  // jour, d'où le léger différé.
+  if (!window.__resizeBranche){
+    window.__resizeBranche = true;
+    window.addEventListener("resize", recadrer);
+    window.addEventListener("orientationchange", function(){
+      setTimeout(recadrer, 150);
+    });
+  }
+  setTimeout(recadrer, 0);
+}
+
+
+/* ---------- tiroir et redimensionnement ---------- */
+
+/** Recadre après un changement de taille ou d'orientation.
+ *
+ *  Leaflet ne détecte pas seul qu'on est passé en paysage ou que le tiroir
+ *  s'est ouvert : sans invalidateSize, la carte garde l'ancienne taille et
+ *  laisse une bande grise. */
+function recadrer(){
+  if (!map) return;
+  map.invalidateSize();
+  if (allLatLngs.length > 1) map.fitBounds(L.latLngBounds(allLatLngs).pad(0.08));
+}
+
+function basculerTiroir(){
+  var panel = document.getElementById("panel");
+  var handle = document.getElementById("drawer-handle");
+  var replie = panel.classList.toggle("replie");
+  handle.setAttribute("aria-expanded", replie ? "false" : "true");
+  handle.querySelector(".chev").textContent = replie ? "▲" : "▼";
+  setTimeout(recadrer, 0);
+}
+
+/** Le tiroir démarre replié sur téléphone, déployé sur ordinateur. */
+function initTiroir(){
+  var petit = window.matchMedia("(max-width:820px), (max-height:520px)").matches;
+  var panel = document.getElementById("panel");
+  panel.classList.toggle("replie", petit);
+  document.getElementById("drawer-handle")
+          .setAttribute("aria-expanded", petit ? "false" : "true");
+  document.getElementById("drawer-handle").querySelector(".chev")
+          .textContent = petit ? "▲" : "▼";
 }
 
 
@@ -663,6 +781,37 @@ function chargerGeometrie(){
 }
 
 /**
+ * « Ouvrir en grand » : la même carte dans un vrai onglet HTTPS.
+ *
+ * Le Fullscreen API n'est pas fiable dans l'iframe sandboxée d'un dialogue
+ * Apps Script. Agrandir l'iframe donnerait un faux plein écran, toujours
+ * borné par le dialogue. On ouvre donc la Web App, qui est une vraie page.
+ */
+function ouvrirEnGrand(){
+  if (!enAppsScript()) return;
+  var sortie = document.getElementById("download-result");
+  sortie.textContent = " Ouverture…";
+  google.script.run
+    .withSuccessHandler(function(url){
+      if (!url){
+        sortie.innerHTML = " <span style='color:#b06000'>La Web App n'est pas "
+          + "encore déployée. Utilisez Exporter en attendant.</span>";
+        return;
+      }
+      // Une fenêtre ouverte hors clic direct peut être bloquée : le lien
+      // reste affiché pour que l'utilisateur décide lui-même.
+      window.open(url, "_blank");
+      sortie.innerHTML = ' <a href="' + esc(url) + '" target="_blank">'
+        + "Ouvrir la carte ↗</a>";
+    })
+    .withFailureHandler(function(){
+      sortie.textContent = " Impossible d'obtenir l'adresse de la carte.";
+    })
+    .getWebAppUrl();
+}
+
+
+/**
  * Export depuis la fenêtre.
  *
  * Le téléchargement direct depuis une iframe HtmlService n'est pas garanti :
@@ -704,6 +853,9 @@ function telechargerCarte(){
 
 /* ---------- amorçage ---------- */
 
+document.getElementById("drawer-handle")
+        .addEventListener("click", basculerTiroir);
+
 (function boot(){
   // 1. Payload déjà posé sur window : fichier exporté autonome, et tests hors
   //    Apps Script. Aucun bouton, aucun appel : tout est déjà dans le fichier.
@@ -717,6 +869,8 @@ function telechargerCarte(){
     document.getElementById("actions").style.display = "block";
     document.getElementById("btn-download")
             .addEventListener("click", telechargerCarte);
+    document.getElementById("btn-fullscreen")
+            .addEventListener("click", ouvrirEnGrand);
 
     google.script.run
       .withSuccessHandler(function(json){

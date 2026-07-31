@@ -799,8 +799,11 @@ class TestMapDownloadButton(unittest.TestCase):
         self.code = strip_comments(read_code())
 
     def test_the_button_exists_and_is_wired(self):
+        # Le popup n'a plus que deux actions : « Ouvrir en grand » et
+        # « Exporter ». L'ancien libelle « Télécharger la carte » disait mal
+        # ce qui se passe -- le fichier part d'abord sur Drive.
         self.assertIn('id="btn-download"', self.html)
-        self.assertIn("Télécharger la carte", self.html)
+        self.assertIn(">Exporter<", self.html)
         self.assertIn('getElementById("btn-download")', self.html)
         self.assertIn("telechargerCarte", self.html)
 
@@ -860,6 +863,92 @@ class TestMapDownloadButton(unittest.TestCase):
         export = extract_function(read_code(), "exporterCarteDepuisDialogue")
         self.assertNotIn("getCarteGeometrie", export)
         self.assertNotIn("UrlFetchApp", export)
+
+
+class TestMapResponsive(unittest.TestCase):
+    """Le panneau prenait 74 % d'un ecran de telephone en paysage, pour
+    101 px de carte visible. Ces controles figent la correction."""
+
+    def setUp(self):
+        self.html = read_map_html()
+
+    def test_the_map_comes_first_in_the_layout(self):
+        layout = self.html[self.html.index('<div id="layout">'):]
+        layout = layout[:layout.index("</div>\n</div>")]
+        self.assertLess(layout.index('id="map"'), layout.index('id="panel"'))
+
+    def test_dynamic_viewport_height_with_a_fallback(self):
+        self.assertIn("height:100vh;height:100dvh", self.html)
+
+    def test_iphone_safe_areas_are_honoured(self):
+        self.assertIn("env(safe-area-inset-left)", self.html)
+        self.assertIn("env(safe-area-inset-bottom)", self.html)
+
+    def test_a_side_panel_on_desktop_a_bottom_drawer_on_phones(self):
+        self.assertIn("flex:0 0 290px", self.html)
+        self.assertIn("@media (max-width:820px), (max-height:520px)", self.html)
+        self.assertIn("#panel.replie", self.html)
+
+    def test_the_drawer_starts_collapsed_on_phones_only(self):
+        body = extract_function(self.html, "initTiroir")
+        self.assertIn('matchMedia("(max-width:820px), (max-height:520px)")', body)
+        self.assertIn('classList.toggle("replie", petit)', body)
+
+    def test_every_control_is_touch_sized(self):
+        for regle in (".actions button{", ".toggles button{",
+                      ".toggles label{", "details.tech>summary{"):
+            bloc = self.html[self.html.index(regle):]
+            bloc = bloc[:bloc.index("}")]
+            self.assertIn("min-height:44px", bloc,
+                          "%s n'est pas dimensionne pour le tactile" % regle)
+
+    def test_the_map_is_resized_on_rotation(self):
+        """Leaflet ne detecte pas seul un passage en paysage : sans
+        invalidateSize la carte garde son ancienne taille."""
+        self.assertIn('addEventListener("resize", recadrer)', self.html)
+        self.assertIn('addEventListener("orientationchange"', self.html)
+        body = extract_function(self.html, "recadrer")
+        self.assertIn("map.invalidateSize()", body)
+        self.assertIn("fitBounds", body)
+        toggle = extract_function(self.html, "basculerTiroir")
+        self.assertIn("recadrer", toggle)
+
+    def test_technical_details_are_collapsed_by_default(self):
+        self.assertIn('<details class="tech" id="technique">', self.html)
+        self.assertNotIn('<details class="tech" id="technique" open>', self.html)
+        bloc = self.html[self.html.index('id="technique"'):]
+        bloc = bloc[:bloc.index("</details>")]
+        for identifiant in ('id="legend"', 'id="meta"', 'id="territorial"'):
+            self.assertIn(identifiant, bloc,
+                          "%s devrait etre sous Details techniques" % identifiant)
+
+    def test_nothing_is_removed_from_the_payload(self):
+        """La strategie, la signature et les diagnostics territoriaux sont
+        deplaces, jamais supprimes."""
+        for champ in ("payload.strategy", "payload.points_signature",
+                      "payload.generated_at", "buildTerritorial"):
+            self.assertIn(champ, self.html)
+
+    def test_the_two_dialog_actions_are_the_requested_ones(self):
+        self.assertIn('id="btn-fullscreen"', self.html)
+        self.assertIn(">Ouvrir en grand<", self.html)
+        self.assertIn(">Exporter<", self.html)
+
+    def test_fullscreen_opens_the_web_app_not_a_fake_one(self):
+        """Le Fullscreen API n'est pas fiable dans l'iframe d'un dialogue :
+        agrandir l'iframe donnerait un faux plein ecran."""
+        body = extract_function(self.html, "ouvrirEnGrand")
+        self.assertIn('window.open(url, "_blank")', body)
+        self.assertIn("getWebAppUrl()", body)
+        self.assertNotIn("requestFullscreen", self.html)
+
+    def test_a_missing_web_app_is_explained_not_a_dead_link(self):
+        body = extract_function(self.html, "ouvrirEnGrand")
+        self.assertIn("n'est pas", body)
+        self.assertIn("encore déployée", body)
+        helper = extract_function(read_code(), "getWebAppUrl")
+        self.assertIn('return url ? String(url) : "";', helper)
+        self.assertIn("catch (e)", helper)
 
 
 class TestMapGeometryWiring(unittest.TestCase):

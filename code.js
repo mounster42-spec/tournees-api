@@ -1354,6 +1354,24 @@ function afficherCarteTournees(result, params, points) {
 const MAP_GEOMETRY_TIMEOUT_MS = 25000;
 
 
+/**
+ * URL de la Web App, ou "" tant qu'aucun déploiement n'existe.
+ *
+ * Appelée depuis le HTML par google.script.run : doit rester au niveau
+ * global. Ne lève jamais — avant le premier déploiement, ScriptApp n'a pas
+ * d'URL à donner, et la carte doit alors le dire plutôt que d'afficher un
+ * lien mort.
+ */
+function getWebAppUrl() {
+  try {
+    const url = ScriptApp.getService().getUrl();
+    return url ? String(url) : "";
+  } catch (e) {
+    return "";
+  }
+}
+
+
 /** Coordonnées [lon, lat] des deux tournées, dans l'ordre EXACT de passage. */
 function _coordsDesRoutes_(payload) {
   const routes = (payload && payload.routes) || [];
