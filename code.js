@@ -1075,6 +1075,162 @@ function afficherCarteTournees(result, params, points) {
 }
 
 
+// =========================
+// GÉOMÉTRIE ROUTIÈRE DE LA CARTE
+// =========================
+// Entièrement séparé de l'optimisation. Ces appels partent APRÈS qu'un run
+// est terminé et mesuré : ils n'entrent ni dans le temps Benchmark, ni dans
+// les appels comptés de l'optimisation, et un échec ne peut pas transformer
+// une optimisation réussie en erreur.
+//
+// La clé ORS n'apparaît nulle part ici : c'est le backend qui la détient,
+// et c'est la seule raison pour laquelle cet aller-retour existe.
+
+const MAP_GEOMETRY_TIMEOUT_MS = 25000;
+
+
+/** Coordonnées [lon, lat] des deux tournées, dans l'ordre EXACT de passage. */
+function _coordsDesRoutes_(payload) {
+  const routes = (payload && payload.routes) || [];
+  const out = [];
+  for (var r = 0; r < routes.length; r++) {
+    const pts = routes[r].points || [];
+    const coords = [];
+    for (var i = 0; i < pts.length; i++) {
+      const lat = Number(pts[i].lat), lon = Number(pts[i].lon);
+      if (isFinite(lat) && isFinite(lon)) coords.push([lon, lat]);
+    }
+    out.push(coords);
+  }
+  return out;
+}
+
+
+/**
+ * Demande au backend le tracé routier des deux tournées.
+ *
+ * Appelée depuis le HTML par google.script.run : doit rester au niveau
+ * global. Ne lève jamais — la carte doit pouvoir garder ses segments
+ * indicatifs sans qu'aucune erreur ne remonte à l'utilisateur.
+ *
+ * @param {string} coordsJson  [[[lon,lat],...],[[lon,lat],...]]
+ * @return {string} JSON de la réponse backend, ou d'un repli local.
+ */
+function getCarteGeometrie(coordsJson) {
+  try {
+    const routes = JSON.parse(coordsJson);
+    if (!Array.isArray(routes) || routes.length !== 2) {
+      return JSON.stringify({geometries: null, status: "invalid_request",
+                             cache_hit: false, calls: 0, elapsed_ms: 0,
+                             fallback_used: true});
+    }
+
+    // Aucun réveil du serveur ici, contrairement à callAPI : la carte est
+    // déjà affichée et ne doit pas attendre un démarrage à froid de Render
+    // pendant une minute. Si le serveur dort, on retombe sur les pointillés.
+    const response = UrlFetchApp.fetch(API_BASE + "/map-geometry", {
+      method: "post",
+      contentType: "application/json",
+      payload: JSON.stringify({routes: routes, profile: "driving-car"}),
+      muteHttpExceptions: true
+    });
+
+    const code = response.getResponseCode();
+    const text = response.getContentText();
+    if (code !== 200 || text.charAt(0) !== "{") {
+      return JSON.stringify({geometries: null, status: "http_" + code,
+                             cache_hit: false, calls: 0, elapsed_ms: 0,
+                             fallback_used: true});
+    }
+    return text;
+
+  } catch (e) {
+    return JSON.stringify({geometries: null, status: "unreachable",
+                           cache_hit: false, calls: 0, elapsed_ms: 0,
+                           fallback_used: true,
+                           error: String(e && e.message ? e.message : e)});
+  }
+}
+
+
+/**
+ * Recopie du payload avec les géométries greffées sur les tournées.
+ *
+ * La géométrie n'est JAMAIS réécrite dans _CarteData : une cellule de
+ * feuille plafonne à 50 000 caractères, et deux tracés routiers la feraient
+ * sauter. Elle ne vit que dans la fenêtre et dans le fichier exporté.
+ */
+function _payloadAvecGeometries_(json, geometries) {
+  if (!geometries) return json;
+  const payload = JSON.parse(json);
+  const routes = payload.routes || [];
+  for (var i = 0; i < routes.length && i < geometries.length; i++) {
+    if (Array.isArray(geometries[i]) && geometries[i].length > 1) {
+      routes[i].geometry = geometries[i];
+    }
+  }
+  return JSON.stringify(payload);
+}
+
+
+/** Nom de fichier déterministe, réduit à une liste de caractères sûrs. */
+function _nomFichierCarte_(signature) {
+  const propre = String(signature || "sans-signature")
+    .replace(/[^A-Za-z0-9_-]/g, "")
+    .slice(0, 40) || "sans-signature";
+  const stamp = Utilities.formatDate(
+    new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd_HH-mm");
+  return "carte_tournees_" + propre + "_" + stamp + ".html";
+}
+
+
+/** Crée le fichier Drive et rend de quoi l'ouvrir. Aucun secret n'y entre. */
+function _deposerCarteSurDrive_(html, signature) {
+  const name = _nomFichierCarte_(signature);
+  const file = DriveApp.createFile(name, html, MimeType.HTML);
+  return {
+    name: name,
+    sizeKb: Math.round(html.length / 1024),
+    url: file.getUrl(),
+    downloadUrl: "https://drive.google.com/uc?export=download&id=" + file.getId()
+  };
+}
+
+
+/**
+ * Export déclenché par le bouton de la fenêtre carte.
+ *
+ * Les géométries déjà chargées dans la fenêtre sont transmises telles
+ * quelles : aucun nouvel appel Directions n'est émis, l'export ne coûte donc
+ * rien de plus que le tracé déjà affiché. Sans géométrie, l'export part en
+ * segments indicatifs plutôt que d'attendre.
+ *
+ * Ne relance aucune optimisation, n'écrit ni dans le Benchmark ni dans
+ * _CarteData.
+ */
+function exporterCarteDepuisDialogue(geometriesJson) {
+  const json = getCarteTourneesPayload();
+  if (!json) return JSON.stringify({error: "Aucune carte enregistrée."});
+
+  var geometries = null;
+  try {
+    geometries = geometriesJson ? JSON.parse(geometriesJson) : null;
+  } catch (e) {
+    geometries = null;
+  }
+
+  const enrichi = _payloadAvecGeometries_(json, geometries);
+  const html = _buildStandaloneCarteHtml_(enrichi);
+
+  var signature = "";
+  try { signature = JSON.parse(json).points_signature || ""; } catch (e) {}
+
+  const info = _deposerCarteSurDrive_(html, signature);
+  info.withGeometry = !!(geometries && geometries.length);
+  return JSON.stringify(info);
+}
+
+
 /**
  * Fabrique une carte AUTONOME : le gabarit HTML avec les données du run
  * injectées dedans. Le fichier obtenu s'ouvre n'importe où — poste local,
@@ -1123,12 +1279,29 @@ function exporterCartePartageable() {
     return;
   }
 
-  const html = _buildStandaloneCarteHtml_(json);
-  const stamp = Utilities.formatDate(
-    new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd_HH-mm");
-  const name = "carte_tournees_" + stamp + ".html";
+  // Tracé routier demandé à la volée. Sur cache backend il ne coûte aucun
+  // appel ; sinon deux au maximum. Un échec n'empêche pas l'export : le
+  // fichier part alors avec ses segments indicatifs.
+  var payload = null;
+  try { payload = JSON.parse(json); } catch (e) {}
+  var geometries = null;
+  var geoStatus = "non_demande";
+  if (payload) {
+    try {
+      const reponse = JSON.parse(
+        getCarteGeometrie(JSON.stringify(_coordsDesRoutes_(payload))));
+      geometries = reponse.geometries;
+      geoStatus = reponse.status;
+    } catch (e) {
+      geoStatus = "erreur";
+    }
+  }
 
-  const file = DriveApp.createFile(name, html, MimeType.HTML);
+  const html = _buildStandaloneCarteHtml_(
+    _payloadAvecGeometries_(json, geometries));
+  const info = _deposerCarteSurDrive_(html,
+    payload ? payload.points_signature : "");
+  const name = info.name;
 
   const esc = function (s) {
     return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
@@ -1139,11 +1312,14 @@ function exporterCartePartageable() {
       '<div style="font-family:Arial,sans-serif;font-size:13px;line-height:1.7;padding:14px">'
     + "<b>Carte exportée.</b><br>"
     + "Fichier : <code>" + esc(name) + "</code>"
-    + " &mdash; " + Math.round(html.length / 1024) + " Ko<br><br>"
-    + '<a href="' + esc(file.getUrl()) + '" target="_blank">Ouvrir dans Drive</a>'
+    + " &mdash; " + info.sizeKb + " Ko<br>"
+    + "Tracé : " + (geometries ? "itinéraires routiers réels"
+                               : "segments indicatifs (" + esc(geoStatus) + ")")
+    + "<br><br>"
+    + '<a href="' + esc(info.url) + '" target="_blank">Ouvrir dans Drive</a>'
     + " &nbsp;|&nbsp; "
-    + '<a href="https://drive.google.com/uc?export=download&id='
-    + esc(file.getId()) + '" target="_blank">Télécharger le fichier</a>'
+    + '<a href="' + esc(info.downloadUrl)
+    + '" target="_blank">Télécharger le fichier</a>'
     + "<br><br>"
     + "<b>Pour partager</b> : dans Drive, clic droit sur le fichier &rsaquo; Partager.<br>"
     + "Il est créé <b>privé</b> : rien n'est publié sans votre décision.<br><br>"
@@ -1269,6 +1445,7 @@ function onOpen() {
   ui.createMenu("Tournées")
     .addItem(MENU_OPTIMISER_LABEL, "runHybridLocalVroomTerritorial")
     .addItem("Afficher la dernière carte", "afficherDerniereCarte")
+    .addItem("Exporter la dernière carte", "exporterCartePartageable")
     .addItem("Ouvrir le benchmark", "ouvrirBenchmark")
     .addSeparator()
     .addSubMenu(

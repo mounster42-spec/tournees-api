@@ -54,7 +54,13 @@ def read_code():
 
 
 def strip_comments(text):
-    """Retire les commentaires // et /* */ sans toucher aux chaines."""
+    """Retire les commentaires // et /* */ sans toucher aux chaines.
+
+    Les chaines sont traitees EN PREMIER, et c'est indispensable : le `//`
+    de "https://..." n'est pas un commentaire. Une fois dans un commentaire
+    on saute jusqu'au bout sans regarder les guillemets, donc l'apostrophe
+    d'un « n'est pas » ne peut pas ouvrir de fausse chaine non plus.
+    """
     out = []
     i = 0
     n = len(text)
@@ -103,6 +109,25 @@ def extract_block(text, opener):
             depth -= 1
         i += 1
     return text[start:i - 1]
+
+
+def extract_function(text, name):
+    """Corps d'une fonction de premier niveau, sur le TEXTE BRUT.
+
+    Volontairement sans analyse lexicale. Compter les accolades demande de
+    reconnaitre chaines, echappements, litteraux d'expression reguliere et
+    commentaires : un mini-analyseur JavaScript ecrit pour des tests se
+    trompe plus souvent que le code qu'il surveille -- il s'est trompe ici
+    meme, sur `!== "{"` puis sur le `//` de "https://".
+
+    Toutes les fonctions de code.js et du gabarit sont formatees pareil :
+    elles se terminent par une accolade en colonne zero. C'est ce reperage,
+    exact et verifiable a l'oeil, qui est utilise.
+    """
+    marker = "\nfunction %s(" % name
+    start = text.index(marker) + 1
+    end = text.index("\n}\n", start)
+    return text[start:end]
 
 
 def split_top_level(block):
@@ -445,12 +470,22 @@ class TestMenuWiring(unittest.TestCase):
             ("sous-menu", "Tournées"),
             ("MENU_OPTIMISER_LABEL", "runHybridLocalVroomTerritorial"),
             ("Afficher la dernière carte", "afficherDerniereCarte"),
+            ("Exporter la dernière carte", "exporterCartePartageable"),
             ("Ouvrir le benchmark", "ouvrirBenchmark"),
             ("separateur", ""),
             ("sous-menu", "Méthodes de comparaison"),
             ("K-means — référence", "runKmeans"),
             ("ORS connecté — comparaison", "runOrtoolsOrsMatrixConnected"),
         ])
+
+    def test_the_export_entry_says_export_because_it_writes_to_drive(self):
+        """Le libellé doit décrire le comportement réel : l'action crée un
+        fichier Drive avant de proposer un lien, elle ne télécharge pas
+        directement."""
+        self.assertIn("DriveApp.createFile", self.code)
+        flat = re.sub(r"\s+", " ", self.code)
+        self.assertIn('.addItem("Exporter la dernière carte", '
+                      '"exporterCartePartageable")', flat)
 
     def test_the_comparison_submenu_holds_exactly_two_methods(self):
         flat = re.sub(r"\s+", " ", self.code)
@@ -472,8 +507,7 @@ class TestMenuWiring(unittest.TestCase):
         # sous-chaine conclurait a tort que le premier est encore au menu.
         wired = set(re.findall(r'\.addItem\([^,]+, "(\w+)"\)', menu))
         for handler in ("runOrtoolsHaversine", "runOrtoolsOrsMatrix",
-                        "exporterCartePartageable", "clearResults",
-                        "resetSelection", "runOptimisation"):
+                        "clearResults", "resetSelection", "runOptimisation"):
             self.assertNotIn(handler, wired,
                              "%s ne devrait plus figurer au menu" % handler)
             self.assertIn("function %s(" % handler, self.code,
@@ -533,8 +567,7 @@ class TestCodeJsIntegrity(unittest.TestCase):
                              "parentheses desequilibrees dans %r" % expression)
 
         for helper in ("_hybridDiag", "_stageMs", "_stagesText", "_cellCounts"):
-            body = extract_block(code, "function %s(" % helper)
-            self.assertIsNotNone(body)
+            self.assertTrue(extract_function(read_code(), helper).strip())
 
     def test_helpers_used_by_the_row_are_defined(self):
         code = strip_comments(read_code())
@@ -587,6 +620,167 @@ class TestCodeJsIntegrity(unittest.TestCase):
         for header in header_list("BENCH_HEADERS_HYBRID"):
             self.assertNotIn("geometry", header)
             self.assertNotIn("map_", header)
+
+
+# =========================================================================
+# CARTE : TRACE ROUTIER ET TELECHARGEMENT
+# =========================================================================
+
+def read_map_html():
+    with open(os.path.join(HERE, "carte_tournee.html"), encoding="utf-8") as h:
+        return h.read()
+
+
+class TestMapDownloadButton(unittest.TestCase):
+
+    def setUp(self):
+        self.html = read_map_html()
+        self.code = strip_comments(read_code())
+
+    def test_the_button_exists_and_is_wired(self):
+        self.assertIn('id="btn-download"', self.html)
+        self.assertIn("Télécharger la carte", self.html)
+        self.assertIn('getElementById("btn-download")', self.html)
+        self.assertIn("telechargerCarte", self.html)
+
+    def test_the_button_is_hidden_outside_apps_script(self):
+        """Un fichier exporte n'a ni serveur ni bouton : tout y est deja."""
+        self.assertIn('id="actions" style="display:none"', self.html)
+        self.assertIn('getElementById("actions").style.display = "block"',
+                      self.html)
+
+    def test_the_download_goes_through_drive_not_a_blob(self):
+        """Le telechargement direct depuis une iframe HtmlService n'est pas
+        garanti : elle est sandboxee. On passe par Drive puis un vrai lien."""
+        self.assertIn("exporterCarteDepuisDialogue", self.html)
+        self.assertNotIn("createObjectURL", self.html)
+        self.assertNotIn("URL.createObjectURL", self.code)
+        self.assertIn("function exporterCarteDepuisDialogue(", self.code)
+
+    def test_the_export_reuses_the_single_standalone_builder(self):
+        """Aucune seconde logique d'export : les deux chemins passent par le
+        meme constructeur."""
+        self.assertEqual(self.code.count("function _buildStandaloneCarteHtml_("), 1)
+        self.assertEqual(self.code.count("_buildStandaloneCarteHtml_("), 3)
+        self.assertEqual(self.code.count("DriveApp.createFile("), 1)
+
+    def test_the_filename_is_deterministic_and_sanitised(self):
+        self.assertIn("function _nomFichierCarte_(", self.code)
+        self.assertIn('"carte_tournees_" + propre + "_" + stamp + ".html"',
+                      self.code)
+        self.assertIn('replace(/[^A-Za-z0-9_-]/g, "")', self.code)
+        self.assertIn('"yyyy-MM-dd_HH-mm"', self.code)
+
+    def test_exporting_launches_no_optimisation(self):
+        export = extract_function(read_code(), "exporterCarteDepuisDialogue")
+        for forbidden in ("callAPI", "runOptimisation", "appendBenchmark",
+                          "getPoints("):
+            self.assertNotIn(forbidden, export)
+
+    def test_exporting_never_writes_the_geometry_back_to_the_sheet(self):
+        """Une cellule plafonne a 50 000 caracteres : deux traces routiers la
+        feraient sauter. La geometrie ne vit que dans la fenetre et le
+        fichier."""
+        export = extract_function(read_code(), "exporterCarteDepuisDialogue")
+        self.assertNotIn("_saveCartePayload_", export)
+        self.assertNotIn("setValue", export)
+        merge = extract_function(read_code(), "_payloadAvecGeometries_")
+        self.assertNotIn("_saveCartePayload_", merge)
+        self.assertNotIn("setValue", merge)
+        # Le seul ecrivain de _CarteData reste la sauvegarde du run.
+        self.assertEqual(self.code.count("function _saveCartePayload_("), 1)
+        self.assertEqual(self.code.count("_saveCartePayload_("), 2)
+
+    def test_the_window_export_sends_the_geometry_it_already_has(self):
+        """Deja chargee, la geometrie repart telle quelle : l'export ne
+        redemande jamais le trace et ne coute aucun appel de plus."""
+        self.assertIn("currentGeometries ? JSON.stringify(currentGeometries)",
+                      self.html)
+        export = extract_function(read_code(), "exporterCarteDepuisDialogue")
+        self.assertNotIn("getCarteGeometrie", export)
+        self.assertNotIn("UrlFetchApp", export)
+
+
+class TestMapGeometryWiring(unittest.TestCase):
+
+    def setUp(self):
+        self.html = read_map_html()
+        self.code = strip_comments(read_code())
+
+    def test_the_map_is_rendered_before_the_geometry_is_requested(self):
+        boot = self.html[self.html.index("function boot()"):]
+        self.assertLess(boot.index("renderCarte(data)"),
+                        boot.index("chargerGeometrie()"))
+
+    def test_a_loading_state_is_shown(self):
+        self.assertIn("Chargement du tracé routier", self.html)
+        self.assertIn("Tracé routier chargé", self.html)
+
+    def test_the_fallback_message_is_explicit(self):
+        self.assertIn("Tracé indicatif", self.html)
+        self.assertIn("serveur injoignable", self.html)
+
+    def test_geometry_draws_a_solid_line_and_its_absence_a_dashed_one(self):
+        draw = self.html[self.html.index("function drawRoute("):]
+        draw = draw[:draw.index("\n}\n")]
+        self.assertIn("route.geometry && route.geometry.length > 1", draw)
+        self.assertIn('dashArray:"7,7"', draw)
+        self.assertIn("tracé indicatif, non routier", draw)
+
+    def test_the_point_order_is_never_recomputed(self):
+        loader = extract_function(self.html, "chargerGeometrie")
+        for forbidden in ("sort(", "reverse(", "splice("):
+            self.assertNotIn(forbidden, loader)
+        self.assertIn("route.push([lon, lat])", loader)
+
+    def test_no_ors_key_anywhere_on_the_client_side(self):
+        """La cle vit uniquement sur Render. C'est la raison d'etre de
+        l'endpoint : sans lui, Apps Script devrait la porter."""
+        for content in (read_code(), self.html):
+            lowered = content.lower()
+            for needle in ("ors_key", "ors_api_key", "api.openrouteservice.org",
+                           "heigit.org", "authorization"):
+                self.assertNotIn(needle, lowered)
+
+    def test_the_client_only_talks_to_our_own_backend(self):
+        """Une seule origine sortante dans tout le fichier : notre backend.
+
+        Le controle porte sur les LITTERAUX d'URL. Une adresse tierce, meme
+        introduite par megarde, apparaitrait ici."""
+        self.assertIn('API_BASE + "/map-geometry"', self.code)
+        literals = set(re.findall(r'"(https?://[^"]*)"', self.code))
+        self.assertEqual(literals, {
+            "https://tournees-api.onrender.com",
+            # Lien AFFICHE a l'utilisateur, pas un appel sortant du script.
+            "https://drive.google.com/uc?export=download&id=",
+        })
+
+    def test_the_geometry_request_carries_exactly_two_routes(self):
+        loader = extract_function(read_code(), "getCarteGeometrie")
+        self.assertIn("routes.length !== 2", loader)
+        self.assertIn('profile: "driving-car"', loader)
+
+    def test_the_geometry_call_never_wakes_the_server(self):
+        """callAPI reveille Render jusqu'a une minute. La carte, elle, est
+        deja affichee : elle ne doit pas faire patienter devant un demarrage
+        a froid, elle retombe sur ses pointilles."""
+        loader = extract_function(read_code(), "getCarteGeometrie")
+        self.assertNotIn("Utilities.sleep", loader)
+        self.assertNotIn("for (var attempt", loader)
+
+    def test_the_geometry_helper_never_throws(self):
+        loader = extract_function(read_code(), "getCarteGeometrie")
+        self.assertIn("catch (e)", loader)
+        self.assertIn("fallback_used: true", loader)
+
+    def test_the_optimisation_path_never_requests_geometry(self):
+        run = extract_function(read_code(), "runOptimisation")
+        self.assertNotIn("getCarteGeometrie", run)
+        self.assertNotIn("map-geometry", run)
+
+    def test_the_benchmark_row_carries_no_geometry(self):
+        for expression in row_expressions():
+            self.assertNotIn("geometr", expression.lower())
 
 
 if __name__ == "__main__":

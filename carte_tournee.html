@@ -23,6 +23,12 @@
          text-align:center;padding:40px 20px;color:#555;font-size:15px;line-height:1.6}
 
   .block{font-size:12px;line-height:1.6}
+  #actions button{font:inherit;padding:5px 12px;cursor:pointer;
+    border:1px solid #999;border-radius:4px;background:#fff}
+  #actions button:disabled{opacity:.5;cursor:default}
+  #geo-status,#download-result{margin-left:10px;color:#555}
+  #geo-status.loaded{color:#1e8449}
+  #geo-status.fallback{color:#b9770e}
   .block h2{margin:0 0 4px;font-size:13px}
   table.sum{border-collapse:collapse;font-size:12px}
   table.sum th,table.sum td{padding:2px 8px 2px 0;text-align:left;white-space:nowrap}
@@ -59,6 +65,13 @@
     <div class="block" id="legend"></div>
     <div class="block toggles" id="toggles"></div>
     <div class="block" id="territorial"></div>
+    <!-- Actions et état du tracé routier. Masqué hors Apps Script : dans un
+         fichier exporté, ni le bouton ni le chargement n'ont de sens. -->
+    <div class="block" id="actions" style="display:none">
+      <button id="btn-download" type="button">Télécharger la carte</button>
+      <span id="geo-status"></span>
+      <span id="download-result"></span>
+    </div>
   </div>
 
   <div id="empty"></div>
@@ -160,6 +173,13 @@ function showMap(){
 /* ---------- carte ---------- */
 
 function initMap(){
+  // Un second rendu (arrivée du tracé routier) réutilise le même conteneur :
+  // sans cette destruction, Leaflet refuse de s'y réinstaller.
+  if (map){ map.remove(); map = null; }
+  layers = [];
+  allLatLngs = [];
+  depotSeen = {};
+  usesRoadGeometry = false;
   map = L.map("map");
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
               {attribution:"&copy; OpenStreetMap", maxZoom:19}).addTo(map);
@@ -510,6 +530,13 @@ function renderCarte(payload){
   }
 
   showMap();
+  // Mémorisé pour le rechargement à l'arrivée du tracé routier et pour
+  // l'export : l'ordre des points n'est jamais recalculé.
+  currentPayload = payload;
+  // Remis à zéro ici et non dans initMap : les points écartés sont collectés
+  // avant ET après la création de la carte. Sans cela, le second rendu
+  // listerait deux fois les mêmes.
+  skipped = [];
 
   // Points écartés en amont par Apps Script (coordonnées absentes du Sheet).
   if (Array.isArray(payload.skipped) && payload.skipped.length){
@@ -553,10 +580,133 @@ function renderCarte(payload){
 }
 
 
+/* ---------- tracé routier et export ---------- */
+
+// Payload du run courant et géométries reçues. Les géométries ne sont JAMAIS
+// renvoyées vers le classeur : une cellule de feuille plafonne à 50 000
+// caractères et deux tracés routiers la feraient sauter. Elles ne vivent
+// que dans cette fenêtre, et dans le fichier exporté.
+var currentPayload = null;
+var currentGeometries = null;
+
+function enAppsScript(){
+  return typeof google !== "undefined" && google.script && google.script.run;
+}
+
+function setGeoStatus(texte, etat){
+  var el = document.getElementById("geo-status");
+  if (!el) return;
+  el.textContent = texte;
+  el.className = etat || "";
+}
+
+/** Recharge la carte avec les tracés routiers reçus. */
+function appliquerGeometries(geometries){
+  if (!currentPayload || !Array.isArray(geometries)) return false;
+  var applique = 0;
+  for (var i = 0; i < currentPayload.routes.length && i < geometries.length; i++){
+    if (Array.isArray(geometries[i]) && geometries[i].length > 1){
+      currentPayload.routes[i].geometry = geometries[i];
+      applique++;
+    }
+  }
+  if (!applique) return false;
+  currentGeometries = geometries;
+  renderCarte(currentPayload);
+  return true;
+}
+
+/**
+ * Demande le tracé routier APRÈS l'affichage.
+ *
+ * La carte est déjà lisible quand cet appel part : si le serveur dort ou
+ * échoue, les segments indicatifs restent en place et rien n'est perdu.
+ */
+function chargerGeometrie(){
+  if (!enAppsScript() || !currentPayload) return;
+
+  var coords = [];
+  for (var r = 0; r < currentPayload.routes.length; r++){
+    var pts = currentPayload.routes[r].points || [];
+    var route = [];
+    for (var i = 0; i < pts.length; i++){
+      var lat = Number(pts[i].lat), lon = Number(pts[i].lon);
+      if (isFinite(lat) && isFinite(lon)) route.push([lon, lat]);
+    }
+    coords.push(route);
+  }
+  if (coords.length !== 2 || coords[0].length < 2 || coords[1].length < 2){
+    setGeoStatus("Tracé routier indisponible pour ce jeu.", "fallback");
+    return;
+  }
+
+  setGeoStatus("Chargement du tracé routier…");
+  google.script.run
+    .withSuccessHandler(function(json){
+      var reponse;
+      try { reponse = JSON.parse(json); }
+      catch (e){ setGeoStatus("Tracé indicatif (réponse illisible).", "fallback"); return; }
+
+      if (appliquerGeometries(reponse.geometries)){
+        setGeoStatus(reponse.status === "partial"
+          ? "Tracé routier partiel : une tournée reste indicative."
+          : "Tracé routier chargé.", "loaded");
+      } else {
+        setGeoStatus("Tracé indicatif (" + (reponse.status || "indisponible") + ").",
+                     "fallback");
+      }
+    })
+    .withFailureHandler(function(){
+      setGeoStatus("Tracé indicatif : serveur injoignable.", "fallback");
+    })
+    .getCarteGeometrie(JSON.stringify(coords));
+}
+
+/**
+ * Export depuis la fenêtre.
+ *
+ * Le téléchargement direct depuis une iframe HtmlService n'est pas garanti :
+ * elle est sandboxée et le navigateur peut bloquer un Blob. On passe donc
+ * par Drive, puis on affiche un vrai lien.
+ *
+ * Les géométries déjà chargées partent avec la demande : l'export ne
+ * redemande jamais le tracé et ne coûte aucun appel externe de plus.
+ */
+function telechargerCarte(){
+  if (!enAppsScript()) return;
+  var bouton = document.getElementById("btn-download");
+  var sortie = document.getElementById("download-result");
+  bouton.disabled = true;
+  sortie.textContent = " Préparation du fichier…";
+
+  google.script.run
+    .withSuccessHandler(function(json){
+      bouton.disabled = false;
+      var info;
+      try { info = JSON.parse(json); }
+      catch (e){ sortie.textContent = " Export illisible."; return; }
+      if (info.error){ sortie.textContent = " " + info.error; return; }
+      sortie.innerHTML =
+        ' <a href="' + esc(info.downloadUrl) + '" target="_blank">Télécharger '
+        + esc(info.name) + "</a> (" + esc(String(info.sizeKb)) + " Ko)"
+        + ' &nbsp;|&nbsp; <a href="' + esc(info.url)
+        + '" target="_blank">Ouvrir dans Drive</a>';
+    })
+    .withFailureHandler(function(err){
+      bouton.disabled = false;
+      sortie.textContent = " Export impossible : "
+        + (err && err.message ? err.message : String(err));
+    })
+    .exporterCarteDepuisDialogue(
+      currentGeometries ? JSON.stringify(currentGeometries) : "");
+}
+
+
 /* ---------- amorçage ---------- */
 
 (function boot(){
-  // 1. Payload déjà posé sur window : utilisé par les tests hors Apps Script.
+  // 1. Payload déjà posé sur window : fichier exporté autonome, et tests hors
+  //    Apps Script. Aucun bouton, aucun appel : tout est déjà dans le fichier.
   if (window.TOURNEES_PAYLOAD){
     renderCarte(window.TOURNEES_PAYLOAD);
     return;
@@ -564,6 +714,10 @@ function renderCarte(payload){
 
   // 2. Contexte Apps Script : on demande au serveur le dernier résultat.
   if (typeof google !== "undefined" && google.script && google.script.run){
+    document.getElementById("actions").style.display = "block";
+    document.getElementById("btn-download")
+            .addEventListener("click", telechargerCarte);
+
     google.script.run
       .withSuccessHandler(function(json){
         if (!json){ showEmpty(); return; }
@@ -571,6 +725,9 @@ function renderCarte(payload){
         try { data = JSON.parse(json); }
         catch (e){ showEmpty("Données de carte illisibles."); return; }
         renderCarte(data);
+        // La carte est AFFICHÉE avant que le tracé routier ne soit demandé :
+        // l'utilisateur ne patiente jamais devant un écran vide.
+        chargerGeometrie();
       })
       .withFailureHandler(function(err){
         showEmpty("Impossible de charger la carte : "
