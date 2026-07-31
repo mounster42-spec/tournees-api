@@ -388,17 +388,22 @@ class TestMenuWiring(unittest.TestCase):
     def setUp(self):
         self.code = strip_comments(read_code())
 
-    def test_the_menu_label_is_exactly_the_one_requested(self):
-        self.assertIn('const EXP_STRATEGY_LABEL = "[EXP] VROOM local + ALNS '
-                      'territoriale";', self.code)
+    def test_the_main_entry_is_optimiser_les_tournees(self):
+        self.assertIn('const MENU_OPTIMISER_LABEL = "Optimiser les tournées";',
+                      self.code)
+        self.assertIn(".addItem(MENU_OPTIMISER_LABEL, "
+                      '"runHybridLocalVroomTerritorial")', self.code)
 
-    def test_the_label_maps_to_the_backend_strategy(self):
+    def test_the_main_entry_maps_to_the_hybrid_strategy(self):
         self.assertIn('const EXP_STRATEGY = "hybrid_local_vroom_territorial";',
                       self.code)
-        self.assertIn(".addItem(EXP_STRATEGY_LABEL, "
-                      '"runHybridLocalVroomTerritorial")', self.code)
         self.assertIn("function runHybridLocalVroomTerritorial() "
                       "{ runOptimisation(EXP_STRATEGY); }", self.code)
+
+    def test_no_exp_prefix_is_visible_anywhere(self):
+        """Le marqueur technique ne doit plus apparaitre a l'utilisateur, ni
+        dans le menu ni dans le champ Mode de la feuille Resultats."""
+        self.assertNotIn("[EXP]", read_code())
 
     def test_the_strategy_id_matches_the_backend_exactly(self):
         match = re.search(r'const EXP_STRATEGY = "([^"]+)";', self.code)
@@ -418,28 +423,83 @@ class TestMenuWiring(unittest.TestCase):
     def test_the_default_strategy_is_unchanged(self):
         self.assertIn('const DEFAULT_STRATEGY = "kmeans";', self.code)
 
-    def test_existing_menu_entries_are_untouched(self):
-        # Espaces normalises : les entrees de menu sont ecrites sur une ou
-        # deux lignes selon leur longueur.
-        flat = re.sub(r"\s+", " ", self.code)
-        for label, handler in (
-                ("K-Means (baseline)", "runKmeans"),
-                ("OR-Tools Haversine", "runOrtoolsHaversine"),
-                ("OR-Tools ORS Matrix", "runOrtoolsOrsMatrix"),
-                ("OR-Tools ORS Matrix — territoires connexes",
-                 "runOrtoolsOrsMatrixConnected")):
-            self.assertIn('.addItem("%s", "%s")' % (label, handler), flat)
+    def test_the_menu_has_exactly_the_expected_entries_in_order(self):
+        """Ordre exact du menu, entree par entree.
 
-    def test_the_experimental_entry_comes_last_in_the_submenu(self):
+        L'ordre porte l'intention : l'usage quotidien d'abord, les methodes de
+        comparaison releguees en dernier."""
         flat = re.sub(r"\s+", " ", self.code)
-        submenu = flat[flat.index('ui.createMenu("Optimiser avec")'):]
-        submenu = submenu[:submenu.index(".addSeparator() .addItem(\"Afficher")]
-        self.assertLess(submenu.index("runOrtoolsOrsMatrixConnected"),
-                        submenu.index("EXP_STRATEGY_LABEL"))
+        menu = flat[flat.index('ui.createMenu("Tournées")'):]
+        menu = menu[:menu.index(".addToUi()")]
+        found = re.findall(r'\.addItem\(([^,]+), "(\w+)"\)|\.addSeparator\(\)'
+                           r'|ui\.createMenu\("([^"]+)"\)', menu)
+        sequence = []
+        for label, handler, submenu in found:
+            if submenu:
+                sequence.append(("sous-menu", submenu))
+            elif label:
+                sequence.append((label.strip().strip('"'), handler))
+            else:
+                sequence.append(("separateur", ""))
+        self.assertEqual(sequence, [
+            ("sous-menu", "Tournées"),
+            ("MENU_OPTIMISER_LABEL", "runHybridLocalVroomTerritorial"),
+            ("Afficher la dernière carte", "afficherDerniereCarte"),
+            ("Ouvrir le benchmark", "ouvrirBenchmark"),
+            ("separateur", ""),
+            ("sous-menu", "Méthodes de comparaison"),
+            ("K-means — référence", "runKmeans"),
+            ("ORS connecté — comparaison", "runOrtoolsOrsMatrixConnected"),
+        ])
+
+    def test_the_comparison_submenu_holds_exactly_two_methods(self):
+        flat = re.sub(r"\s+", " ", self.code)
+        submenu = flat[flat.index('ui.createMenu("Méthodes de comparaison")'):]
+        submenu = submenu[:submenu.index(".addToUi()")]
+        self.assertIn('.addItem("K-means — référence", "runKmeans")', submenu)
+        self.assertIn('.addItem("ORS connecté — comparaison", '
+                      '"runOrtoolsOrsMatrixConnected")', submenu)
+        self.assertEqual(submenu.count(".addItem("), 2)
+
+    def test_technical_methods_left_the_visible_menu_but_keep_their_code(self):
+        """Retirees du menu, jamais supprimees : le backend les accepte encore
+        et elles restent executables depuis l'editeur Apps Script."""
+        flat = re.sub(r"\s+", " ", self.code)
+        menu = flat[flat.index('ui.createMenu("Tournées")'):]
+        menu = menu[:menu.index(".addToUi()")]
+        # Comparaison sur la liste EXACTE des gestionnaires : "runOrtoolsOrsMatrix"
+        # est un prefixe de "runOrtoolsOrsMatrixConnected", une recherche par
+        # sous-chaine conclurait a tort que le premier est encore au menu.
+        wired = set(re.findall(r'\.addItem\([^,]+, "(\w+)"\)', menu))
+        for handler in ("runOrtoolsHaversine", "runOrtoolsOrsMatrix",
+                        "exporterCartePartageable", "clearResults",
+                        "resetSelection", "runOptimisation"):
+            self.assertNotIn(handler, wired,
+                             "%s ne devrait plus figurer au menu" % handler)
+            self.assertIn("function %s(" % handler, self.code,
+                          "%s a ete supprime alors qu'il doit rester" % handler)
+
+    def test_every_menu_handler_exists(self):
+        flat = re.sub(r"\s+", " ", self.code)
+        menu = flat[flat.index('ui.createMenu("Tournées")'):]
+        menu = menu[:menu.index(".addToUi()")]
+        for handler in re.findall(r'\.addItem\([^,]+, "(\w+)"\)', menu):
+            self.assertIn("function %s(" % handler, self.code,
+                          "l'entree de menu appelle %s, qui n'existe pas"
+                          % handler)
+
+    def test_all_backend_strategies_remain_declared(self):
+        """Aucune strategie n'est retiree du backend ni de la validation."""
+        strategies = header_list("STRATEGIES")
+        for name in app.VALID_STRATEGIES:
+            self.assertIn(name, strategies)
+        self.assertEqual(len(app.VALID_STRATEGIES), 5)
 
     def test_the_experimental_strategy_is_labelled_in_the_result_sheet(self):
-        self.assertIn("[EXP] VROOM local conjoint + ALNS territoriale",
-                      self.code)
+        """Le champ Mode de la feuille Resultats nomme la strategie, sans
+        marqueur technique."""
+        self.assertIn("VROOM local conjoint + ALNS territoriale", self.code)
+        self.assertNotIn("[EXP] VROOM local conjoint", self.code)
 
 
 # =========================================================================
@@ -481,6 +541,37 @@ class TestCodeJsIntegrity(unittest.TestCase):
         for helper in ("_hybridDiag", "_stageMs", "_stagesText", "_cellCounts"):
             self.assertIn("function %s(" % helper, code,
                           "%s est utilise sans etre defini" % helper)
+
+    def test_collecte_gs_is_gone_and_leaves_no_orphan_reference(self):
+        """collecte.gs etait une implementation ANTERIEURE et autonome.
+
+        Elle visait une autre structure de classeur -- feuille 'Parametres'
+        sans accent, sorties 'Tournee_J1'/'Tournee_J2' -- appelait ORS
+        directement avec une cle stockee cote script, et declarait son propre
+        onOpen, en collision avec celui de code.js. Aucun de ses symboles
+        n'etait appele par code.js ni par les fichiers HTML."""
+        self.assertFalse(os.path.exists(os.path.join(HERE, "collecte.gs")),
+                         "collecte.gs est de retour dans le depot")
+
+        removed = ("calculerTournee", "configurerCleORS", "effacerTournee",
+                   "initialiserClasseur", "reinitialiserSelection")
+        sources = [os.path.join(HERE, name) for name in
+                   ("code.js", "carte_tournee.html", "app.py",
+                    "local_vroom.py")]
+        for path in sources:
+            if not os.path.isfile(path):
+                continue
+            with open(path, encoding="utf-8") as handle:
+                content = handle.read()
+            for symbol in removed:
+                self.assertNotIn(symbol, content,
+                                 "%s reference encore %s" % (path, symbol))
+
+    def test_only_one_onopen_remains(self):
+        """Deux fichiers .gs partagent le meme espace global : deux onOpen se
+        masquaient l'un l'autre, et un seul menu apparaissait."""
+        code = strip_comments(read_code())
+        self.assertEqual(len(re.findall(r"^function onOpen\(", code, re.M)), 1)
 
     def test_no_flask_route_was_needed(self):
         """L'exposition Sheets ne devait toucher aucune route Flask."""

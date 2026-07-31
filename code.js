@@ -13,7 +13,11 @@ const DEFAULT_STRATEGY = "kmeans";
 // enverrait un autre nom produirait un 501 côté API, et surtout une ligne de
 // Benchmark étiquetée avec une stratégie qui n'a pas tourné.
 const EXP_STRATEGY = "hybrid_local_vroom_territorial";
-const EXP_STRATEGY_LABEL = "[EXP] VROOM local + ALNS territoriale";
+
+// Libellé de l'entrée principale du menu. Elle lance la stratégie hybride :
+// c'est devenu l'usage quotidien, les autres méthodes ne servent plus qu'à
+// la comparaison. Le nom interne de la stratégie, lui, ne change pas.
+const MENU_OPTIMISER_LABEL = "Optimiser les tournées";
 
 // Ligne de la feuille "Paramètres" portant la stratégie
 const STRATEGY_ROW = 6;
@@ -31,7 +35,7 @@ const ENGINE_LABELS = {
   "ortools_ors_matrix_connected":
     "OR-Tools ORS Matrix — territoires connexes (affectation) + Vroom (séquencement)",
   "hybrid_local_vroom_territorial":
-    "[EXP] VROOM local conjoint + ALNS territoriale (affectation + séquencement)"
+    "VROOM local conjoint + ALNS territoriale (affectation + séquencement)"
 };
 
 // Repli si partition_engine est absent (backend antérieur au lot 3).
@@ -42,7 +46,7 @@ const STRATEGY_LABELS = {
   "ortools_ors_matrix_connected":
     "OR-Tools ORS Matrix — territoires connexes (affectation) + Vroom (séquencement)",
   "hybrid_local_vroom_territorial":
-    "[EXP] VROOM local conjoint + ALNS territoriale (affectation + séquencement)"
+    "VROOM local conjoint + ALNS territoriale (affectation + séquencement)"
 };
 
 const BENCH_SHEET = "Benchmark";
@@ -1252,27 +1256,41 @@ function runHybridLocalVroomTerritorial() { runOptimisation(EXP_STRATEGY); }
 // =========================
 // MENU PERSONNALISÉ
 // =========================
+/**
+ * Menu « Tournées ».
+ *
+ * L'usage quotidien est en tête, les méthodes techniques sont reléguées dans
+ * un sous-menu. Les stratégies retirées du menu visible ne sont PAS
+ * supprimées : leurs fonctions restent définies et exécutables depuis
+ * l'éditeur Apps Script, et le backend les accepte toujours.
+ */
 function onOpen() {
   const ui = SpreadsheetApp.getUi();
   ui.createMenu("Tournées")
-    .addItem("Optimisation", "runOptimisation")
-    .addSubMenu(
-      ui.createMenu("Optimiser avec")
-        .addItem("K-Means (baseline)", "runKmeans")
-        .addItem("OR-Tools Haversine", "runOrtoolsHaversine")
-        .addItem("OR-Tools ORS Matrix", "runOrtoolsOrsMatrix")
-        .addItem("OR-Tools ORS Matrix — territoires connexes",
-                 "runOrtoolsOrsMatrixConnected")
-        .addSeparator()
-        .addItem(EXP_STRATEGY_LABEL, "runHybridLocalVroomTerritorial")
-    )
-    .addSeparator()
+    .addItem(MENU_OPTIMISER_LABEL, "runHybridLocalVroomTerritorial")
     .addItem("Afficher la dernière carte", "afficherDerniereCarte")
-    .addItem("Exporter la carte partageable", "exporterCartePartageable")
+    .addItem("Ouvrir le benchmark", "ouvrirBenchmark")
     .addSeparator()
-    .addItem("Effacer tournées", "clearResults")
-    .addItem("Réinitialiser la sélection", "resetSelection")
+    .addSubMenu(
+      ui.createMenu("Méthodes de comparaison")
+        .addItem("K-means — référence", "runKmeans")
+        .addItem("ORS connecté — comparaison", "runOrtoolsOrsMatrixConnected")
+    )
     .addToUi();
+}
+
+
+/**
+ * Ouvre la feuille Benchmark, en la créant au besoin.
+ *
+ * Aucune logique dupliquée : ensureBenchmarkSheet() reste seule responsable
+ * de la création de la feuille et de la migration de ses colonnes. Ce
+ * wrapper n'ajoute que la navigation, qu'une entrée de menu ne sait pas
+ * faire elle-même.
+ */
+function ouvrirBenchmark() {
+  const sheet = ensureBenchmarkSheet();
+  SpreadsheetApp.getActive().setActiveSheet(sheet);
 }
 
 
