@@ -819,6 +819,24 @@ class TestDockerfileGuarantees(unittest.TestCase):
         self.assertIn("VROOM_COMMIT=43dd7d0b8b560431eb555bf335cf4797eb7343c4",
                       self.content)
 
+    def test_the_build_is_sequential_by_default(self):
+        """Un build parallele tuait le builder Render par manque de memoire.
+
+        Le nombre de coeurs visibles ne dit rien de la memoire disponible :
+        `-j$(nproc)` lancait autant de g++ que de coeurs declares, chacun
+        pesant plusieurs centaines de mega-octets sur du C++20 en -O3."""
+        self.assertIn("ARG VROOM_BUILD_JOBS=1", self.content)
+        self.assertIn('-j"${VROOM_BUILD_JOBS}"', self.content)
+        self.assertNotIn("nproc", self.content.split("# Compilation")[0])
+
+    def test_no_unbounded_parallelism_anywhere(self):
+        for line in self.content.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            self.assertNotIn("$(nproc)", stripped)
+            self.assertNotIn("make -j ", stripped)
+
     def test_vroom_is_built_without_routing(self):
         # USE_ROUTING=false : le binaire ne peut structurellement pas appeler
         # un routeur distant.

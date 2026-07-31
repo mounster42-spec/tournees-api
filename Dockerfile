@@ -23,6 +23,15 @@ FROM ${PYTHON_IMAGE} AS vroom-build
 ARG VROOM_VERSION=v1.15.0
 ARG VROOM_COMMIT=43dd7d0b8b560431eb555bf335cf4797eb7343c4
 
+# Compilation SEQUENTIELLE par defaut. `-j$(nproc)` lancait autant de g++ que
+# le builder declare de coeurs ; chaque g++ compilant du C++20 avec -O3 pese
+# plusieurs centaines de mega-octets, et le build Render mourait par manque de
+# memoire avant meme d'installer les dependances Python. Le nombre de coeurs
+# visibles n'a rien a voir avec la memoire disponible : c'est cette memoire
+# qui borne le parallelisme, donc elle seule doit le fixer.
+# Ne relever cette valeur que sur un builder dont on connait la RAM.
+ARG VROOM_BUILD_JOBS=1
+
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         build-essential \
@@ -33,10 +42,17 @@ RUN apt-get update \
 
 WORKDIR /build/vroom
 
+# Les trois sous-modules sont initialises NOMMEMENT, sans --recursive :
+# --recurse-submodules descendait aussi dans les sous-modules de rapidjson et
+# ramenait thirdparty/gtest, dont aucun test n'est execute ici. Les trois
+# chemins ci-dessous sont exactement ceux declares par le .gitmodules de
+# VROOM ; en ajouter ou en retirer ferait echouer la compilation, pas passer
+# silencieusement.
 RUN git clone --branch "${VROOM_VERSION}" --depth 1 \
-        --recurse-submodules --shallow-submodules \
         https://github.com/VROOM-Project/vroom.git . \
  && test "$(git rev-parse HEAD)" = "${VROOM_COMMIT}" \
+ && git submodule update --init --depth 1 \
+        include/cxxopts include/polylineencoder include/rapidjson \
  && echo "vroom ${VROOM_VERSION} @ ${VROOM_COMMIT}"
 
 # USE_ROUTING=false retire du binaire les wrappers OSRM / ORS / Valhalla.
@@ -46,7 +62,7 @@ RUN git clone --branch "${VROOM_VERSION}" --depth 1 \
 # toujours une matrice personnalisee, donc aucun routeur n'est necessaire.
 # libglpk est volontairement absent : il ne sert qu'au mode -c (choose-eta),
 # que nous n'utilisons pas, et il ajouterait une dependance au runtime.
-RUN make -C src -j"$(nproc)" USE_ROUTING=false
+RUN make -C src -j"${VROOM_BUILD_JOBS}" USE_ROUTING=false
 
 # Verification a l'etape de build : un binaire muet ici ne doit jamais
 # atteindre l'image finale.
