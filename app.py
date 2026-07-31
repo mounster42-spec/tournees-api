@@ -6718,6 +6718,301 @@ def optimize():
 
 
 # =========================
+# 7b. GEOMETRIE DE CARTE (endpoint isole)
+# =========================
+# Cette section est ENTIEREMENT separee de l'optimisation. Elle ne partage
+# avec elle ni compteur, ni cache, ni fonction. Elle sert uniquement a tracer
+# sur la carte l'itineraire routier reel, la ou le gabarit affichait jusqu'ici
+# des segments droits en pointilles.
+#
+# Trois regles non negociables :
+#
+# 1. AUCUN appel depuis /optimize. La geometrie est demandee par la carte,
+#    apres coup, une fois l'optimisation terminee et mesuree. Le temps et les
+#    appels du Benchmark n'en voient rien.
+# 2. La cle ORS ne quitte jamais le serveur. C'est la seule raison d'etre de
+#    cet endpoint : Apps Script ne peut pas appeler ORS sans exposer la cle
+#    dans le classeur.
+# 3. Ce n'est PAS un proxy ORS. Aucune URL ne vient du client, le profil est
+#    en liste blanche, le nombre de routes et de coordonnees est borne, et
+#    les distances/durees renvoyees par Directions sont jetees : seule la
+#    trace geometrique est conservee.
+
+ORS_DIRECTIONS_URL = "https://api.heigit.org/openrouteservice/v2/directions/%s/geojson"
+
+# Liste blanche stricte. Un profil hors liste est refuse, jamais substitue.
+MAP_GEOMETRY_PROFILES = ("driving-car",)
+
+MAP_GEOMETRY_ROUTES = 2            # exactement deux tournees, ni une ni trois
+MAP_GEOMETRY_MIN_COORDS = 2        # un trajet a au moins un depart et une arrivee
+MAP_GEOMETRY_MAX_COORDS = 60       # plafond ORS = 50 waypoints ; 32 en usage reel
+MAP_GEOMETRY_MAX_BODY_BYTES = 64 * 1024
+MAP_GEOMETRY_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+MAP_GEOMETRY_TIMEOUT_S = 12        # borne dure : la carte ne doit jamais pendre
+MAP_GEOMETRY_CACHE_MAX = 8
+
+# Compteurs PROPRES a la carte. _API_STATS mesure la consommation de
+# l'optimisation et ne doit pas bouger d'un iota a cause d'un affichage.
+_MAP_STATS = {"requests": 0, "directions": 0, "cache_hits": 0}
+
+_MAP_GEOMETRY_CACHE = {}
+
+
+def _reset_map_stats():
+    _MAP_STATS["requests"] = 0
+    _MAP_STATS["directions"] = 0
+    _MAP_STATS["cache_hits"] = 0
+
+
+def _post_directions(profile, coordinates, headers, timeout):
+    """Unique point de sortie vers ORS Directions (compte les appels carte).
+
+    Le pendant de _post_matrix pour la geometrie, avec son propre compteur :
+    un appel de carte ne doit jamais apparaitre dans les appels d'optimisation.
+    """
+    _MAP_STATS["directions"] += 1
+    return requests.post(
+        ORS_DIRECTIONS_URL % profile,
+        json={"coordinates": coordinates, "geometry_simplify": True},
+        headers=headers,
+        timeout=timeout,
+    )
+
+
+def _map_geometry_cache_key(profile, routes):
+    """Empreinte de l'ORDRE EXACT des coordonnees des deux tournees.
+
+    Deux ouvertures de la meme carte donnent la meme cle, donc zero appel. Un
+    seul point deplace, ou deux points permutes, donnent une cle differente :
+    le cache ne peut pas resservir une trace qui ne correspond plus.
+    """
+    digest = hashlib.md5()
+    digest.update(profile.encode("utf-8"))
+    for route in routes:
+        digest.update(b"|")
+        for lon, lat in route:
+            digest.update(("%.6f,%.6f;" % (lon, lat)).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _map_geometry_cache_get(key):
+    hit = _MAP_GEOMETRY_CACHE.get(key)
+    if hit is not None:
+        _MAP_STATS["cache_hits"] += 1
+    return hit
+
+
+def _map_geometry_cache_put(key, geometries):
+    # Borne dure sur le nombre d'entrees : sans elle, un service qui tourne
+    # des semaines accumulerait une trace par carte ouverte.
+    if len(_MAP_GEOMETRY_CACHE) >= MAP_GEOMETRY_CACHE_MAX:
+        _MAP_GEOMETRY_CACHE.pop(next(iter(_MAP_GEOMETRY_CACHE)))
+    _MAP_GEOMETRY_CACHE[key] = geometries
+
+
+def _validate_map_geometry(data):
+    """Validation stricte de la requete. Retourne (profile, routes, erreur).
+
+    Tout est refuse par defaut : ce qui n'est pas explicitement autorise
+    n'entre pas. C'est ce qui empeche l'endpoint de devenir un proxy.
+    """
+    if not isinstance(data, dict):
+        return None, None, "body must be a JSON object"
+
+    # Profil ABSENT -> defaut. Profil FOURNI -> il doit etre dans la liste
+    # blanche, sans exception. Un `or` sur la valeur substituerait
+    # silencieusement le defaut a une chaine vide, c'est-a-dire accepterait
+    # une entree que l'appelant croit refusee.
+    if "profile" not in data or data["profile"] is None:
+        profile = MAP_GEOMETRY_PROFILES[0]
+    else:
+        profile = data["profile"]
+    if not isinstance(profile, str) or profile not in MAP_GEOMETRY_PROFILES:
+        return None, None, ("profile must be one of %s"
+                            % list(MAP_GEOMETRY_PROFILES))
+
+    routes = data.get("routes")
+    if not isinstance(routes, list) or len(routes) != MAP_GEOMETRY_ROUTES:
+        return None, None, ("routes must be a list of exactly %d route(s)"
+                            % MAP_GEOMETRY_ROUTES)
+
+    cleaned = []
+    for position, route in enumerate(routes):
+        if not isinstance(route, list):
+            return None, None, "route %d must be a list of coordinates" % position
+        if len(route) < MAP_GEOMETRY_MIN_COORDS:
+            return None, None, ("route %d needs at least %d coordinates"
+                                % (position, MAP_GEOMETRY_MIN_COORDS))
+        if len(route) > MAP_GEOMETRY_MAX_COORDS:
+            return None, None, ("route %d exceeds %d coordinates"
+                                % (position, MAP_GEOMETRY_MAX_COORDS))
+        pairs = []
+        for coord in route:
+            if not isinstance(coord, (list, tuple)) or len(coord) != 2:
+                return None, None, ("route %d has a coordinate that is not "
+                                    "a [lon, lat] pair" % position)
+            lon, lat = coord
+            if isinstance(lon, bool) or isinstance(lat, bool):
+                return None, None, "route %d has a boolean coordinate" % position
+            if not isinstance(lon, (int, float)) or not isinstance(lat, (int, float)):
+                return None, None, ("route %d has a non numeric coordinate"
+                                    % position)
+            lon, lat = float(lon), float(lat)
+            if not (math.isfinite(lon) and math.isfinite(lat)):
+                return None, None, ("route %d has a non finite coordinate"
+                                    % position)
+            if not (-180.0 <= lon <= 180.0):
+                return None, None, "route %d has longitude out of range" % position
+            if not (-90.0 <= lat <= 90.0):
+                return None, None, "route %d has latitude out of range" % position
+            pairs.append([lon, lat])
+        cleaned.append(pairs)
+
+    return profile, cleaned, None
+
+
+def _extract_geometry(payload):
+    """Trace [lon, lat] d'une reponse Directions GeoJSON, ou None.
+
+    Les champs distance et duration renvoyes par Directions sont
+    DELIBEREMENT ignores : les metriques du Benchmark viennent de la matrice
+    ORS et ne doivent jamais etre remplacees par celles d'un autre appel.
+    """
+    if not isinstance(payload, dict):
+        return None
+    features = payload.get("features")
+    if not isinstance(features, list) or not features:
+        return None
+    geometry = (features[0] or {}).get("geometry") or {}
+    coords = geometry.get("coordinates")
+    if not isinstance(coords, list) or len(coords) < 2:
+        return None
+    out = []
+    for coord in coords:
+        if not isinstance(coord, (list, tuple)) or len(coord) < 2:
+            return None
+        try:
+            lon, lat = float(coord[0]), float(coord[1])
+        except (TypeError, ValueError):
+            return None
+        if not (math.isfinite(lon) and math.isfinite(lat)):
+            return None
+        out.append([lon, lat])
+    return out
+
+
+def _fetch_route_geometry(profile, coordinates, headers):
+    """Une tournee, un appel Directions. Retourne (geometrie, code_erreur)."""
+    try:
+        response = _post_directions(profile, coordinates, headers,
+                                    MAP_GEOMETRY_TIMEOUT_S)
+    except Exception as exc:                        # noqa: BLE001
+        # Le type d'exception est lu par son NOM plutot que par
+        # `except requests.Timeout`. La classe n'existe pas quand requests est
+        # remplace par un double dans les tests, et une clause introuvable
+        # leverait une AttributeError a la place du repli attendu. Aucun echec
+        # reseau ne doit pouvoir casser l'affichage de la carte.
+        name = type(exc).__name__
+        if "Timeout" in name:
+            return None, "timeout"
+        print("  Carte: Directions injoignable (%s: %s)" % (name, exc), flush=True)
+        return None, "network_error"
+
+    content = response.content or b""
+    if len(content) > MAP_GEOMETRY_MAX_RESPONSE_BYTES:
+        return None, "response_too_large"
+    if response.status_code != 200:
+        print("  Carte: Directions HTTP %d" % response.status_code, flush=True)
+        return None, "http_%d" % response.status_code
+
+    try:
+        payload = response.json()
+    except ValueError:
+        return None, "invalid_response"
+
+    geometry = _extract_geometry(payload)
+    if geometry is None:
+        return None, "invalid_response"
+    return geometry, None
+
+
+@app.route("/map-geometry", methods=["POST"])
+def map_geometry():
+    """Trace routier des deux tournees, pour l'affichage seul.
+
+    Repond TOUJOURS de facon structuree. Un echec ORS n'est pas une erreur
+    de service : la carte doit pouvoir retomber sur ses segments indicatifs
+    sans que rien ne casse. Seule une requete malformee vaut un 400, parce
+    qu'elle signale un defaut d'appelant et non une indisponibilite.
+    """
+    started = time.monotonic()
+    _MAP_STATS["requests"] += 1
+
+    def answer(geometries, status, cache_hit, calls, fallback, code=200,
+               error=None):
+        body = {
+            "geometries": geometries,
+            "status": status,
+            "cache_hit": bool(cache_hit),
+            "calls": int(calls),
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
+            "fallback_used": bool(fallback),
+        }
+        if error:
+            body["error"] = error
+        return jsonify(body), code
+
+    raw = request.get_data(cache=False, as_text=False) or b""
+    if len(raw) > MAP_GEOMETRY_MAX_BODY_BYTES:
+        return answer(None, "body_too_large", False, 0, True, 413,
+                      "body exceeds %d bytes" % MAP_GEOMETRY_MAX_BODY_BYTES)
+
+    try:
+        data = json.loads(raw.decode("utf-8")) if raw else None
+    except (ValueError, UnicodeDecodeError):
+        return answer(None, "validation_error", False, 0, True, 400,
+                      "body is not valid JSON")
+
+    profile, routes, error = _validate_map_geometry(data)
+    if error:
+        return answer(None, "validation_error", False, 0, True, 400, error)
+
+    key = _map_geometry_cache_key(profile, routes)
+    cached = _map_geometry_cache_get(key)
+    if cached is not None:
+        return answer(cached, "cached", True, 0, False)
+
+    if not ORS_KEY:
+        return answer(None, "missing_ors_key", False, 0, True)
+
+    headers = {"Authorization": ORS_KEY, "Content-Type": "application/json"}
+    geometries = []
+    calls_before = _MAP_STATS["directions"]
+    failures = []
+    for position, coordinates in enumerate(routes):
+        geometry, failure = _fetch_route_geometry(profile, coordinates, headers)
+        if failure:
+            failures.append("route %d: %s" % (position, failure))
+            geometries.append(None)
+        else:
+            geometries.append(geometry)
+    calls = _MAP_STATS["directions"] - calls_before
+
+    if all(geometry is None for geometry in geometries):
+        return answer(None, failures[0].split(": ", 1)[-1] if failures else "error",
+                      False, calls, True, 200, "; ".join(failures) or None)
+
+    if any(geometry is None for geometry in geometries):
+        # Une seule tournee tracee : la carte affiche l'autre en pointilles.
+        # Non mis en cache -- un succes partiel ne doit pas se figer.
+        return answer(geometries, "partial", False, calls, True, 200,
+                      "; ".join(failures))
+
+    _map_geometry_cache_put(key, geometries)
+    return answer(geometries, "ok", False, calls, False)
+
+
+# =========================
 # 8. TEST
 # =========================
 @app.route("/")

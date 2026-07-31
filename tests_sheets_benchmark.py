@@ -573,12 +573,20 @@ class TestCodeJsIntegrity(unittest.TestCase):
         code = strip_comments(read_code())
         self.assertEqual(len(re.findall(r"^function onOpen\(", code, re.M)), 1)
 
-    def test_no_flask_route_was_needed(self):
-        """L'exposition Sheets ne devait toucher aucune route Flask."""
+    def test_the_benchmark_columns_needed_no_flask_route(self):
+        """Les 155 colonnes se lisent dans la reponse existante.
+
+        /map-geometry sert uniquement au TRACE de la carte : il n'alimente
+        aucune colonne du Benchmark et n'est jamais appele par /optimize.
+        La liste des routes est verifiee dans tests_map_geometry.py."""
         with open(os.path.join(HERE, "app.py"), encoding="utf-8") as handle:
             backend = handle.read()
-        routes = re.findall(r'@app\.route\("([^"]+)"', backend)
-        self.assertEqual(sorted(routes), ["/", "/healthz", "/optimize"])
+        routes = sorted(re.findall(r'@app\.route\("([^"]+)"', backend))
+        self.assertEqual(routes, ["/", "/healthz", "/map-geometry", "/optimize"])
+        # Aucune colonne du Benchmark ne provient de la geometrie.
+        for header in header_list("BENCH_HEADERS_HYBRID"):
+            self.assertNotIn("geometry", header)
+            self.assertNotIn("map_", header)
 
 
 if __name__ == "__main__":
