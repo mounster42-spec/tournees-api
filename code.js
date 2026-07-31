@@ -4,8 +4,16 @@
 const API_BASE = "https://tournees-api.onrender.com";
 
 const STRATEGIES = ["kmeans", "ortools_haversine", "ortools_ors_matrix",
-                    "ortools_ors_matrix_connected"];
+                    "ortools_ors_matrix_connected",
+                    "hybrid_local_vroom_territorial"];
 const DEFAULT_STRATEGY = "kmeans";
+
+// Identifiant backend de la stratégie expérimentale. Le libellé de menu et
+// cet identifiant sont liés en UN SEUL endroit : une entrée de menu qui
+// enverrait un autre nom produirait un 501 côté API, et surtout une ligne de
+// Benchmark étiquetée avec une stratégie qui n'a pas tourné.
+const EXP_STRATEGY = "hybrid_local_vroom_territorial";
+const EXP_STRATEGY_LABEL = "[EXP] VROOM local + ALNS territoriale";
 
 // Ligne de la feuille "Paramètres" portant la stratégie
 const STRATEGY_ROW = 6;
@@ -21,7 +29,9 @@ const ENGINE_LABELS = {
   "ortools_haversine":  "OR-Tools Haversine (affectation) + Vroom (séquencement)",
   "ortools_ors_matrix": "OR-Tools ORS Matrix (affectation) + Vroom (séquencement)",
   "ortools_ors_matrix_connected":
-    "OR-Tools ORS Matrix — territoires connexes (affectation) + Vroom (séquencement)"
+    "OR-Tools ORS Matrix — territoires connexes (affectation) + Vroom (séquencement)",
+  "hybrid_local_vroom_territorial":
+    "[EXP] VROOM local conjoint + ALNS territoriale (affectation + séquencement)"
 };
 
 // Repli si partition_engine est absent (backend antérieur au lot 3).
@@ -30,7 +40,9 @@ const STRATEGY_LABELS = {
   "ortools_haversine":  "OR-Tools Haversine (affectation) + Vroom (séquencement)",
   "ortools_ors_matrix": "OR-Tools ORS Matrix (affectation) + Vroom (séquencement)",
   "ortools_ors_matrix_connected":
-    "OR-Tools ORS Matrix — territoires connexes (affectation) + Vroom (séquencement)"
+    "OR-Tools ORS Matrix — territoires connexes (affectation) + Vroom (séquencement)",
+  "hybrid_local_vroom_territorial":
+    "[EXP] VROOM local conjoint + ALNS territoriale (affectation + séquencement)"
 };
 
 const BENCH_SHEET = "Benchmark";
@@ -106,11 +118,58 @@ const BENCH_HEADERS_ORSFIRST = [
   "post_optimization_kept", "post_optimization_note"
 ];
 
+// Colonnes de la stratégie expérimentale VROOM local + ALNS territoriale,
+// strictement à la fin. Aucune colonne existante n'est déplacée, renommée ni
+// supprimée : ces colonnes restent vides pour les quatre stratégies de
+// production, qui ne renvoient pas ce bloc de diagnostic.
+//
+// Toutes ces valeurs proviennent de result.ors_matrix.hybrid, déjà présent
+// dans la réponse : aucune route Flask n'a eu besoin de changer.
+const BENCH_HEADERS_HYBRID = [
+  // contexte du run expérimental
+  "hybrid_error", "local_vroom_enabled", "local_vroom_version",
+  // juge commun : la seule mesure qui classe les solutions
+  "common_rescore_duration_s", "common_rescore_distance_m",
+  "common_rescore_matrix_hash",
+  // résultat de chaque bloc
+  "joint_direct_valid", "joint_direct_duration_s", "joint_direct_sizes",
+  "joint_nucleus_attempted", "joint_nucleus_valid",
+  "joint_nucleus_best_duration_s",
+  "route_first_unique", "route_first_best_duration_s",
+  "joint_alns_iterations", "joint_alns_accepted", "joint_alns_seed",
+  "joint_alns_best_duration_s",
+  "joint_finalists", "joint_finalists_local_vroom_solved",
+  "joint_finalists_reused",
+  // sélection finale
+  "joint_solutions_considered", "joint_selected_source",
+  "joint_selected_duration_s", "joint_selected_distance_m",
+  "joint_selected_sizes", "joint_selected_components",
+  "joint_selected_enclaves",
+  // admissibilité territoriale
+  "joint_territorial_level", "joint_territorial_max_enclaves",
+  "joint_territorial_admissible", "joint_territorial_fallback_used",
+  "joint_territorial_fallback_reason", "joint_territorial_thresholds",
+  "joint_territorial_level_counts",
+  // compteur de résolutions locales
+  "local_vroom_solve_count", "local_vroom_attempted", "local_vroom_succeeded",
+  "local_vroom_failed", "local_vroom_timed_out", "local_vroom_reused",
+  "local_vroom_skipped_for_time", "local_vroom_elapsed_ms",
+  "local_vroom_stop_reason", "local_vroom_last_error",
+  // discipline temporelle, un temps par bloc réellement renvoyé
+  "hybrid_stage_matrix_ms", "hybrid_stage_joint_direct_ms",
+  "hybrid_stage_route_first_ms", "hybrid_stage_joint_nucleus_ms",
+  "hybrid_stage_joint_alns_ms", "hybrid_stage_alns_refine_ms",
+  "hybrid_stage_joint_finalists_ms",
+  "hybrid_stage_timings_text", "hybrid_stage_stops_text",
+  "hybrid_total_elapsed_ms", "hybrid_soft_limit_reached"
+];
+
 const BENCH_HEADERS = BENCH_HEADERS_BASE
   .concat(BENCH_HEADERS_D3)
   .concat(BENCH_HEADERS_TERR)
   .concat(BENCH_HEADERS_CONN)
-  .concat(BENCH_HEADERS_ORSFIRST);
+  .concat(BENCH_HEADERS_ORSFIRST)
+  .concat(BENCH_HEADERS_HYBRID);
 
 
 
@@ -597,6 +656,11 @@ function appendBenchmark(result, params, points, extra) {
   const calls = result.api_calls || {};
   const sizes = result.partition_sizes || [];
 
+  // Diagnostic de la stratégie expérimentale. Absent des quatre stratégies de
+  // production : hyb vaut alors {} et toutes ses colonnes restent vides.
+  const hyb = _hybridDiag(result);
+  const stages = hyb.hybrid_stages || [];
+
   // Les champs D-3 sont absents des réponses d'un backend antérieur :
   // _cell() rend "" plutôt que de lever, les runs normaux restent valides.
   const row = [
@@ -704,10 +768,121 @@ function appendBenchmark(result, params, points, extra) {
     _cell(result.connected_matrix_hash),
     _cell(result.connected_per_source_text),
     _cell(result.post_optimization_kept),
-    _cell(result.post_optimization_note)
+    _cell(result.post_optimization_note),
+
+    // --- stratégie expérimentale VROOM local + ALNS territoriale ---
+    // hyb est {} pour les quatre stratégies de production : toutes ces
+    // cellules restent alors vides, aucune ligne existante ne change de forme.
+    _cell(hyb.hybrid_error),
+    _cell(hyb.local_vroom_enabled),
+    _cell(hyb.local_vroom_version),
+    _cell(hyb.common_rescore_duration_s),
+    _cell(hyb.common_rescore_distance_m),
+    _cell(hyb.common_rescore_matrix_hash),
+    _cell(hyb.joint_direct_valid),
+    _cell(hyb.joint_direct_duration_s),
+    _cellList(hyb.joint_direct_sizes),
+    _cell(hyb.joint_nucleus_attempted),
+    _cell(hyb.joint_nucleus_valid),
+    _cell(hyb.joint_nucleus_best_duration_s),
+    _cell(hyb.route_first_unique),
+    _cell(hyb.route_first_best_duration_s),
+    _cell(hyb.joint_alns_iterations),
+    _cell(hyb.joint_alns_accepted),
+    _cell(hyb.joint_alns_seed),
+    _cell(hyb.joint_alns_best_duration_s),
+    _cell(hyb.joint_finalists),
+    _cell(hyb.joint_finalists_local_vroom_solved),
+    _cell(hyb.joint_finalists_reused),
+    _cell(hyb.joint_solutions_considered),
+    _cell(hyb.joint_selected_source),
+    _cell(hyb.joint_selected_duration_s),
+    _cell(hyb.joint_selected_distance_m),
+    _cellList(hyb.joint_selected_sizes),
+    _cellList(hyb.joint_selected_components),
+    _cell(hyb.joint_selected_enclaves),
+    _cell(hyb.joint_territorial_level),
+    _cell(hyb.joint_territorial_max_enclaves),
+    _cell(hyb.joint_territorial_admissible),
+    _cell(hyb.joint_territorial_fallback_used),
+    _cell(hyb.joint_territorial_fallback_reason),
+    _cellList(hyb.joint_territorial_thresholds),
+    _cellCounts(hyb.joint_territorial_level_counts),
+    // Le plafond configuré, à lire en regard de local_vroom_attempted :
+    // "4 lancées sur 4 autorisées" ne se voit pas sans lui.
+    _cell(hyb.local_vroom_max_solves),
+    _cell(hyb.local_vroom_attempted),
+    _cell(hyb.local_vroom_succeeded),
+    _cell(hyb.local_vroom_failed),
+    _cell(hyb.local_vroom_timed_out),
+    _cell(hyb.local_vroom_reused),
+    _cell(hyb.local_vroom_skipped_for_time),
+    _cell(hyb.local_vroom_elapsed_ms),
+    _cell(hyb.local_vroom_stop_reason),
+    _cell(hyb.local_vroom_last_error),
+    _cell(_stageMs(stages, "matrix")),
+    _cell(_stageMs(stages, "joint_direct")),
+    _cell(_stageMs(stages, "route_first")),
+    _cell(_stageMs(stages, "joint_nucleus")),
+    _cell(_stageMs(stages, "joint_alns")),
+    _cell(_stageMs(stages, "alns_refine")),
+    _cell(_stageMs(stages, "joint_finalists")),
+    // Texte de repli : si le backend ajoute un bloc, son temps apparaît ici
+    // au lieu d'être perdu en silence.
+    _stagesText(stages, "elapsed_ms"),
+    _stagesText(stages, "stop_reason"),
+    _cell(hyb.total_elapsed_ms),
+    _cell(hyb.soft_limit_reached)
   ];
 
   sheet.appendRow(row);
+}
+
+
+/**
+ * Bloc de diagnostic de la stratégie expérimentale.
+ *
+ * Il voyage dans result.ors_matrix.hybrid, là où la stratégie connexe passe
+ * par result.ors_matrix.connected. Rend {} pour les quatre stratégies de
+ * production, qui ne produisent pas ce bloc : les colonnes restent vides
+ * plutôt que de lever.
+ */
+function _hybridDiag(result) {
+  const meta = (result && result.ors_matrix) || {};
+  return meta.hybrid || {};
+}
+
+
+/** Temps consommé par un bloc, "" si le bloc n'a pas tourné. */
+function _stageMs(stages, name) {
+  for (var i = 0; i < stages.length; i++) {
+    if (stages[i] && stages[i].stage === name) return stages[i].elapsed_ms;
+  }
+  return "";
+}
+
+
+/** "bloc=valeur;bloc=valeur" sur tous les blocs réellement renvoyés. */
+function _stagesText(stages, field) {
+  const parts = [];
+  for (var i = 0; i < stages.length; i++) {
+    const stage = stages[i];
+    if (!stage || !stage.stage) continue;
+    parts.push(stage.stage + "=" + _cell(stage[field]));
+  }
+  return parts.join(";");
+}
+
+
+/** Sérialise un dictionnaire {clé: nombre} en "clé=valeur;clé=valeur". */
+function _cellCounts(v) {
+  if (v === null || v === undefined) return "";
+  const keys = Object.keys(v).sort();
+  const parts = [];
+  for (var i = 0; i < keys.length; i++) {
+    parts.push(keys[i] + "=" + v[keys[i]]);
+  }
+  return parts.join(";");
 }
 
 
@@ -1067,6 +1242,11 @@ function runOrtoolsHaversine() { runOptimisation("ortools_haversine"); }
 function runOrtoolsOrsMatrix() { runOptimisation("ortools_ors_matrix"); }
 function runOrtoolsOrsMatrixConnected() { runOptimisation("ortools_ors_matrix_connected"); }
 
+// Stratégie expérimentale. L'identifiant vient de la constante, jamais d'une
+// chaîne recopiée : le libellé de menu et le nom envoyé à l'API ne peuvent
+// pas diverger.
+function runHybridLocalVroomTerritorial() { runOptimisation(EXP_STRATEGY); }
+
 
 
 // =========================
@@ -1083,6 +1263,8 @@ function onOpen() {
         .addItem("OR-Tools ORS Matrix", "runOrtoolsOrsMatrix")
         .addItem("OR-Tools ORS Matrix — territoires connexes",
                  "runOrtoolsOrsMatrixConnected")
+        .addSeparator()
+        .addItem(EXP_STRATEGY_LABEL, "runHybridLocalVroomTerritorial")
     )
     .addSeparator()
     .addItem("Afficher la dernière carte", "afficherDerniereCarte")
