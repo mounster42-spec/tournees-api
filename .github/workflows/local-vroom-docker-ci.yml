@@ -683,11 +683,22 @@ jobs:
             echo "ECHEC: la couche locale reference un service distant"; fail=1
           fi
 
-          echo "--- aucun nouvel appel reseau ajoute a app.py ---"
-          # Les deux seuls points de sortie historiques restent les seuls.
-          count=$(grep -c "requests.post(" app.py)
-          echo "appels requests.post dans app.py: $count"
-          test "$count" -eq 2 || { echo "ECHEC: nombre d'appels sortants modifie"; fail=1; }
+          echo "--- points de sortie reseau d'app.py ---"
+          # Verification par DESTINATION plutot que par simple comptage : ce
+          # qui doit rester fige, ce sont les deux sorties de l'OPTIMISATION.
+          # La geometrie de carte a la sienne, comptee a part et jamais
+          # appelee depuis /optimize.
+          for pair in "ORS_VROOM_URL:1" "ORS_MATRIX_URL:1" "ORS_DIRECTIONS_URL:1"; do
+            name="${pair%%:*}"; want="${pair##*:}"
+            got=$(grep -c "requests.post($name" app.py || true)
+            echo "  requests.post($name...) : $got (attendu $want)"
+            test "$got" -eq "$want" \
+              || { echo "ECHEC: sortie reseau $name modifiee"; fail=1; }
+          done
+          total=$(grep -c "requests.post(" app.py)
+          echo "  total requests.post : $total (attendu 3)"
+          test "$total" -eq 3 \
+            || { echo "ECHEC: un appel sortant inattendu a ete ajoute"; fail=1; }
 
           echo "--- experimentation desactivee par defaut ---"
           python -c "

@@ -6771,12 +6771,13 @@ def _post_directions(profile, coordinates, headers, timeout):
     un appel de carte ne doit jamais apparaitre dans les appels d'optimisation.
     """
     _MAP_STATS["directions"] += 1
-    return requests.post(
-        ORS_DIRECTIONS_URL % profile,
-        json={"coordinates": coordinates, "geometry_simplify": True},
-        headers=headers,
-        timeout=timeout,
-    )
+    # URL sur la meme ligne que l'appel, comme _post_matrix et _post_vroom :
+    # le controle statique de la CI verifie chaque sortie reseau par sa
+    # destination, et il lit une ligne a la fois.
+    return requests.post(ORS_DIRECTIONS_URL % profile,
+                         json={"coordinates": coordinates,
+                               "geometry_simplify": True},
+                         headers=headers, timeout=timeout)
 
 
 def _map_geometry_cache_key(profile, routes):
