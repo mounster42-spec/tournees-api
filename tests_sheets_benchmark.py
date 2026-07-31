@@ -623,6 +623,167 @@ class TestCodeJsIntegrity(unittest.TestCase):
 
 
 # =========================================================================
+# SELECTION PAR ID
+# =========================================================================
+
+def read_sidebar():
+    with open(os.path.join(HERE, "selection_par_id.html"), encoding="utf-8") as h:
+        return h.read()
+
+
+class TestSelectionParId(unittest.TestCase):
+
+    def setUp(self):
+        self.code = read_code()
+        self.html = read_sidebar()
+
+    # --- lecture seule des depots ---------------------------------------
+
+    def test_the_depots_are_read_but_never_written(self):
+        """Paramètres!B4 et B5 restent pilotes depuis la feuille.
+
+        La barre laterale les AFFICHE ; les corriger reste une action dans la
+        feuille. Aucune ecriture, dans aucune des fonctions du bloc."""
+        for name in ("getSelectionContexte", "appliquerSelectionParId",
+                     "_lireHorodateurs_", "_resoudreId_", "_parseIds_"):
+            body = extract_function(self.code, name)
+            # setValues() groupe est autorise sur la colonne des cases ;
+            # setValue() unitaire ne l'est nulle part, et c'est la seule
+            # forme qui pourrait atteindre B4 ou B5.
+            self.assertNotIn("setValue(", body,
+                             "%s ecrit une cellule isolee" % name)
+
+        # Les deux cellules sont lues, et uniquement lues.
+        lecture = extract_function(self.code, "getSelectionContexte")
+        self.assertIn("getRange(PARAM_ROW_START, 2).getValue()", lecture)
+        self.assertIn("getRange(PARAM_ROW_END, 2).getValue()", lecture)
+
+    def test_the_depot_fields_are_not_editable(self):
+        """Aucun champ de saisie pour le depart ni pour l'arrivee."""
+        self.assertIn('<div class="depot" id="depart">', self.html)
+        self.assertIn('<div class="depot" id="arrivee">', self.html)
+        # Le seul champ modifiable de la barre laterale est la zone de collage.
+        champs = re.findall(r"<(input|textarea|select)\b", self.html)
+        self.assertEqual(champs, ["textarea"])
+
+    def test_the_sidebar_never_offers_to_fix_the_depots(self):
+        for interdit in ("Corriger le départ", "Modifier Paramètres",
+                         "setDepart", "setArrivee"):
+            self.assertNotIn(interdit, self.html)
+        self.assertIn("se modifient dans la feuille Paramètres", self.html)
+
+    # --- perimetre d'ecriture -------------------------------------------
+
+    def test_the_only_written_range_is_the_checkbox_column(self):
+        """Une seule plage ecrite dans tout le bloc, et c'est la colonne E."""
+        body = extract_function(self.code, "appliquerSelectionParId")
+        ecritures = re.findall(r"\.setValues?\(", body)
+        self.assertEqual(len(ecritures), 1,
+                         "attendu une seule ecriture, trouve %d" % len(ecritures))
+        self.assertIn("getRange(2, HORO_COL_SEL, valeurs.length, 1).setValues(",
+                      body)
+        self.assertIn("const HORO_COL_SEL = 5;", self.code)
+
+    def test_no_coordinate_no_id_no_address_is_ever_written(self):
+        """Les colonnes A a D ne sont jamais ecrites, sous aucune forme."""
+        body = extract_function(self.code, "appliquerSelectionParId")
+        for interdit in ("HORO_COL_ID,", "getRange(2, 1,", "getRange(2, 2,",
+                         "getRange(2, 3,", "getRange(2, 4,", "setFormula",
+                         "insertRows", "deleteRow", "moveRows", ".sort("):
+            self.assertNotIn(interdit, body,
+                             "appliquerSelectionParId touche %s" % interdit)
+
+    def test_nothing_is_written_row_by_row(self):
+        body = extract_function(self.code, "appliquerSelectionParId")
+        self.assertNotIn("setValue(", body)
+        self.assertNotIn("check()", body)
+        self.assertNotIn("uncheck()", body)
+
+    def test_a_blocking_depot_writes_nothing(self):
+        """Chaque sortie bloquante rend le rapport AVANT l'ecriture."""
+        body = extract_function(self.code, "appliquerSelectionParId")
+        ecriture = body.index(".setValues(")
+        for garde in ("if (!startId)", "if (!depart.trouve)",
+                      "if (!arrivee.trouve)", "if (!parsed.uniques.length)",
+                      "if (rapport.inconnus.length || rapport.ambigus.length)"):
+            self.assertLess(body.index(garde), ecriture,
+                            "la garde %s arrive apres l'ecriture" % garde)
+
+    # --- identifiants ----------------------------------------------------
+
+    def test_ids_are_matched_on_both_the_raw_and_displayed_form(self):
+        """getValues rend 12 la ou l'utilisateur voit 0012 : les deux formes
+        sont indexees, donc coller l'une ou l'autre fonctionne."""
+        body = extract_function(self.code, "_lireHorodateurs_")
+        self.assertIn("getDisplayValues()", body)
+        self.assertIn("getValues()", body)
+        self.assertIn("[ligne.idAffiche, ligne.idBrut]", body)
+
+    def test_no_identifier_is_ever_converted(self):
+        body = extract_function(self.code, "_parseIds_")
+        for interdit in ("Number(", "parseInt", "parseFloat", "toUpperCase",
+                         "toLowerCase", "replace(/^0+/"):
+            self.assertNotIn(interdit, body,
+                             "_parseIds_ transforme les identifiants: %s" % interdit)
+        self.assertIn(".trim()", body)
+
+    def test_the_accepted_separators_do_not_include_the_space(self):
+        """Un identifiant peut contenir une espace : elle ne peut pas servir
+        de separateur sans casser des ID reels."""
+        body = extract_function(self.code, "_parseIds_")
+        self.assertIn("split(/[\\n\\r,;\\t]+/)", body)
+        self.assertNotIn("\\s+/", body)
+
+    def test_duplicate_input_is_deduplicated_but_counted(self):
+        body = extract_function(self.code, "_parseIds_")
+        self.assertIn("saisis++", body)
+        self.assertIn("if (vus[id]) continue;", body)
+
+    def test_an_ambiguous_id_is_never_resolved_arbitrarily(self):
+        resolve = extract_function(self.code, "_resoudreId_")
+        self.assertIn("trouve: rows.length === 1", resolve)
+        self.assertIn("ambigu: rows.length > 1", resolve)
+        body = extract_function(self.code, "appliquerSelectionParId")
+        self.assertIn("if (trouve.ambigu) { rapport.ambigus.push", body)
+
+    def test_a_depot_typed_as_a_collection_is_reported_not_swallowed(self):
+        body = extract_function(self.code, "appliquerSelectionParId")
+        self.assertIn("rapport.depotsDansCollectes.push(id)", body)
+
+    # --- cardinalite -----------------------------------------------------
+
+    def test_the_same_depot_is_checked_once(self):
+        """rowsDepots est un objet indexe par numero de ligne : depart et
+        arrivee sur la meme ligne n'y entrent qu'une fois."""
+        body = extract_function(self.code, "appliquerSelectionParId")
+        self.assertIn("rowsDepots[depart.rows[0]] = true;", body)
+        self.assertIn("rowsDepots[arrivee.rows[0]] = true;", body)
+        self.assertIn("Object.keys(rowsDepots).length", body)
+
+    def test_the_total_counts_collections_plus_depots(self):
+        body = extract_function(self.code, "appliquerSelectionParId")
+        self.assertIn("rapport.lignesCochees = rowsCollectes.length + nbDepots;",
+                      body)
+
+    def test_the_success_message_matches_the_requested_wording(self):
+        self.assertIn("Départ et arrivée validés.", self.html)
+        self.assertIn("points de collecte sélectionnés.", self.html)
+        self.assertIn("Vous pouvez maintenant lancer l'optimisation.", self.html)
+
+    def test_the_sidebar_never_starts_an_optimisation(self):
+        for interdit in ("runOptimisation", "callAPI", "appendBenchmark"):
+            self.assertNotIn(interdit, self.html)
+
+    def test_the_sidebar_escapes_what_it_displays(self):
+        """Les libelles viennent du Sheet et peuvent contenir n'importe quoi."""
+        self.assertIn("function esc(", self.html)
+        self.assertIn('replace(/</g,"&lt;")', self.html)
+
+    def test_the_apply_button_is_touch_sized(self):
+        self.assertIn("min-height:44px", self.html)
+
+
+# =========================================================================
 # CARTE : TRACE ROUTIER ET TELECHARGEMENT
 # =========================================================================
 

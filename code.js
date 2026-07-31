@@ -351,6 +351,271 @@ function getPoints() {
 
 
 // =========================
+// SÉLECTION PAR ID
+// =========================
+// Prépare la sélection AVANT l'optimisation. Une seule plage est écrite dans
+// tout ce bloc : Horodateurs!E, la colonne des cases à cocher. Les ID, les
+// adresses et surtout les coordonnées ne sont jamais touchés, pas plus que
+// Paramètres!B4:B5 — les deux dépôts restent pilotés depuis la feuille.
+
+// Nom EXACT du fichier HTML à créer dans l'éditeur Apps Script
+// (Fichier > Nouveau > Fichier HTML), sans l'extension.
+const SELECTION_HTML_FILE = "SelectionParId";
+
+const HORO_SHEET   = "Horodateurs";
+const HORO_COL_ID  = 1;   // A
+const HORO_COL_SEL = 5;   // E
+const PARAM_SHEET  = "Paramètres";
+const PARAM_ROW_START = 4;   // B4 : ID de départ
+const PARAM_ROW_END   = 5;   // B5 : ID d'arrivée
+
+
+/**
+ * Lit la feuille Horodateurs une seule fois.
+ *
+ * Deux lectures de la colonne ID, et c'est délibéré. getValues() rend le type
+ * natif : un ID « 0012 » saisi dans une cellule numérique revient 12, et ne
+ * correspondrait plus à ce que l'utilisateur colle. getDisplayValues() rend
+ * ce qui est AFFICHÉ. On indexe les deux formes, donc les deux fonctionnent,
+ * et un écart entre elles est signalé plutôt que subi.
+ */
+function _lireHorodateurs_() {
+  const sheet = SpreadsheetApp.getActive().getSheetByName(HORO_SHEET);
+  if (!sheet) throw new Error("Feuille « " + HORO_SHEET + " » introuvable.");
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return {sheet: sheet, lastRow: lastRow, lignes: [], index: {}};
+
+  const brut = sheet.getRange(2, 1, lastRow - 1, 4).getValues();
+  const affiche = sheet.getRange(2, HORO_COL_ID, lastRow - 1, 1).getDisplayValues();
+
+  const lignes = [];
+  const index = {};
+  for (var i = 0; i < brut.length; i++) {
+    const ligne = {
+      row: i + 2,
+      idBrut: brut[i][0] === null || brut[i][0] === undefined ? "" : String(brut[i][0]).trim(),
+      idAffiche: String(affiche[i][0] || "").trim(),
+      libelle: String(brut[i][1] || "")
+    };
+    lignes.push(ligne);
+    // Les deux écritures pointent vers la même ligne : coller « 12 » ou
+    // « 0012 » trouve la cellule dans les deux cas.
+    [ligne.idAffiche, ligne.idBrut].forEach(function (cle) {
+      if (!cle) return;
+      if (!index[cle]) index[cle] = [];
+      if (index[cle].indexOf(ligne.row) === -1) index[cle].push(ligne.row);
+    });
+  }
+  return {sheet: sheet, lastRow: lastRow, lignes: lignes, index: index};
+}
+
+
+/** Résout un ID : {trouve, ambigu, rows, libelle}. Ne choisit jamais seul. */
+function _resoudreId_(index, lignes, id) {
+  const rows = index[String(id || "").trim()] || [];
+  const parRow = {};
+  for (var i = 0; i < lignes.length; i++) parRow[lignes[i].row] = lignes[i];
+  return {
+    id: String(id || "").trim(),
+    trouve: rows.length === 1,
+    ambigu: rows.length > 1,
+    rows: rows,
+    libelle: rows.length ? (parRow[rows[0]].libelle || "") : ""
+  };
+}
+
+
+/**
+ * Découpe la saisie libre en ID.
+ *
+ * Séparateurs : retour à la ligne, virgule, point-virgule, tabulation — soit
+ * un collage direct depuis une colonne de tableur. L'espace n'en est PAS un :
+ * un identifiant peut légitimement en contenir. La normalisation se limite au
+ * rognage des bords, au retrait des vides et au dédoublonnage exact. Aucun ID
+ * n'est converti : « 0012 » reste « 0012 ».
+ */
+function _parseIds_(texte) {
+  const bruts = String(texte || "").split(/[\n\r,;\t]+/);
+  const vus = {};
+  const uniques = [];
+  var saisis = 0;
+  for (var i = 0; i < bruts.length; i++) {
+    const id = bruts[i].trim();
+    if (!id) continue;
+    saisis++;
+    if (vus[id]) continue;
+    vus[id] = true;
+    uniques.push(id);
+  }
+  return {saisis: saisis, uniques: uniques};
+}
+
+
+/**
+ * Contexte affiché à l'ouverture de la barre latérale.
+ *
+ * Lecture SEULE de Paramètres!B4 et B5 : la barre latérale montre les deux
+ * dépôts, elle ne les modifie jamais. Les corriger reste une action dans la
+ * feuille Paramètres.
+ */
+function getSelectionContexte() {
+  try {
+    const param = SpreadsheetApp.getActive().getSheetByName(PARAM_SHEET);
+    if (!param) throw new Error("Feuille « " + PARAM_SHEET + " » introuvable.");
+
+    const startId = String(param.getRange(PARAM_ROW_START, 2).getValue() || "").trim();
+    const endId = String(param.getRange(PARAM_ROW_END, 2).getValue() || "").trim();
+
+    const data = _lireHorodateurs_();
+    const depart = _resoudreId_(data.index, data.lignes, startId);
+    const arrivee = endId ? _resoudreId_(data.index, data.lignes, endId) : null;
+
+    return JSON.stringify({
+      depart: {id: startId, libelle: depart.libelle, trouve: depart.trouve,
+               ambigu: depart.ambigu, vide: !startId},
+      arrivee: arrivee
+        ? {id: endId, libelle: arrivee.libelle, trouve: arrivee.trouve,
+           ambigu: arrivee.ambigu, vide: false}
+        : {id: startId, libelle: depart.libelle, trouve: depart.trouve,
+           ambigu: depart.ambigu, vide: true},
+      memeDepot: !endId || endId === startId,
+      nbLignes: data.lignes.length
+    });
+  } catch (e) {
+    return JSON.stringify({erreur: String(e && e.message ? e.message : e)});
+  }
+}
+
+
+/**
+ * Valide la saisie et applique la sélection.
+ *
+ * `appliquer` à false ne fait que rapporter : rien n'est écrit tant que
+ * l'utilisateur n'a pas vu le bilan. Un dépôt vide, introuvable ou ambigu
+ * bloque dans les deux cas.
+ */
+function appliquerSelectionParId(texteCollectes, appliquer) {
+  try {
+    const param = SpreadsheetApp.getActive().getSheetByName(PARAM_SHEET);
+    if (!param) throw new Error("Feuille « " + PARAM_SHEET + " » introuvable.");
+
+    const startId = String(param.getRange(PARAM_ROW_START, 2).getValue() || "").trim();
+    const endIdBrut = String(param.getRange(PARAM_ROW_END, 2).getValue() || "").trim();
+    const endId = endIdBrut || startId;
+
+    const data = _lireHorodateurs_();
+    const rapport = {
+      applique: false, bloquant: null,
+      depart: null, arrivee: null,
+      saisis: 0, uniques: 0, trouves: 0,
+      inconnus: [], ambigus: [], depotsDansCollectes: [],
+      lignesCochees: 0, collectesCochees: 0
+    };
+
+    // --- dépôts : bloquants, et corrigés dans la feuille, pas ici ---
+    if (!startId) {
+      rapport.bloquant = "Aucun point de départ n'est configuré dans "
+        + PARAM_SHEET + "!B" + PARAM_ROW_START
+        + ". Renseignez-le avant de sélectionner les collectes.";
+      return JSON.stringify(rapport);
+    }
+    const depart = _resoudreId_(data.index, data.lignes, startId);
+    const arrivee = _resoudreId_(data.index, data.lignes, endId);
+    rapport.depart = {id: startId, libelle: depart.libelle,
+                      trouve: depart.trouve, ambigu: depart.ambigu};
+    rapport.arrivee = {id: endId, libelle: arrivee.libelle,
+                       trouve: arrivee.trouve, ambigu: arrivee.ambigu};
+
+    if (!depart.trouve) {
+      rapport.bloquant = depart.ambigu
+        ? ("Le point de départ « " + startId + " » correspond à plusieurs lignes ("
+           + depart.rows.join(", ") + "). Corrigez la feuille " + HORO_SHEET + ".")
+        : ("Le point de départ configuré dans " + PARAM_SHEET + "!B" + PARAM_ROW_START
+           + " est introuvable. Corrigez la feuille " + PARAM_SHEET
+           + " avant de sélectionner les collectes.");
+      return JSON.stringify(rapport);
+    }
+    if (!arrivee.trouve) {
+      rapport.bloquant = arrivee.ambigu
+        ? ("Le point d'arrivée « " + endId + " » correspond à plusieurs lignes ("
+           + arrivee.rows.join(", ") + "). Corrigez la feuille " + HORO_SHEET + ".")
+        : ("Le point d'arrivée configuré dans " + PARAM_SHEET + "!B" + PARAM_ROW_END
+           + " est introuvable. Corrigez la feuille " + PARAM_SHEET
+           + " avant de sélectionner les collectes.");
+      return JSON.stringify(rapport);
+    }
+
+    // --- collectes ---
+    const parsed = _parseIds_(texteCollectes);
+    rapport.saisis = parsed.saisis;
+    rapport.uniques = parsed.uniques.length;
+
+    const rowsDepots = {};
+    rowsDepots[depart.rows[0]] = true;
+    rowsDepots[arrivee.rows[0]] = true;   // même ligne si départ = arrivée
+
+    const rowsCollectes = [];
+    for (var i = 0; i < parsed.uniques.length; i++) {
+      const id = parsed.uniques[i];
+      const trouve = _resoudreId_(data.index, data.lignes, id);
+      if (trouve.ambigu) { rapport.ambigus.push({id: id, rows: trouve.rows}); continue; }
+      if (!trouve.trouve) { rapport.inconnus.push(id); continue; }
+      if (rowsDepots[trouve.rows[0]]) { rapport.depotsDansCollectes.push(id); continue; }
+      rapport.trouves++;
+      rowsCollectes.push(trouve.rows[0]);
+    }
+
+    if (!parsed.uniques.length) {
+      rapport.bloquant = "Aucun identifiant de collecte n'a été saisi.";
+      return JSON.stringify(rapport);
+    }
+
+    const nbDepots = Object.keys(rowsDepots).length;
+    rapport.collectesCochees = rowsCollectes.length;
+    rapport.lignesCochees = rowsCollectes.length + nbDepots;
+    rapport.nbDepots = nbDepots;
+
+    if (!appliquer) return JSON.stringify(rapport);
+
+    // Rien n'est appliqué tant qu'un ID reste inconnu ou ambigu : les ignorer
+    // en silence produirait une tournée incomplète sans que personne ne le voie.
+    if (rapport.inconnus.length || rapport.ambigus.length) {
+      rapport.bloquant = "Des identifiants sont inconnus ou ambigus. "
+        + "Corrigez la saisie, ou confirmez explicitement.";
+      return JSON.stringify(rapport);
+    }
+
+    // --- UNIQUE écriture de tout ce bloc ---
+    // Une seule plage, une seule setValues() : la colonne des cases. Aucune
+    // écriture ligne par ligne, aucune autre colonne.
+    const aCocher = {};
+    Object.keys(rowsDepots).forEach(function (r) { aCocher[r] = true; });
+    rowsCollectes.forEach(function (r) { aCocher[r] = true; });
+
+    const valeurs = [];
+    for (var r = 2; r <= data.lastRow; r++) valeurs.push([!!aCocher[r]]);
+    data.sheet.getRange(2, HORO_COL_SEL, valeurs.length, 1).setValues(valeurs);
+
+    rapport.applique = true;
+    return JSON.stringify(rapport);
+
+  } catch (e) {
+    return JSON.stringify({applique: false,
+                           bloquant: String(e && e.message ? e.message : e)});
+  }
+}
+
+
+/** Entrée de menu : ouvre la barre latérale de sélection. */
+function ouvrirSelectionParId() {
+  const html = HtmlService.createHtmlOutputFromFile(SELECTION_HTML_FILE)
+    .setTitle("Sélectionner les points");
+  SpreadsheetApp.getUi().showSidebar(html);
+}
+
+
+// =========================
 // APPEL API
 // =========================
 function callAPI(points, params) {
