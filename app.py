@@ -4813,6 +4813,118 @@ def hybrid_fixed_partition_solve(points, indices, dur_matrix, dist_matrix,
         declared=(solution.get("summary") or {}).get("duration"))
 
 
+# --- ADMISSIBILITE TERRITORIALE -----------------------------------------
+# La connexite 1/1 dit qu'un territoire est d'un seul tenant. Elle ne dit
+# rien de sa FORME : une tournee peut etre connexe et laisser des dizaines
+# de points cernes par l'autre. Sur le terrain, une telle decoupe n'est pas
+# livrable, meme si elle est plus rapide sur le papier.
+#
+# Les enclaves deviennent donc un critere d'ADMISSION et non de departage :
+# une solution de niveau territorial inferieur bat toujours une solution de
+# niveau superieur, quel que soit l'ecart de duree. La regle duree / +30 s /
+# distance ne s'applique qu'ENTRE solutions du meme niveau, ou elle reste
+# exactement celle deja validee.
+
+HYBRID_TERRITORIAL_RATIOS = (0.0, 0.05, 0.10)
+
+
+def territorial_thresholds(n_points, max_ratio=0.15):
+    """Plafonds d'enclaves par niveau, en nombre de points.
+
+    Le dernier niveau vaut le plafond configurable ; les niveaux
+    intermediaires y sont bornes, sinon abaisser le plafond a 2 % laisserait
+    un niveau 2 a 10 % plus permissif que la limite annoncee.
+    """
+    n = max(0, int(n_points))
+    cap = int(math.ceil(float(max_ratio) * n))
+    thresholds = [min(int(math.ceil(ratio * n)), cap)
+                  for ratio in HYBRID_TERRITORIAL_RATIOS]
+    thresholds.append(cap)
+    return thresholds
+
+
+def territorial_level(enclaves, n_points, max_ratio=0.15):
+    """Niveau territorial d'une solution, ou None si elle depasse le plafond.
+
+    Niveau 0 : aucune enclave. Niveau 1 : jusqu'a 5 % des points. Niveau 2 :
+    jusqu'a 10 %. Niveau 3 : jusqu'au plafond configure. Au-dela, la solution
+    est territorialement invalide -- pas mauvaise, INVALIDE.
+    """
+    thresholds = territorial_thresholds(n_points, max_ratio)
+    count = int(enclaves or 0)
+    for level, limit in enumerate(thresholds):
+        if count <= limit:
+            return level
+    return None
+
+
+def select_territorial_solution(solutions, n_points, tie_seconds,
+                                max_ratio=0.15):
+    """Selection FINALE de la strategie hybride.
+
+    Trois filtres successifs, du plus dur au plus fin :
+      1. validite structurelle -- connexite et cardinalite, non negociables ;
+      2. admissibilite territoriale -- le plus petit niveau contenant au
+         moins une solution ;
+      3. la regle deja validee, appliquee A L'INTERIEUR de ce niveau :
+         duree minimale, fenetre exacte de +30 s, distance minimale,
+         frontiere, puis departage deterministe.
+
+    Aucun equilibrage entre T1 et T2 n'intervient a aucune de ces etapes.
+
+    Quand rien n'est admissible, la meilleure solution connue est tout de
+    meme retournee pour ne pas perdre le calcul, mais elle est marquee comme
+    non admissible : elle ne doit jamais etre presentee comme une decoupe
+    territorialement acceptable.
+
+    Retourne (solution, info).
+    """
+    thresholds = territorial_thresholds(n_points, max_ratio)
+    info = {
+        "level": None,
+        "max_enclaves": thresholds[-1],
+        "thresholds": thresholds,
+        "admissible": False,
+        "fallback_used": False,
+        "fallback_reason": "",
+        "level_counts": {},
+    }
+    if not solutions:
+        info["fallback_reason"] = "no_solution"
+        return None, info
+
+    structural = [s for s in solutions
+                  if s.get("connected") and s.get("cardinality_ok")]
+    if not structural:
+        # Aucune solution structurellement valide : on garde la moins mauvaise
+        # plutot que de rendre une erreur apres avoir tout calcule, mais on ne
+        # pretend pas qu'elle est acceptable.
+        info["fallback_used"] = True
+        info["fallback_reason"] = "no_structurally_valid_solution"
+        return select_best_solution(solutions, tie_seconds), info
+
+    by_level = {}
+    for solution in structural:
+        enclaves = (solution.get("boundary") or {}).get("enclave_points", 0)
+        level = territorial_level(enclaves, n_points, max_ratio)
+        if level is None:
+            continue
+        by_level.setdefault(level, []).append(solution)
+    info["level_counts"] = {str(k): len(v) for k, v in sorted(by_level.items())}
+
+    if not by_level:
+        info["fallback_used"] = True
+        info["fallback_reason"] = "enclave_cap_exceeded"
+        return select_best_solution(structural, tie_seconds), info
+
+    best_level = min(by_level)
+    info["level"] = best_level
+    info["admissible"] = True
+    # A l'interieur du niveau, la regle ne change pas d'un iota : c'est
+    # exactement select_best_solution, celle deja validee et partagee.
+    return select_best_solution(by_level[best_level], tie_seconds), info
+
+
 def _hybrid_diagnostics_template():
     """Tous les champs de diagnostic existent des le depart.
 
@@ -4866,6 +4978,14 @@ def _hybrid_diagnostics_template():
         "joint_selected_enclaves": None,
         "joint_selection_window_s": CONNECTED_TIE_SECONDS,
         "joint_solutions_considered": 0,
+        # --- admissibilite territoriale ---
+        "joint_territorial_level": None,
+        "joint_territorial_max_enclaves": None,
+        "joint_territorial_admissible": False,
+        "joint_territorial_fallback_used": False,
+        "joint_territorial_fallback_reason": "",
+        "joint_territorial_thresholds": None,
+        "joint_territorial_level_counts": {},
         # --- discipline temporelle ---
         "hybrid_stages": [],
         "total_elapsed_ms": 0,
@@ -5211,7 +5331,17 @@ def _hybrid_finish(points, indices, start_idx, end_idx, dur_matrix, dist_matrix,
         diag["hybrid_error"] = diag["hybrid_error"] or "no valid solution produced"
         return None, diag["hybrid_error"], meta
 
-    best = select_best_solution(solutions, tie_seconds=CONNECTED_TIE_SECONDS)
+    best, territorial = select_territorial_solution(
+        solutions, len(indices), CONNECTED_TIE_SECONDS, config.max_enclave_ratio)
+    diag.update({
+        "joint_territorial_level": territorial["level"],
+        "joint_territorial_max_enclaves": territorial["max_enclaves"],
+        "joint_territorial_admissible": territorial["admissible"],
+        "joint_territorial_fallback_used": territorial["fallback_used"],
+        "joint_territorial_fallback_reason": territorial["fallback_reason"],
+        "joint_territorial_thresholds": territorial["thresholds"],
+        "joint_territorial_level_counts": territorial["level_counts"],
+    })
     if best is None:
         diag["hybrid_error"] = "no valid solution produced"
         return None, diag["hybrid_error"], meta
@@ -5235,6 +5365,19 @@ def _hybrid_finish(points, indices, start_idx, end_idx, dur_matrix, dist_matrix,
     # jamais si "Vroom public" a ete appele -- il ne l'est jamais ici.
     meta["connected_vroom_ok"] = best["sequencer"] == "vroom_local"
     meta["connected_vroom_error"] = diag["joint_direct_error"] or None
+
+    if territorial["admissible"]:
+        print("  Admissibilite territoriale: niveau %d (plafonds %s enclaves "
+              "pour %d points), repartition par niveau %s"
+              % (territorial["level"], territorial["thresholds"], len(indices),
+                 territorial["level_counts"]), flush=True)
+    else:
+        print("  ATTENTION: aucune solution territorialement admissible (%s). "
+              "L'incumbent retourne est DEGRADE : %d enclaves pour un plafond "
+              "de %d."
+              % (territorial["fallback_reason"],
+                 best["boundary"]["enclave_points"],
+                 territorial["max_enclaves"]), flush=True)
 
     print("  Retenue: %s pts, source=%s, composantes %s, %d enclaves, "
           "duree %.1fmin, %.2fkm, %d solutions comparees, %d solves VROOM "

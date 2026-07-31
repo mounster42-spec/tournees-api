@@ -208,6 +208,22 @@ class TestConfiguration(unittest.TestCase):
         self.assertAlmostEqual(config.min_remaining_to_start_s, 9.0)
         self.assertAlmostEqual(config.route_first_budget_s, 3.0)
         self.assertAlmostEqual(config.alns_budget_s, 6.0)
+        self.assertAlmostEqual(config.max_enclave_ratio, 0.15)
+
+    def test_the_enclave_cap_is_configurable(self):
+        env_backup = dict(os.environ)
+        try:
+            os.environ["LOCAL_VROOM_MAX_ENCLAVE_RATIO"] = "0.05"
+            tight = local_vroom.LocalVroomConfig()
+            os.environ["LOCAL_VROOM_MAX_ENCLAVE_RATIO"] = "hors-sujet"
+            broken = local_vroom.LocalVroomConfig()
+        finally:
+            os.environ.clear()
+            os.environ.update(env_backup)
+        self.assertAlmostEqual(tight.max_enclave_ratio, 0.05)
+        # Une valeur illisible retombe sur le defaut, elle n'ouvre pas le
+        # plafond en grand.
+        self.assertAlmostEqual(broken.max_enclave_ratio, 0.15)
 
     def test_budgets_can_be_raised_to_eight_without_code_change(self):
         env_backup = dict(os.environ)

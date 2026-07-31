@@ -298,6 +298,12 @@ jobs:
                   problems.append("[%s] processus enfants restants" % label)
               if report.get("tmp_after"):
                   problems.append("[%s] fichiers temporaires residuels" % label)
+              # Une decoupe hors plafond ne doit jamais sortir en se
+              # presentant comme acceptable.
+              if not report.get("territorial_admissible") \
+                      and not report.get("territorial_fallback_used"):
+                  problems.append("[%s] non admissible sans marquage de repli"
+                                  % label)
 
           default = cases["default"]
           if default.get("max_solves") != 4:
@@ -316,6 +322,13 @@ jobs:
               problems.append("l'ALNS n'a fait aucune iteration")
           if (default.get("joint_finalists") or 0) < 1:
               problems.append("aucun finaliste construit")
+          if not default.get("territorial_admissible"):
+              problems.append("le resultat par defaut n'est pas territorialement "
+                              "admissible: %s"
+                              % default.get("territorial_fallback_reason"))
+          if default.get("territorial_thresholds") != [0, 3, 6, 9]:
+              problems.append("plafonds territoriaux inattendus pour 60 points: %s"
+                              % default.get("territorial_thresholds"))
 
           max8 = cases["max8"]
           if max8.get("max_solves") != 8:

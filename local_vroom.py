@@ -141,6 +141,16 @@ class LocalVroomConfig:
         self.finalist_solves = _env_int("LOCAL_VROOM_FINALIST_SOLVES", 2, 0, 32)
         self.max_concurrent_solves = _env_int("LOCAL_VROOM_MAX_CONCURRENT_SOLVES", 1, 1, 1)
 
+        # --- admissibilite territoriale ---
+        # Plafond d'enclaves tolerees, en proportion des points de collecte.
+        # La connexite 1/1 garantit qu'un territoire est d'un seul tenant ;
+        # elle n'empeche pas une frontiere en dents de scie ou des dizaines de
+        # points cernes par l'autre tournee. Ce plafond est la borne au-dela
+        # de laquelle une solution n'est plus livrable sur le terrain, quel
+        # que soit son gain de duree.
+        self.max_enclave_ratio = _env_float("LOCAL_VROOM_MAX_ENCLAVE_RATIO",
+                                            0.15, 0.0, 1.0)
+
         # --- reglages du binaire ---
         # -t 1 est impose : sur 0,1 CPU, plusieurs threads VROOM se disputent un
         # dixieme de coeur et degradent le temps de reponse au lieu de l'ameliorer.

@@ -979,6 +979,218 @@ class TestSelection(HybridTestCase):
         self.assertEqual(diag["joint_selection_window_s"], 30.0)
 
 
+def territorial_candidate(duration_s, enclaves, distance_m=10000.0,
+                          label="x", connected=True, cardinality_ok=True):
+    """Solution minimale, suffisante pour la selection."""
+    return {
+        "connected": connected,
+        "cardinality_ok": cardinality_ok,
+        "duration_s": float(duration_s),
+        "distance_m": float(distance_m),
+        "boundary": {"enclave_points": int(enclaves), "cut_edges": 0},
+        "partition_key": (label,),
+        "sequencer": label,
+        "source": label,
+        "route_a": [],
+        "route_b": [],
+    }
+
+
+class TestTerritorialAdmissibility(unittest.TestCase):
+    """L'admissibilite territoriale est une ADMISSION, pas un departage."""
+
+    def test_thresholds_follow_the_declared_ratios(self):
+        # 60 points : 0, ceil(5%)=3, ceil(10%)=6, ceil(15%)=9.
+        self.assertEqual(app.territorial_thresholds(60, 0.15), [0, 3, 6, 9])
+
+    def test_thresholds_round_up(self):
+        # 58 points : 5% = 2,9 -> 3 ; 10% = 5,8 -> 6 ; 15% = 8,7 -> 9.
+        self.assertEqual(app.territorial_thresholds(58, 0.15), [0, 3, 6, 9])
+
+    def test_a_lower_cap_also_lowers_the_intermediate_levels(self):
+        """Sinon un plafond a 2 % laisserait un niveau 2 a 10 %."""
+        thresholds = app.territorial_thresholds(60, 0.02)
+        self.assertEqual(thresholds, [0, 2, 2, 2])
+        self.assertEqual(max(thresholds), thresholds[-1])
+
+    def test_levels_are_assigned_on_the_thresholds(self):
+        self.assertEqual(app.territorial_level(0, 60), 0)
+        self.assertEqual(app.territorial_level(3, 60), 1)
+        self.assertEqual(app.territorial_level(4, 60), 2)
+        self.assertEqual(app.territorial_level(6, 60), 2)
+        self.assertEqual(app.territorial_level(9, 60), 3)
+        # Au-dela du plafond : pas un mauvais niveau, aucun niveau.
+        self.assertIsNone(app.territorial_level(10, 60))
+        self.assertIsNone(app.territorial_level(18, 60))
+
+    def test_zero_enclaves_beats_eighteen_whatever_the_time_gap(self):
+        """Le cas qui motive tout ce garde-fou.
+
+        Quatre minutes d'avance ne rachetent pas dix-huit points cernes par
+        l'autre tournee : cette decoupe n'est pas livrable."""
+        clean = territorial_candidate(4200.0, 0, label="propre")
+        fast = territorial_candidate(3960.0, 18, label="rapide")
+        best, info = app.select_territorial_solution([fast, clean], 60, 30.0)
+        self.assertEqual(best["source"], "propre")
+        self.assertEqual(info["level"], 0)
+        self.assertTrue(info["admissible"])
+        self.assertFalse(info["fallback_used"])
+
+    def test_level_zero_beats_level_one(self):
+        level0 = territorial_candidate(5000.0, 0, label="niveau0")
+        level1 = territorial_candidate(3000.0, 3, label="niveau1")
+        best, info = app.select_territorial_solution([level1, level0], 60, 30.0)
+        self.assertEqual(best["source"], "niveau0")
+        self.assertEqual(info["level"], 0)
+
+    def test_level_one_beats_level_two(self):
+        level1 = territorial_candidate(5000.0, 3, label="niveau1")
+        level2 = territorial_candidate(3000.0, 6, label="niveau2")
+        best, info = app.select_territorial_solution([level2, level1], 60, 30.0)
+        self.assertEqual(best["source"], "niveau1")
+        self.assertEqual(info["level"], 1)
+
+    def test_inside_a_level_the_duration_rule_is_unchanged(self):
+        """La regle deja validee s'applique telle quelle dans le niveau."""
+        slow = territorial_candidate(5000.0, 2, distance_m=1.0, label="lente")
+        fast = territorial_candidate(3000.0, 3, distance_m=99999.0, label="rapide")
+        best, info = app.select_territorial_solution([slow, fast], 60, 30.0)
+        # Memes niveau 1 pour les deux : la duree minimale l'emporte, hors
+        # fenetre, malgre une distance bien pire.
+        self.assertEqual(info["level"], 1)
+        self.assertEqual(best["source"], "rapide")
+
+    def test_inside_a_level_the_thirty_second_window_still_decides_on_distance(self):
+        near = territorial_candidate(3000.0, 1, distance_m=50000.0, label="proche")
+        far = territorial_candidate(3029.0, 1, distance_m=40000.0, label="courte")
+        best, info = app.select_territorial_solution([near, far], 60, 30.0)
+        self.assertEqual(info["level"], 1)
+        self.assertEqual(best["source"], "courte")
+
+    def test_outside_the_window_inside_a_level_distance_does_not_save_it(self):
+        near = territorial_candidate(3000.0, 1, distance_m=50000.0, label="proche")
+        far = territorial_candidate(3031.0, 1, distance_m=10.0, label="courte")
+        best, _ = app.select_territorial_solution([near, far], 60, 30.0)
+        self.assertEqual(best["source"], "proche")
+
+    def test_the_cap_is_configurable(self):
+        candidate = territorial_candidate(3000.0, 12, label="douze")
+        # 12 enclaves sur 60 : au-dela du plafond de 15 % (9).
+        _, strict = app.select_territorial_solution([candidate], 60, 30.0, 0.15)
+        self.assertFalse(strict["admissible"])
+        self.assertTrue(strict["fallback_used"])
+        # Le meme candidat devient admissible avec un plafond a 25 %.
+        best, loose = app.select_territorial_solution([candidate], 60, 30.0, 0.25)
+        self.assertTrue(loose["admissible"])
+        self.assertEqual(loose["max_enclaves"], 15)
+        self.assertEqual(best["source"], "douze")
+
+    def test_an_inadmissible_result_is_returned_but_flagged(self):
+        """Le calcul n'est pas jete, mais il n'est jamais presente comme bon."""
+        bad = territorial_candidate(3000.0, 18, label="degradee")
+        worse = territorial_candidate(4000.0, 25, label="pire")
+        best, info = app.select_territorial_solution([bad, worse], 60, 30.0)
+        self.assertIsNotNone(best)
+        self.assertEqual(best["source"], "degradee")
+        self.assertFalse(info["admissible"])
+        self.assertTrue(info["fallback_used"])
+        self.assertEqual(info["fallback_reason"], "enclave_cap_exceeded")
+        self.assertIsNone(info["level"])
+
+    def test_structurally_invalid_solutions_are_never_admissible(self):
+        disconnected = territorial_candidate(1000.0, 0, label="coupee",
+                                             connected=False)
+        wrong_count = territorial_candidate(1100.0, 0, label="cardinalite",
+                                            cardinality_ok=False)
+        best, info = app.select_territorial_solution(
+            [disconnected, wrong_count], 60, 30.0)
+        self.assertIsNotNone(best)
+        self.assertFalse(info["admissible"])
+        self.assertTrue(info["fallback_used"])
+        self.assertEqual(info["fallback_reason"],
+                         "no_structurally_valid_solution")
+
+    def test_a_connected_solution_beats_a_faster_disconnected_one(self):
+        disconnected = territorial_candidate(1000.0, 0, label="coupee",
+                                             connected=False)
+        connected = territorial_candidate(9000.0, 0, label="connexe")
+        best, info = app.select_territorial_solution(
+            [disconnected, connected], 60, 30.0)
+        self.assertEqual(best["source"], "connexe")
+        self.assertTrue(info["admissible"])
+
+    def test_no_balancing_term_enters_the_territorial_rule(self):
+        """Un ecart de charge entre T1 et T2 ne penalise toujours rien."""
+        balanced = territorial_candidate(4000.0, 0, label="equilibree")
+        balanced["sizes"] = [30, 30]
+        lopsided = territorial_candidate(3900.0, 0, label="desequilibree")
+        lopsided["sizes"] = [30, 30]
+        lopsided["route_a"] = list(range(50))
+        best, _ = app.select_territorial_solution(
+            [balanced, lopsided], 60, 30.0)
+        self.assertEqual(best["source"], "desequilibree")
+
+    def test_empty_input_is_reported_not_crashed(self):
+        best, info = app.select_territorial_solution([], 60, 30.0)
+        self.assertIsNone(best)
+        self.assertFalse(info["admissible"])
+        self.assertEqual(info["fallback_reason"], "no_solution")
+
+    def test_level_counts_are_reported(self):
+        candidates = [territorial_candidate(4000.0, 0, label="a"),
+                      territorial_candidate(3000.0, 2, label="b"),
+                      territorial_candidate(2000.0, 5, label="c")]
+        _, info = app.select_territorial_solution(candidates, 60, 30.0)
+        self.assertEqual(info["level_counts"], {"0": 1, "1": 1, "2": 1})
+        self.assertEqual(info["max_enclaves"], 9)
+
+    def test_the_shared_selection_rule_is_untouched(self):
+        """La strategie connexe utilise select_best_solution sans filtre.
+
+        Le garde-fou territorial est une couche AJOUTEE au-dessus, propre a
+        la strategie experimentale : les strategies de production gardent
+        exactement leur comportement."""
+        fast_but_dirty = territorial_candidate(3000.0, 18, label="rapide")
+        clean = territorial_candidate(4200.0, 0, label="propre")
+        legacy = app.select_best_solution([fast_but_dirty, clean],
+                                          tie_seconds=30.0)
+        self.assertEqual(legacy["source"], "rapide")
+
+
+class TestTerritorialInStrategy(HybridTestCase):
+
+    def test_diagnostics_are_reported(self):
+        _, _, meta = self.run_strategy()
+        diag = meta["hybrid"]
+        for key in ("joint_territorial_level", "joint_territorial_max_enclaves",
+                    "joint_territorial_admissible",
+                    "joint_territorial_fallback_used",
+                    "joint_territorial_fallback_reason"):
+            self.assertIn(key, diag)
+        self.assertTrue(diag["joint_territorial_admissible"])
+        self.assertFalse(diag["joint_territorial_fallback_used"])
+        self.assertEqual(diag["joint_territorial_max_enclaves"], 9)
+
+    def test_the_selected_solution_respects_its_level(self):
+        _, _, meta = self.run_strategy()
+        diag = meta["hybrid"]
+        thresholds = app.territorial_thresholds(self.n_tasks, 0.15)
+        self.assertLessEqual(diag["joint_selected_enclaves"],
+                             thresholds[diag["joint_territorial_level"]])
+
+    def test_a_tighter_cap_is_honoured_by_the_strategy(self):
+        os.environ["LOCAL_VROOM_MAX_ENCLAVE_RATIO"] = "0.0"
+        local_vroom.get_config(refresh=True)
+        _, err, meta = self.run_strategy()
+        diag = meta["hybrid"]
+        self.assertIsNone(err)
+        self.assertEqual(diag["joint_territorial_max_enclaves"], 0)
+        if diag["joint_territorial_admissible"]:
+            self.assertEqual(diag["joint_selected_enclaves"], 0)
+        else:
+            self.assertTrue(diag["joint_territorial_fallback_used"])
+
+
 class TestTimeDiscipline(HybridTestCase):
 
     def test_a_short_global_limit_still_returns_a_valid_result(self):

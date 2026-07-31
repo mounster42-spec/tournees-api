@@ -165,6 +165,16 @@ def run(n_tasks=60):
         "selected_enclaves": diag.get("joint_selected_enclaves"),
         "solutions_considered": diag.get("joint_solutions_considered"),
 
+        # --- admissibilite territoriale ---
+        "territorial_level": diag.get("joint_territorial_level"),
+        "territorial_max_enclaves": diag.get("joint_territorial_max_enclaves"),
+        "territorial_admissible": diag.get("joint_territorial_admissible"),
+        "territorial_fallback_used": diag.get("joint_territorial_fallback_used"),
+        "territorial_fallback_reason":
+            diag.get("joint_territorial_fallback_reason"),
+        "territorial_thresholds": diag.get("joint_territorial_thresholds"),
+        "territorial_level_counts": diag.get("joint_territorial_level_counts"),
+
         # --- discipline temporelle ---
         "stages": diag.get("hybrid_stages"),
         "total_elapsed_ms": diag.get("total_elapsed_ms"),
@@ -205,6 +215,20 @@ def run(n_tasks=60):
             problems.append("depart ou arrivee incorrects")
         if report["components"] != [1, 1]:
             problems.append("territoires non connexes: %s" % report["components"])
+        # Le resultat doit soit respecter son niveau territorial, soit etre
+        # explicitement marque degrade. Ce qui est interdit, c'est de rendre
+        # une decoupe hors plafond en la presentant comme acceptable.
+        if report["territorial_admissible"]:
+            thresholds = report["territorial_thresholds"] or []
+            level = report["territorial_level"]
+            if level is None or level >= len(thresholds):
+                problems.append("niveau territorial incoherent: %s" % level)
+            elif (report["selected_enclaves"] or 0) > thresholds[level]:
+                problems.append(
+                    "%s enclaves pour un niveau %s plafonne a %s"
+                    % (report["selected_enclaves"], level, thresholds[level]))
+        elif not report["territorial_fallback_used"]:
+            problems.append("solution non admissible sans marquage de repli")
     if report["api_vroom_calls"]:
         problems.append("%d appel(s) VROOM public" % report["api_vroom_calls"])
     if report["api_matrix_calls"]:
