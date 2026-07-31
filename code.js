@@ -151,7 +151,7 @@ const BENCH_HEADERS_HYBRID = [
   "joint_territorial_fallback_reason", "joint_territorial_thresholds",
   "joint_territorial_level_counts",
   // compteur de résolutions locales
-  "local_vroom_solve_count", "local_vroom_attempted", "local_vroom_succeeded",
+  "local_vroom_max_solves", "local_vroom_attempted", "local_vroom_succeeded",
   "local_vroom_failed", "local_vroom_timed_out", "local_vroom_reused",
   "local_vroom_skipped_for_time", "local_vroom_elapsed_ms",
   "local_vroom_stop_reason", "local_vroom_last_error",

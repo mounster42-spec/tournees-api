@@ -203,8 +203,9 @@ HYBRID_EXPECTED = [
      "hyb.joint_territorial_fallback_reason"),
     ("joint_territorial_thresholds", "hyb.joint_territorial_thresholds"),
     ("joint_territorial_level_counts", "hyb.joint_territorial_level_counts"),
-    # Colonne DERIVEE : le plafond configure, pour lire "4 lancees sur 4".
-    ("local_vroom_solve_count", "hyb.local_vroom_max_solves"),
+    # Le plafond configure. La colonne porte desormais le nom exact du champ
+    # backend : plus aucun ecart de nommage a retenir de ce cote.
+    ("local_vroom_max_solves", "hyb.local_vroom_max_solves"),
     ("local_vroom_attempted", "hyb.local_vroom_attempted"),
     ("local_vroom_succeeded", "hyb.local_vroom_succeeded"),
     ("local_vroom_failed", "hyb.local_vroom_failed"),
@@ -353,7 +354,7 @@ class TestBackendFields(unittest.TestCase):
                      "joint_direct_duration_s", "joint_nucleus_best_duration_s",
                      "route_first_best_duration_s", "joint_alns_best_duration_s",
                      "local_vroom_attempted", "local_vroom_succeeded",
-                     "local_vroom_elapsed_ms", "local_vroom_solve_count",
+                     "local_vroom_elapsed_ms", "local_vroom_max_solves",
                      "common_rescore_duration_s", "common_rescore_distance_m"):
             self.assertIn(name, headers)
 
