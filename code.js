@@ -19,6 +19,10 @@ const EXP_STRATEGY = "hybrid_local_vroom_territorial";
 // la comparaison. Le nom interne de la stratégie, lui, ne change pas.
 const MENU_OPTIMISER_LABEL = "Optimiser les tournées";
 
+// Titre du menu racine. « Menu tournées » se repère mieux au milieu des
+// menus de Google Sheets, qui sont tous des noms communs.
+const MENU_RACINE_LABEL = "Menu tournées";
+
 // Ligne de la feuille "Paramètres" portant la stratégie
 const STRATEGY_ROW = 6;
 
@@ -2102,7 +2106,7 @@ function onOpen() {
   _memoriserClasseur_();
 
   const ui = SpreadsheetApp.getUi();
-  ui.createMenu("Tournées")
+  ui.createMenu(MENU_RACINE_LABEL)
     .addItem("Sélectionner les points par ID", "ouvrirSelectionParId")
     .addItem(MENU_OPTIMISER_LABEL, "runHybridLocalVroomTerritorial")
     .addItem("Ouvrir la carte", "ouvrirLaCarte")

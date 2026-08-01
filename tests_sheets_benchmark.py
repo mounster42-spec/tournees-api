@@ -413,6 +413,14 @@ class TestMenuWiring(unittest.TestCase):
     def setUp(self):
         self.code = strip_comments(read_code())
 
+    def test_the_root_menu_is_named_menu_tournees(self):
+        """« Menu tournees » se repere mieux parmi les menus de Sheets."""
+        self.assertIn('const MENU_RACINE_LABEL = "Menu tournées";', self.code)
+        self.assertIn("ui.createMenu(MENU_RACINE_LABEL)", self.code)
+        # Le titre passe par la constante, jamais par une chaine recopiee.
+        self.assertNotIn('ui.createMenu("Tournées")', self.code)
+        self.assertNotIn('ui.createMenu("Menu tournées")', self.code)
+
     def test_the_main_entry_is_optimiser_les_tournees(self):
         self.assertIn('const MENU_OPTIMISER_LABEL = "Optimiser les tournées";',
                       self.code)
@@ -454,10 +462,12 @@ class TestMenuWiring(unittest.TestCase):
         L'ordre porte l'intention : les trois gestes d'une journee au premier
         niveau, tout l'outillage technique sous « Outils dev »."""
         flat = re.sub(r"\s+", " ", self.code)
-        menu = flat[flat.index('ui.createMenu("Tournées")'):]
+        menu = flat[flat.index('ui.createMenu(MENU_RACINE_LABEL)'):]
         menu = menu[:menu.index(".addToUi()")]
+        # Le titre racine passe par une constante, les sous-menus par des
+        # chaines : les deux formes doivent etre reconnues.
         found = re.findall(r'\.addItem\(([^,]+), "(\w+)"\)|\.addSeparator\(\)'
-                           r'|ui\.createMenu\("([^"]+)"\)', menu)
+                           r'|ui\.createMenu\("?([^")]+)"?\)', menu)
         sequence = []
         for label, handler, submenu in found:
             if submenu:
@@ -467,7 +477,7 @@ class TestMenuWiring(unittest.TestCase):
             else:
                 sequence.append(("separateur", ""))
         self.assertEqual(sequence, [
-            ("sous-menu", "Tournées"),
+            ("sous-menu", "MENU_RACINE_LABEL"),
             ("Sélectionner les points par ID", "ouvrirSelectionParId"),
             ("MENU_OPTIMISER_LABEL", "runHybridLocalVroomTerritorial"),
             ("Ouvrir la carte", "ouvrirLaCarte"),
@@ -493,7 +503,7 @@ class TestMenuWiring(unittest.TestCase):
         Drive etait le moyen normal de consulter la carte. La fonction, elle,
         reste executable depuis l'editeur Apps Script."""
         flat = re.sub(r"\s+", " ", self.code)
-        menu = flat[flat.index('ui.createMenu("Tournées")'):]
+        menu = flat[flat.index('ui.createMenu(MENU_RACINE_LABEL)'):]
         menu = menu[:menu.index(".addToUi()")]
         self.assertNotIn("Exporter la carte", menu)
         self.assertNotIn("exporterCartePartageable", menu)
@@ -527,7 +537,7 @@ class TestMenuWiring(unittest.TestCase):
         """Retirees du menu, jamais supprimees : le backend les accepte encore
         et elles restent executables depuis l'editeur Apps Script."""
         flat = re.sub(r"\s+", " ", self.code)
-        menu = flat[flat.index('ui.createMenu("Tournées")'):]
+        menu = flat[flat.index('ui.createMenu(MENU_RACINE_LABEL)'):]
         menu = menu[:menu.index(".addToUi()")]
         # Comparaison sur la liste EXACTE des gestionnaires : "runOrtoolsOrsMatrix"
         # est un prefixe de "runOrtoolsOrsMatrixConnected", une recherche par
@@ -542,7 +552,7 @@ class TestMenuWiring(unittest.TestCase):
 
     def test_every_menu_handler_exists(self):
         flat = re.sub(r"\s+", " ", self.code)
-        menu = flat[flat.index('ui.createMenu("Tournées")'):]
+        menu = flat[flat.index('ui.createMenu(MENU_RACINE_LABEL)'):]
         menu = menu[:menu.index(".addToUi()")]
         for handler in re.findall(r'\.addItem\([^,]+, "(\w+)"\)', menu):
             self.assertIn("function %s(" % handler, self.code,
@@ -1192,7 +1202,7 @@ class TestShareableSnapshot(unittest.TestCase):
                              % interdit)
         # Aucune entree de menu ajoutee : le menu reste celui des tournees.
         flat = re.sub(r"\s+", " ", self.code)
-        menu = flat[flat.index('ui.createMenu("Tournées")'):]
+        menu = flat[flat.index('ui.createMenu(MENU_RACINE_LABEL)'):]
         menu = menu[:menu.index(".addToUi()")]
         self.assertNotIn("revoquerPartagesCarte", menu)
 
@@ -1217,7 +1227,7 @@ class TestShareableSnapshot(unittest.TestCase):
     def test_the_drive_preview_url_is_never_offered_as_the_way_to_consult(self):
         partage = extract_function(self.html, "afficherPartage")
         self.assertIn("info.shareUrl", partage)
-        self.assertIn("Télécharger le fichier HTML", partage)
+        self.assertIn("Télécharger l'archive", partage)
         # Le lien /view de Drive, celui qui affiche « Impossible d'ouvrir le
         # fichier », ne figure plus dans la fenetre.
         self.assertNotIn("info.url", partage)
@@ -1274,13 +1284,28 @@ class TestShareableSnapshot(unittest.TestCase):
 
     # --- la fenetre de partage -------------------------------------------
 
-    def test_the_share_panel_offers_the_three_requested_actions(self):
+    def test_the_share_panel_is_reduced_to_what_is_useful(self):
+        """Le besoin est de COPIER un lien, pas de rouvrir la carte.
+
+        « Ouvrir la carte partagee » ne faisait qu'afficher une seconde copie
+        d'une carte deja sous les yeux — et c'est ce clic qui empruntait le
+        parcours defectueux."""
         partage = extract_function(self.html, "afficherPartage")
         self.assertIn("Carte prête à être partagée", partage)
         self.assertIn("Copier le lien", partage)
-        self.assertIn("Ouvrir la carte partagée", partage)
-        self.assertIn("Télécharger le fichier HTML", partage)
+        self.assertIn("Télécharger l'archive", partage)
+        self.assertIn("Fermer", partage)
         self.assertIn("MSG_PARTAGE_AIDE", partage)
+        self.assertNotIn("Ouvrir la carte partagée", self.html)
+        # Le mot « map » ne remplace jamais « carte ».
+        self.assertNotIn("map partag", self.html)
+
+    def test_closing_the_share_panel_leaves_the_map_untouched(self):
+        partage = extract_function(self.html, "afficherPartage")
+        self.assertIn('getElementById("btn-close-share")', partage)
+        self.assertIn('sortie.innerHTML = "";', partage)
+        for interdit in ("renderCarte(", "map.remove", "location."):
+            self.assertNotIn(interdit, partage)
         self.assertIn("Utilisez le lien pour consulter la carte sur ",
                       self.html)
         self.assertIn("ordinateur, iPhone, iPad ou Android.", self.html)
@@ -1432,11 +1457,31 @@ class TestEnlargeDialog(unittest.TestCase):
             self.assertNotIn(interdit, self.body,
                              "l'agrandissement passe par %s" % interdit)
 
-    def test_the_enlarged_size_follows_the_screen_with_a_margin(self):
+    def test_the_enlarged_size_asks_for_the_whole_available_screen(self):
+        """Les anciens plafonds 1500x950 bridaient le dialogue bien en deca
+        de ce que Sheets accorde sur un ecran large. On demande l'ecran, et
+        Google ramene de lui-meme au maximum qu'il autorise."""
         self.assertIn("screen.availWidth", self.body)
         self.assertIn("screen.availHeight", self.body)
-        self.assertIn("1500", self.body)
-        self.assertIn("950", self.body)
+        self.assertIn("(screen.availWidth  || DIALOG_L) - 24", self.body)
+        self.assertIn("(screen.availHeight || DIALOG_H) - 24", self.body)
+        # Plus aucun plafond de notre cote. Sur le corps SANS commentaires :
+        # celui qui explique le retrait doit citer les anciennes valeurs.
+        sans = strip_comments(self.body)
+        for plafond in ("1500", "950", "Math.min("):
+            self.assertNotIn(plafond, sans,
+                             "l'agrandissement est encore bride par %s"
+                             % plafond)
+
+    def test_the_panel_shrinks_so_the_map_takes_the_space(self):
+        """Elargir le panneau irait contre le but de l'agrandissement."""
+        debut = self.html.index("body.agrandi #panel{")
+        regle = self.html[debut:self.html.index("}", debut)]
+        self.assertIn("flex:0 0 250px", regle)
+        # Le panneau normal reste plus large : c'est bien un retrecissement.
+        debut = self.html.index("#panel{flex:0 0 ")
+        normal = self.html[debut:self.html.index("}", debut)]
+        self.assertIn("flex:0 0 290px", normal)
 
     def test_it_restores_the_original_dialog_size(self):
         self.assertIn("var DIALOG_L = 1200, DIALOG_H = 800;", self.html)

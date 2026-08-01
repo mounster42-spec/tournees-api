@@ -111,10 +111,11 @@
     border:1px solid #999;border-radius:6px;margin:8px 0}
   .partage .actions{margin-bottom:8px}
 
-  /* Mode agrandi : le dialogue lui-meme a grandi (google.script.host), la
-     carte prend la place gagnee et le panneau s'elargit juste ce qu'il
-     faut pour rester lisible. */
-  body.agrandi #panel{flex:0 0 330px}
+  /* Mode agrandi : le dialogue lui-meme a grandi (google.script.host). Le
+     panneau RETRECIT au lieu de s'elargir — toute la place gagnee doit
+     aller a la carte, c'est le seul but de l'agrandissement. 250 px reste
+     au-dessus de la largeur du tableau recapitulatif, rien n'est tronque. */
+  body.agrandi #panel{flex:0 0 250px}
   .toggles label{display:inline-flex;align-items:center;min-height:44px;
                  margin-right:12px;cursor:pointer;white-space:nowrap}
   .toggles input[type=checkbox]{width:20px;height:20px;margin-right:6px}
@@ -913,10 +914,13 @@ function basculerAgrandissement(){
   var largeur, hauteur;
 
   if (vise){
-    // Une marge est laissée à l'interface Sheets : un dialogue collé aux
-    // bords masquerait ses propres commandes.
-    largeur = Math.min((screen.availWidth  || DIALOG_L) - 80,  1500);
-    hauteur = Math.min((screen.availHeight || DIALOG_H) - 120, 950);
+    // On demande la surface de l'ecran, moins un liseré. Aucun plafond de
+    // notre part : les anciens 1500x950 bridaient le dialogue bien en deçà
+    // de ce que Sheets accorde sur un ecran large. Google ramène de
+    // lui-même la valeur au maximum qu'il autorise, et c'est exactement le
+    // maximum reellement disponible que l'on veut.
+    largeur = (screen.availWidth  || DIALOG_L) - 24;
+    hauteur = (screen.availHeight || DIALOG_H) - 24;
   } else {
     largeur = DIALOG_L;
     hauteur = DIALOG_H;
@@ -997,24 +1001,29 @@ function afficherPartage(info){
   var html = "<div class='partage'><b>Carte prête à être partagée</b>";
 
   if (info.shareUrl){
+    // Aucun bouton n'ouvre la carte partagée depuis ici : elle est déjà
+    // sous les yeux, et une seconde copie n'apporterait rien. Le besoin est
+    // de COPIER le lien pour l'envoyer.
     html += "<input id='share-url' type='text' readonly value=\""
           + esc(info.shareUrl) + "\">"
           + "<div class='actions'>"
           + "<button type='button' id='btn-copy' class='primaire'>"
           + "Copier le lien</button>"
-          + "<a class='bouton' href='" + esc(info.shareUrl)
-          + "' target='_blank' rel='noopener'>Ouvrir la carte partagée</a>"
+          + "<a class='bouton' href='" + esc(info.downloadUrl)
+          + "' target='_blank' rel='noopener'>Télécharger l'archive</a>"
+          + "<button type='button' id='btn-close-share'>Fermer</button>"
           + "</div><div id='copy-state' class='meta'></div>";
   } else {
     html += "<div class='warn'>"
           + esc(info.shareError || "Lien de partage indisponible.")
-          + "</div>";
+          + "</div>"
+          + "<div class='actions'><a class='bouton' href='"
+          + esc(info.downloadUrl) + "' target='_blank' rel='noopener'>"
+          + "Télécharger l'archive</a>"
+          + "<button type='button' id='btn-close-share'>Fermer</button></div>";
   }
 
-  html += "<div class='actions'><a class='bouton' href='"
-        + esc(info.downloadUrl) + "' target='_blank' rel='noopener'>"
-        + "Télécharger le fichier HTML</a></div>"
-        + "<div class='meta'>" + esc(info.name) + " — "
+  html += "<div class='meta'>" + esc(info.name) + " — "
         + esc(String(info.sizeKb)) + " Ko<br>" + esc(MSG_PARTAGE_AIDE)
         + "</div></div>";
 
@@ -1022,6 +1031,11 @@ function afficherPartage(info){
 
   var copier = document.getElementById("btn-copy");
   if (copier) copier.addEventListener("click", copierLien);
+
+  var fermer = document.getElementById("btn-close-share");
+  if (fermer) fermer.addEventListener("click", function(){
+    sortie.innerHTML = "";
+  });
 }
 
 
