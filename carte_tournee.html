@@ -90,6 +90,27 @@
   .actions button.primaire:hover{background:#0842a0;color:#ffffff}
   .actions button:disabled{opacity:.5;cursor:default}
 
+  /* Liens presentes comme des boutons : memes regles, meme contraste, meme
+     hauteur tactile. Un lien doit ouvrir un onglet, un bouton non — d'ou
+     les deux formes cote a cote. */
+  .actions a.bouton{font:inherit;font-weight:600;min-height:44px;
+    padding:0 16px;cursor:pointer;display:inline-flex;align-items:center;
+    justify-content:center;
+    border:1px solid #0b57d0;border-radius:6px;
+    background:#ffffff;color:#0b57d0;text-decoration:none;
+    flex:1 1 auto;max-width:100%;box-sizing:border-box;
+    white-space:nowrap;overflow:visible}
+  .actions a.bouton:hover{background:#eaf1fb;color:#0b57d0}
+  .actions a.bouton:focus{outline:3px solid #0b57d0;outline-offset:2px}
+
+  /* Bloc de partage : le lien doit etre visible et selectionnable, y compris
+     si la copie automatique est refusee par le navigateur. */
+  .partage{margin-top:10px}
+  .partage input{width:100%;box-sizing:border-box;min-height:44px;
+    padding:0 10px;font:inherit;font-size:12px;color:#222;background:#fff;
+    border:1px solid #999;border-radius:6px;margin:8px 0}
+  .partage .actions{margin-bottom:8px}
+
   /* Mode agrandi : le dialogue lui-meme a grandi (google.script.host), la
      carte prend la place gagnee et le panneau s'elargit juste ce qu'il
      faut pour rester lisible. */
@@ -153,12 +174,12 @@
       <div class="actions">
         <button id="btn-zoom" type="button" class="primaire"
                 aria-pressed="false">Agrandir</button>
-        <button id="btn-download" type="button">Exporter</button>
+        <button id="btn-download" type="button">Exporter et partager</button>
       </div>
       <div id="geo-status"></div>
       <div id="download-result"></div>
-      <div class="meta" id="export-hint">L'export crée une archive HTML dans
-        Google Drive.</div>
+      <div class="meta" id="export-hint">Le partage produit un lien à envoyer
+        et une archive HTML dans Google Drive.</div>
     </div>
 
     <details class="tech" id="technique">
@@ -193,6 +214,10 @@ var FALLBACK_COLORS = ["#1f5fa9", "#d35400"];
 var MSG_EMPTY = "Aucune tournée récente disponible. Lancez une optimisation.";
 
 var MSG_AUCUNE_TOURNEE = "Sélectionnez au moins une tournée.";
+
+var MSG_PARTAGE_AIDE = "Utilisez le lien pour consulter la carte sur "
+  + "ordinateur, iPhone, iPad ou Android. Le fichier HTML sert "
+  + "principalement d'archive.";
 
 
 /* ---------- utilitaires ---------- */
@@ -949,11 +974,7 @@ function telechargerCarte(){
       try { info = JSON.parse(json); }
       catch (e){ sortie.textContent = " Export illisible."; return; }
       if (info.error){ sortie.textContent = " " + info.error; return; }
-      sortie.innerHTML =
-        ' <a href="' + esc(info.downloadUrl) + '" target="_blank">Télécharger '
-        + esc(info.name) + "</a> (" + esc(String(info.sizeKb)) + " Ko)"
-        + ' &nbsp;|&nbsp; <a href="' + esc(info.url)
-        + '" target="_blank">Ouvrir dans Drive</a>';
+      afficherPartage(info);
     })
     .withFailureHandler(function(err){
       bouton.disabled = false;
@@ -962,6 +983,73 @@ function telechargerCarte(){
     })
     .exporterCarteDepuisDialogue(
       currentGeometries ? JSON.stringify(currentGeometries) : "");
+}
+
+
+/**
+ * Résultat du partage : un lien d'abord, le fichier ensuite.
+ *
+ * Le lien est la voie de consultation, sur ordinateur comme sur téléphone.
+ * Le fichier reste une archive : Drive ne l'affiche pas, il le télécharge.
+ */
+function afficherPartage(info){
+  var sortie = document.getElementById("download-result");
+  var html = "<div class='partage'><b>Carte prête à être partagée</b>";
+
+  if (info.shareUrl){
+    html += "<input id='share-url' type='text' readonly value=\""
+          + esc(info.shareUrl) + "\">"
+          + "<div class='actions'>"
+          + "<button type='button' id='btn-copy' class='primaire'>"
+          + "Copier le lien</button>"
+          + "<a class='bouton' href='" + esc(info.shareUrl)
+          + "' target='_blank' rel='noopener'>Ouvrir la carte partagée</a>"
+          + "</div><div id='copy-state' class='meta'></div>";
+  } else {
+    html += "<div class='warn'>"
+          + esc(info.shareError || "Lien de partage indisponible.")
+          + "</div>";
+  }
+
+  html += "<div class='actions'><a class='bouton' href='"
+        + esc(info.downloadUrl) + "' target='_blank' rel='noopener'>"
+        + "Télécharger le fichier HTML</a></div>"
+        + "<div class='meta'>" + esc(info.name) + " — "
+        + esc(String(info.sizeKb)) + " Ko<br>" + esc(MSG_PARTAGE_AIDE)
+        + "</div></div>";
+
+  sortie.innerHTML = html;
+
+  var copier = document.getElementById("btn-copy");
+  if (copier) copier.addEventListener("click", copierLien);
+}
+
+
+/**
+ * Copie le lien, ou à défaut le sélectionne.
+ *
+ * L'iframe d'un dialogue Apps Script est sandboxée : l'API presse-papiers y
+ * est souvent refusée. Le champ reste donc affiché et sélectionné, ce qui
+ * laisse toujours un Ctrl+C possible — jamais d'impasse.
+ */
+function copierLien(){
+  var champ = document.getElementById("share-url");
+  var etat = document.getElementById("copy-state");
+  if (!champ || !etat) return;
+
+  champ.focus();
+  champ.select();
+
+  var ok = false;
+  try { ok = document.execCommand("copy"); } catch (e){ ok = false; }
+  if (!ok && navigator.clipboard && navigator.clipboard.writeText){
+    try { navigator.clipboard.writeText(champ.value); ok = true; }
+    catch (e){ ok = false; }
+  }
+
+  etat.textContent = ok
+    ? "Lien copié."
+    : "Lien sélectionné : copiez-le avec Ctrl+C (⌘C sur Mac).";
 }
 
 

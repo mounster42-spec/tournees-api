@@ -1283,40 +1283,47 @@ function _pageMessage_(titre, message) {
 
 
 /**
- * Point d'entrée de la Web App.
+ * Point d'entrée de la Web App : un instantané partagé, et RIEN d'autre.
  *
- * L'accès est vérifié AVANT de servir quoi que ce soit : openById lève pour
- * un utilisateur sans droits sur le classeur, et la page d'erreur ne porte
- * aucune adresse, aucun point, aucune métrique.
+ * Le jeton est la seule clé. Sans jeton valide, aucune donnée ne sort d'ici :
+ * la Web App ne sert plus « la dernière carte », usage revenu au dialogue du
+ * classeur. C'est ce qui permet d'ouvrir le déploiement au partage sans
+ * ouvrir en même temps l'accès au dernier run à quiconque connaît l'adresse.
+ *
+ * La page servie est le fichier d'archive lui-même, relu depuis Drive : le
+ * lien et le fichier téléchargé montrent donc exactement la même carte.
  */
 function doGet(e) {
-  const id = PropertiesService.getScriptProperties()
-    .getProperty(PROP_SPREADSHEET_ID);
+  const jeton = (e && e.parameter && e.parameter[SHARE_PARAM])
+    ? String(e.parameter[SHARE_PARAM]) : "";
 
-  if (!id) {
-    return _pageMessage_("Carte indisponible",
-      "Le classeur n'a pas encore été associé à cette application. "
-      + "Ouvrez le classeur une fois, puis rechargez cette page.");
+  if (!jeton) {
+    return _pageMessage_("Lien incomplet",
+      "Ce lien ne désigne aucune carte. Demandez à la personne qui vous l'a "
+      + "envoyé de vous transmettre le lien en entier.");
   }
 
+  var partage = null;
   try {
-    // Contrôle des droits, et lui seul : la valeur n'est pas utilisée ici.
-    SpreadsheetApp.openById(id).getName();
+    partage = _lirePartage_(jeton);
   } catch (err) {
-    return _pageMessage_("Accès refusé",
-      "Vous devez être connecté avec un compte autorisé à accéder à ce "
-      + "classeur.");
+    partage = null;
+  }
+  if (!partage) {
+    return _pageMessage_("Carte indisponible", MSG_PARTAGE_INDISPONIBLE);
   }
 
-  if (!getCarteTourneesPayload()) {
-    return _pageMessage_("Aucune carte disponible",
-      "Lancez une optimisation depuis le classeur, puis rouvrez cette page.");
+  var html = "";
+  try {
+    html = DriveApp.getFileById(partage.fileId)
+      .getBlob().getDataAsString("UTF-8");
+  } catch (err) {
+    // Fichier supprimé de Drive : le partage n'a plus d'objet, et la réponse
+    // reste la même que pour un jeton inconnu.
+    return _pageMessage_("Carte indisponible", MSG_PARTAGE_INDISPONIBLE);
   }
 
-  // Le gabarit est servi SANS payload injecté : la page le demande ensuite
-  // par google.script.run, qui fonctionne aussi dans une Web App. C'est ce
-  // qui lui donne le tracé routier et les mêmes boutons que le dialogue.
-  return HtmlService.createHtmlOutputFromFile(MAP_HTML_FILE)
+  return HtmlService.createHtmlOutput(html)
     .setTitle("Carte des tournées")
     .addMetaTag("viewport",
                 "width=device-width, initial-scale=1, viewport-fit=cover");
@@ -1683,11 +1690,142 @@ function _deposerCarteSurDrive_(html, signature) {
   const name = _nomFichierCarte_(signature);
   const file = DriveApp.createFile(name, html, MimeType.HTML);
   return {
+    id: file.getId(),
     name: name,
     sizeKb: Math.round(html.length / 1024),
     url: file.getUrl(),
     downloadUrl: "https://drive.google.com/uc?export=download&id=" + file.getId()
   };
+}
+
+
+// =========================
+// PARTAGE D'UN INSTANTANÉ DE CARTE
+// =========================
+// Pourquoi ce détour plutôt que d'envoyer le fichier : Drive ne PRÉVISUALISE
+// pas le HTML qu'il n'a pas produit. Il propose de le télécharger, et sur
+// téléphone cela ne mène à rien d'utilisable — d'où « Impossible d'ouvrir le
+// fichier pour le moment ». Un fichier reçu par messagerie ne s'ouvre pas
+// mieux : l'aperçu d'iOS n'exécute pas JavaScript, et Chrome Android refuse
+// souvent d'ouvrir un HTML local.
+//
+// Ce qui marche partout, sans installation ni compte, c'est une vraie adresse
+// HTTPS. La Web App en est déjà une. Elle sert donc l'instantané — le MÊME
+// fichier que l'archive, relu depuis Drive — identifié par un jeton.
+//
+// Le jeton est la seule clé. Sans lui la Web App ne rend rien : elle n'expose
+// plus « la dernière carte », cet usage étant revenu au dialogue.
+
+const SHARE_SHEET = "_CartesPartagees";
+const SHARE_HEADERS = ["Jeton", "Fichier Drive", "Nom", "Créée le",
+                       "Expire le", "Signature jeu"];
+
+// Paramètre d'URL portant le jeton. Court, parce qu'il voyage dans un lien
+// que quelqu'un va recopier ou coller dans une messagerie.
+const SHARE_PARAM = "c";
+
+// Au-delà, le lien cesse de fonctionner sans qu'on ait à y penser. Une carte
+// de tournée n'a de sens que peu de temps.
+const SHARE_TTL_DAYS = 30;
+
+const MSG_PARTAGE_INDISPONIBLE =
+    "Ce lien n'est plus valable. Il a peut-être expiré, ou le partage a été "
+  + "révoqué.";
+
+
+/**
+ * Jeton de partage : deux UUID concaténés, tirets retirés.
+ *
+ * 64 caractères hexadécimaux, soit largement au-delà de ce qu'une recherche
+ * exhaustive peut atteindre. C'est ce qui rend le lien non devinable — et
+ * c'est aussi pourquoi il ne doit être transmis qu'aux personnes concernées.
+ */
+function _jetonPartage_() {
+  return (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, "");
+}
+
+
+/** Registre des partages. Feuille masquée, lisible et modifiable à la main. */
+function _sharesSheet_(createIfMissing) {
+  const ss = _classeur_();
+  let sh = ss.getSheetByName(SHARE_SHEET);
+  if (!sh && createIfMissing) {
+    sh = ss.insertSheet(SHARE_SHEET);
+    sh.getRange(1, 1, 1, SHARE_HEADERS.length).setValues([SHARE_HEADERS]);
+    sh.getRange(1, 1, 1, SHARE_HEADERS.length)
+      .setBackground("#434343").setFontColor("#ffffff").setFontWeight("bold");
+    sh.setFrozenRows(1);
+    sh.hideSheet();
+  }
+  return sh;
+}
+
+
+/**
+ * Enregistre un instantané partageable et rend son jeton.
+ *
+ * Seuls un identifiant de fichier et des dates entrent ici : ni adresse, ni
+ * coordonnée, ni géométrie. Les données de la carte restent dans le fichier
+ * Drive, dont ce registre ne fait que désigner l'emplacement.
+ */
+function _enregistrerPartage_(fileId, nom, signature) {
+  const jeton = _jetonPartage_();
+  const cree = new Date();
+  const expire = new Date(cree.getTime() + SHARE_TTL_DAYS * 24 * 3600 * 1000);
+  _sharesSheet_(true).appendRow(
+    [jeton, String(fileId), String(nom || ""), cree, expire,
+     String(signature || "")]);
+  return jeton;
+}
+
+
+/**
+ * Retrouve un partage valide, ou null.
+ *
+ * Un jeton inconnu, expiré ou effacé rend null, sans distinction : la page
+ * d'erreur ne doit pas révéler qu'un jeton a existé.
+ */
+function _lirePartage_(jeton) {
+  const cle = String(jeton || "").trim();
+  if (!cle) return null;
+
+  const sh = _sharesSheet_(false);
+  if (!sh) return null;
+
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return null;
+
+  const rows = sh.getRange(2, 1, lastRow - 1, SHARE_HEADERS.length).getValues();
+  const maintenant = new Date();
+  for (var i = 0; i < rows.length; i++) {
+    if (String(rows[i][0]).trim() !== cle) continue;
+    const expire = rows[i][4];
+    if (expire instanceof Date && expire.getTime() < maintenant.getTime()) {
+      return null;
+    }
+    const fileId = String(rows[i][1] || "").trim();
+    return fileId ? {fileId: fileId, nom: String(rows[i][2] || "")} : null;
+  }
+  return null;
+}
+
+
+/**
+ * Révoque TOUS les partages : les liens déjà envoyés cessent de fonctionner.
+ *
+ * Sans entrée de menu, volontairement — c'est une action rare, et le menu
+ * doit rester celui de la conduite des tournées. Elle s'exécute depuis
+ * l'éditeur Apps Script. Révoquer un seul lien se fait en supprimant sa
+ * ligne dans la feuille « _CartesPartagees », qu'il suffit d'afficher.
+ *
+ * Les fichiers Drive ne sont pas supprimés : ils restent votre archive.
+ */
+function revoquerPartagesCarte() {
+  const sh = _sharesSheet_(false);
+  if (!sh || sh.getLastRow() < 2) return 0;
+  const n = sh.getLastRow() - 1;
+  sh.deleteRows(2, n);
+  return n;
 }
 
 
@@ -1721,6 +1859,22 @@ function exporterCarteDepuisDialogue(geometriesJson) {
 
   const info = _deposerCarteSurDrive_(html, signature);
   info.withGeometry = !!(geometries && geometries.length);
+
+  // Lien de consultation. Un échec ici ne fait pas échouer l'export : le
+  // fichier existe déjà, et la fenêtre le dira plutôt que de tout perdre.
+  try {
+    const base = _getWebAppUrl_();
+    if (base) {
+      info.shareUrl = base + "?" + SHARE_PARAM + "="
+        + _enregistrerPartage_(info.id, info.name, signature);
+    } else {
+      info.shareError = MSG_WEB_APP_INDISPONIBLE;
+    }
+  } catch (e) {
+    info.shareError = "Lien de partage indisponible : "
+      + (e && e.message ? e.message : e);
+  }
+
   return JSON.stringify(info);
 }
 

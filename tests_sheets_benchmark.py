@@ -830,7 +830,7 @@ class TestMapDownloadButton(unittest.TestCase):
         # « Exporter ». L'ancien libelle « Télécharger la carte » disait mal
         # ce qui se passe -- le fichier part d'abord sur Drive.
         self.assertIn('id="btn-download"', self.html)
-        self.assertIn(">Exporter<", self.html)
+        self.assertIn(">Exporter et partager<", self.html)
         self.assertIn('getElementById("btn-download")', self.html)
         self.assertIn("telechargerCarte", self.html)
 
@@ -911,21 +911,31 @@ class TestWebApp(unittest.TestCase):
     def test_the_workbook_is_found_by_a_stored_identifier(self):
         self.assertIn('const PROP_SPREADSHEET_ID = "TOURNEES_SPREADSHEET_ID";',
                       self.code)
-        body = extract_function(self.code, "doGet")
+        # doGet ne connait plus le classeur : il sert un instantane designe
+        # par un jeton. C'est _classeur_ qui porte l'ouverture par identifiant.
+        body = extract_function(self.code, "_classeur_")
         self.assertIn("getProperty(PROP_SPREADSHEET_ID)", body)
         self.assertIn("SpreadsheetApp.openById(id)", body)
         # L'identifiant est enregistre depuis le classeur, a l'ouverture.
         self.assertIn("_memoriserClasseur_();",
                       extract_function(self.code, "onOpen"))
 
-    def test_access_is_checked_before_anything_is_served(self):
+    def test_the_token_is_checked_before_anything_is_served(self):
+        """Le jeton est la seule cle, et il est verifie avant toute lecture."""
         body = extract_function(self.code, "doGet")
-        controle = body.index("SpreadsheetApp.openById(id)")
-        service = body.index("createHtmlOutputFromFile(MAP_HTML_FILE)")
-        self.assertLess(controle, service,
-                        "la page est servie avant le controle des droits")
-        self.assertIn("Accès refusé", body)
-        self.assertIn("compte autorisé à accéder à ce", body)
+        garde = body.index("if (!partage)")
+        service = body.index("DriveApp.getFileById(partage.fileId)")
+        self.assertLess(garde, service,
+                        "le fichier est lu avant le controle du jeton")
+        self.assertLess(body.index("if (!jeton)"), garde)
+
+    def test_an_unknown_or_expired_token_gets_one_single_answer(self):
+        """Distinguer les cas revelerait qu'un jeton a existe."""
+        # Sans commentaires : celui qui explique la regle doit la nommer.
+        body = strip_comments(extract_function(self.code, "doGet"))
+        self.assertEqual(body.count("MSG_PARTAGE_INDISPONIBLE"), 2)
+        for interdit in ("expiré le", "jeton inconnu", "révoqué le"):
+            self.assertNotIn(interdit, body)
 
     def test_the_refusal_page_carries_no_map_data(self):
         page = extract_function(self.code, "_pageMessage_")
@@ -947,14 +957,16 @@ class TestWebApp(unittest.TestCase):
     def test_a_single_responsive_page_serves_every_device(self):
         """Aucune version mobile separee : le meme gabarit partout."""
         body = extract_function(self.code, "doGet")
-        self.assertIn("MAP_HTML_FILE", body)
         self.assertIn("viewport-fit=cover", body)
-        # Dialogue, export autonome et Web App lisent le MEME gabarit. Trois
-        # usages, une seule page : c'est ce qui garantit qu'il n'existe pas
-        # de version mobile a maintenir a part.
+        # Le dialogue lit le gabarit, l'export autonome aussi. La Web App sert
+        # le fichier DEJA construit par l'export : le lien et le fichier
+        # telecharge montrent donc exactement la meme page, et il n'existe
+        # aucune version mobile a maintenir a part.
         self.assertEqual(
-            self.code.count("createHtmlOutputFromFile(MAP_HTML_FILE)"), 3)
+            self.code.count("createHtmlOutputFromFile(MAP_HTML_FILE)"), 2)
         self.assertEqual(self.code.count("const MAP_HTML_FILE"), 1)
+        self.assertEqual(
+            self.code.count("function _buildStandaloneCarteHtml_("), 1)
 
     def test_the_web_app_page_is_served_without_an_injected_payload(self):
         """Servi sans payload, le gabarit passe par google.script.run : c'est
@@ -963,10 +975,17 @@ class TestWebApp(unittest.TestCase):
         self.assertNotIn("_buildStandaloneCarteHtml_", body)
 
     def test_no_permission_is_ever_changed_by_the_code(self):
+        # DriveApp.getFileById n'est plus interdit : la Web App LIT l'archive
+        # pour la servir. Lire n'accorde aucun droit — l'acces reste porte par
+        # le jeton, et la revocation par la suppression de sa ligne.
         for interdit in ("setSharing", "addEditor", "addViewer", "ANYONE",
-                         "DriveApp.getFileById", "setAccess"):
+                         "setAccess", "setOwner", "removeEditor"):
             self.assertNotIn(interdit, self.code,
                              "le code modifie un partage : %s" % interdit)
+        lecture = extract_function(self.code, "doGet")
+        self.assertIn("DriveApp.getFileById(partage.fileId)", lecture)
+        self.assertIn(".getBlob().getDataAsString(", lecture)
+        self.assertEqual(self.code.count("DriveApp.getFileById("), 1)
 
     def test_the_backend_is_untouched_by_the_web_app(self):
         with open(os.path.join(HERE, "app.py"), encoding="utf-8") as handle:
@@ -1120,6 +1139,176 @@ class TestReopenLastMapFromMenu(unittest.TestCase):
                              "rouvrir la carte declenche %s" % interdit)
 
 
+class TestShareableSnapshot(unittest.TestCase):
+    """Un lien HTTPS pour consulter, un fichier HTML pour archiver.
+
+    Drive ne PREVISUALISE pas le HTML qu'il n'a pas produit : il propose de
+    le telecharger, ce qui ne mene nulle part d'utilisable sur telephone.
+    L'instantane est donc servi par la Web App, qui est une vraie adresse
+    HTTPS, et identifie par un jeton."""
+
+    def setUp(self):
+        self.code = read_code()
+        self.html = read_map_html()
+
+    # --- le jeton --------------------------------------------------------
+
+    def test_the_token_is_long_and_random(self):
+        body = extract_function(self.code, "_jetonPartage_")
+        self.assertIn("Utilities.getUuid()", body)
+        # Deux UUID : 64 caracteres hexadecimaux une fois les tirets retires.
+        self.assertEqual(body.count("Utilities.getUuid()"), 2)
+        self.assertIn('replace(/-/g, "")', body)
+        for interdit in ("Math.random", "new Date().getTime()", "Date.now"):
+            self.assertNotIn(interdit, body,
+                             "le jeton est previsible : %s" % interdit)
+
+    def test_the_registry_stores_no_map_data(self):
+        """Le registre designe un fichier ; il ne contient pas la carte."""
+        body = extract_function(self.code, "_enregistrerPartage_")
+        for interdit in ("lat", "lon", "routes", "geometr", "adresse",
+                         "payload"):
+            self.assertNotIn(interdit, body.lower(),
+                             "le registre stocke %s" % interdit)
+        entetes = header_list("SHARE_HEADERS")
+        self.assertEqual(entetes, ["Jeton", "Fichier Drive", "Nom",
+                                   "Créée le", "Expire le", "Signature jeu"])
+
+    def test_a_share_expires(self):
+        self.assertIn("const SHARE_TTL_DAYS = 30;", self.code)
+        enreg = extract_function(self.code, "_enregistrerPartage_")
+        self.assertIn("SHARE_TTL_DAYS * 24 * 3600 * 1000", enreg)
+        lire = extract_function(self.code, "_lirePartage_")
+        self.assertIn("expire.getTime() < maintenant.getTime()", lire)
+        self.assertIn("return null;", lire)
+
+    def test_a_share_can_be_revoked(self):
+        body = extract_function(self.code, "revoquerPartagesCarte")
+        self.assertIn("deleteRows(2, n)", body)
+        # La revocation ne detruit pas l'archive de l'utilisateur.
+        for interdit in ("setTrashed", "removeFile", "DriveApp"):
+            self.assertNotIn(interdit, body,
+                             "la revocation supprime aussi le fichier : %s"
+                             % interdit)
+        # Aucune entree de menu ajoutee : le menu reste celui des tournees.
+        flat = re.sub(r"\s+", " ", self.code)
+        menu = flat[flat.index('ui.createMenu("Tournées")'):]
+        menu = menu[:menu.index(".addToUi()")]
+        self.assertNotIn("revoquerPartagesCarte", menu)
+
+    # --- le lien ---------------------------------------------------------
+
+    def test_the_link_is_built_from_the_validated_web_app_url(self):
+        export = extract_function(self.code, "exporterCarteDepuisDialogue")
+        self.assertIn("_getWebAppUrl_()", export)
+        self.assertIn('base + "?" + SHARE_PARAM + "="', export)
+        self.assertIn("_enregistrerPartage_(info.id", export)
+        # Sans Web App deployee, pas de lien mort : un message.
+        self.assertIn("info.shareError = MSG_WEB_APP_INDISPONIBLE;", export)
+
+    def test_a_failed_link_does_not_lose_the_export(self):
+        """Le fichier existe deja quand le lien est construit."""
+        export = extract_function(self.code, "exporterCarteDepuisDialogue")
+        self.assertLess(export.index("_deposerCarteSurDrive_("),
+                        export.index("_getWebAppUrl_()"))
+        self.assertIn("try {", export)
+        self.assertIn("catch (e)", export)
+
+    def test_the_drive_preview_url_is_never_offered_as_the_way_to_consult(self):
+        partage = extract_function(self.html, "afficherPartage")
+        self.assertIn("info.shareUrl", partage)
+        self.assertIn("Télécharger le fichier HTML", partage)
+        # Le lien /view de Drive, celui qui affiche « Impossible d'ouvrir le
+        # fichier », ne figure plus dans la fenetre.
+        self.assertNotIn("info.url", partage)
+        self.assertNotIn("Ouvrir dans Drive", strip_comments(self.html))
+
+    # --- ce que voit l'ami -----------------------------------------------
+
+    def test_the_shared_page_is_the_archive_itself(self):
+        body = extract_function(self.code, "doGet")
+        self.assertIn("DriveApp.getFileById(partage.fileId)", body)
+        self.assertIn("HtmlService.createHtmlOutput(html)", body)
+        # Servie responsive, comme le dialogue.
+        self.assertIn("width=device-width, initial-scale=1, viewport-fit=cover",
+                      body)
+
+    def test_the_shared_page_needs_no_spreadsheet_and_no_backend(self):
+        """Le gabarit autonome rend directement, sans google.script.run."""
+        boot = self.html[self.html.index("function boot()"):]
+        self.assertLess(boot.index("window.TOURNEES_PAYLOAD"),
+                        boot.index("google.script.run"))
+        self.assertIn("renderCarte(window.TOURNEES_PAYLOAD);", boot)
+        # L'injection se fait a la construction, pas a la lecture.
+        builder = extract_function(self.code, "_buildStandaloneCarteHtml_")
+        self.assertIn("window.TOURNEES_PAYLOAD = ", builder)
+
+    def test_the_shared_page_keeps_the_route_checkboxes_and_the_fit_button(self):
+        """Elles vivent dans buildToggles, appele par renderCarte dans TOUS
+        les contextes — la barre d'actions, elle, reste masquee."""
+        render = extract_function(self.html, "renderCarte")
+        self.assertIn("buildToggles();", render)
+        self.assertIn("buildSummary(payload);", render)
+        toggles = extract_function(self.html, "buildToggles")
+        self.assertIn("Ajuster la vue", toggles)
+        self.assertIn("type='checkbox' data-layer='", toggles)
+
+    def test_the_snapshot_carries_the_geometry_already_loaded(self):
+        self.assertIn("currentGeometries ? JSON.stringify(currentGeometries)",
+                      self.html)
+        export = extract_function(self.code, "exporterCarteDepuisDialogue")
+        self.assertIn("_payloadAvecGeometries_(json, geometries)", export)
+        # Aucun nouvel appel : ni optimisation, ni geometrie, ni ORS.
+        for interdit in ("getCarteGeometrie", "UrlFetchApp", "callAPI",
+                         "runOptimisation", "appendBenchmark", "getPoints("):
+            self.assertNotIn(interdit, export,
+                             "l'export declenche %s" % interdit)
+
+    def test_no_secret_can_reach_the_shared_page(self):
+        for content in (self.code, self.html):
+            lowered = content.lower()
+            for needle in ("ors_key", "ors_api_key", "api.openrouteservice.org",
+                           "heigit.org", "authorization", "render.com/api",
+                           "bearer "):
+                self.assertNotIn(needle, lowered)
+
+    # --- la fenetre de partage -------------------------------------------
+
+    def test_the_share_panel_offers_the_three_requested_actions(self):
+        partage = extract_function(self.html, "afficherPartage")
+        self.assertIn("Carte prête à être partagée", partage)
+        self.assertIn("Copier le lien", partage)
+        self.assertIn("Ouvrir la carte partagée", partage)
+        self.assertIn("Télécharger le fichier HTML", partage)
+        self.assertIn("MSG_PARTAGE_AIDE", partage)
+        self.assertIn("Utilisez le lien pour consulter la carte sur ",
+                      self.html)
+        self.assertIn("ordinateur, iPhone, iPad ou Android.", self.html)
+
+    def test_copying_always_leaves_a_way_out(self):
+        """L'API presse-papiers est souvent refusee dans l'iframe : le champ
+        reste affiche et selectionne, donc Ctrl+C fonctionne toujours."""
+        body = extract_function(self.html, "copierLien")
+        self.assertIn("champ.select();", body)
+        self.assertIn('document.execCommand("copy")', body)
+        self.assertIn("navigator.clipboard", body)
+        self.assertIn("catch (e)", body)
+        self.assertIn("Ctrl+C", body)
+
+    def test_the_share_controls_are_touch_sized_and_contrasted(self):
+        debut = self.html.index(".actions a.bouton{")
+        regle = self.html[debut:self.html.index("}", debut)]
+        for attendu in ("min-height:44px", "background:#ffffff",
+                        "color:#0b57d0", "display:inline-flex",
+                        "box-sizing:border-box", "max-width:100%"):
+            self.assertIn(attendu, regle)
+        debut = self.html.index(".partage input{")
+        champ = self.html[debut:self.html.index("}", debut)]
+        self.assertIn("min-height:44px", champ)
+        self.assertIn("width:100%", champ)
+        self.assertIn("box-sizing:border-box", champ)
+
+
 class TestMapResponsive(unittest.TestCase):
     """Le panneau prenait 74 % d'un ecran de telephone en paysage, pour
     101 px de carte visible. Ces controles figent la correction."""
@@ -1187,7 +1376,7 @@ class TestMapResponsive(unittest.TestCase):
     def test_the_two_dialog_actions_are_the_requested_ones(self):
         self.assertIn('id="btn-zoom"', self.html)
         self.assertIn(">Agrandir<", self.html)
-        self.assertIn(">Exporter<", self.html)
+        self.assertIn(">Exporter et partager<", self.html)
         # L'ancien bouton et son vocabulaire ont disparu : Apps Script ne
         # peut pas tenir la promesse d'un plein ecran de navigateur, et
         # « Ouvrir la carte » est le nom d'une entree de menu, pas d'un
@@ -1196,13 +1385,19 @@ class TestMapResponsive(unittest.TestCase):
         # doit forcement nommer ce qui a ete retire.
         rendu = strip_comments(self.html)
         for interdit in ("btn-fullscreen", "ouvrirEnGrand", "Plein écran",
-                         "Ouvrir en grand", "Ouvrir la carte",
-                         "requestFullscreen"):
+                         "Ouvrir en grand", "requestFullscreen"):
             self.assertNotIn(interdit, rendu,
                              "%s subsiste dans la carte" % interdit)
+        # « Ouvrir la carte » nomme une entree de MENU : elle ne doit pas
+        # reapparaitre dans la barre d'actions du dialogue.
+        barre = self.html[self.html.index('<div class="actions">'):]
+        barre = barre[:barre.index("</div>")]
+        self.assertNotIn("Ouvrir la carte", barre)
 
     def test_the_export_is_described_as_an_archive(self):
-        self.assertIn("L'export crée une archive HTML dans", self.html)
+        self.assertIn("une archive HTML dans Google Drive", self.html)
+        self.assertIn("Le fichier HTML sert ", self.html)
+        self.assertIn("principalement d'archive.", self.html)
 
 
 class TestEnlargeDialog(unittest.TestCase):
