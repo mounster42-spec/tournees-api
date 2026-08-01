@@ -279,14 +279,21 @@ class TestLockAndStructure(unittest.TestCase):
         """Verification STRUCTURELLE : la branche verrouillee precede la branche
         des swaps et ne les appelle pas. L'appel effectif de /optimize demande
         un contexte Flask complet, hors perimetre de ces tests hors reseau."""
-        locked_at = self.src.index("if routes_idx and vroom_ok and membership_locked:")
+        locked_at = self.src.index("and membership_locked:")
         swaps_at = self.src.index("elif routes_idx and vroom_ok:")
         self.assertLess(locked_at, swaps_at,
                         "la branche verrouillee doit etre testee en premier")
         branch = self.src[locked_at:swaps_at]
         self.assertNotIn("post_process_swaps(", branch,
                          "aucun appel de swaps dans la branche verrouillee")
-        self.assertIn('"territorial_partition_locked"', branch)
+
+        # La raison est portee par swap_lock_reason, qui vaut territorial par
+        # defaut et bascule sur connected pour le mode a territoires connexes.
+        self.assertIn('swap_stats["swap_stop_reason"] = swap_lock_reason', branch)
+        self.assertIn('swap_lock_reason = "territorial_partition_locked"', self.src)
+        self.assertIn('swap_lock_reason = "connected_partition_locked"', self.src)
+        self.assertIn("territorial_partition_locked", app.SWAP_STOP_REASONS)
+        self.assertIn("connected_partition_locked", app.SWAP_STOP_REASONS)
 
     def test_16_kmeans_untouched(self):
         for name in ("kmeans_partition", "_balance_groups",
