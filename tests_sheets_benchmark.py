@@ -1029,29 +1029,16 @@ class TestWebAppUrlIsTheOnlySource(unittest.TestCase):
         self.assertIn("WEB_APP_URL_INTERDITS", valider)
         self.assertIn('return "";', valider)
 
-    def test_an_empty_url_says_so_and_offers_no_drive_fallback(self):
-        self.assertIn("La Web App n'est pas encore disponible. Mettez à jour ",
-                      self.code)
-        self.assertIn("l'application Web Apps Script.", self.code)
-        body = extract_function(self.code, "ouvrirLaCarte")
-        self.assertIn("if (!url)", body)
-        self.assertIn("MSG_WEB_APP_INDISPONIBLE", body)
-        # Aucun repli vers l'archive : ni lien Drive, ni renvoi vers l'export.
-        for interdit in ("drive.google.com", "downloadUrl", "info.url",
-                         "exporterCartePartageable", "DriveApp"):
-            self.assertNotIn(interdit, body,
-                             "ouvrirLaCarte propose %s en repli" % interdit)
+    def test_the_helper_is_no_longer_wired_to_the_menu(self):
+        """Le menu n'ouvre plus la Web App : il rouvre le dialogue.
 
-    def test_the_same_helper_serves_the_menu_and_the_map_button(self):
+        Le helper reste, valide, car le PARTAGE en a besoin — mais plus
+        aucune ouverture de carte ne construit d'adresse."""
         menu = extract_function(self.code, "ouvrirLaCarte")
-        self.assertIn("_getWebAppUrl_()", menu)
-        bouton = extract_function(self.html, "ouvrirEnGrand")
-        self.assertIn("getWebAppUrl()", bouton)
-        # Deux points d'appel cote script, et deux seulement : l'entree de
-        # menu et la surface RPC que le bouton de la carte interroge. La
-        # definition elle-meme est exclue du comptage.
-        appels = re.findall(r"(?<!function )_getWebAppUrl_\(\)", self.code)
-        self.assertEqual(len(appels), 2)
+        for interdit in ("_getWebAppUrl_", "getWebAppUrl", "ScriptApp",
+                         "window.open", "http", "/exec", "drive.google.com"):
+            self.assertNotIn(interdit, menu,
+                             "ouvrirLaCarte touche encore %s" % interdit)
 
     def test_the_drive_archive_url_never_reaches_an_opening_function(self):
         """L'archive naît dans _deposerCarteSurDrive_ et n'en sort que pour
@@ -1067,33 +1054,70 @@ class TestWebAppUrlIsTheOnlySource(unittest.TestCase):
                 self.assertNotIn(interdit, body,
                                  "%s manipule l'adresse de l'archive" % name)
 
-    # --- la petite fenetre de repli --------------------------------------
+class TestReopenLastMapFromMenu(unittest.TestCase):
+    """« Ouvrir la carte » rouvre la derniere carte, dans le MEME dialogue.
 
-    def test_the_modal_is_titled_open_the_map_and_acts_by_fullscreen(self):
-        body = extract_function(self.code, "ouvrirLaCarte")
-        self.assertEqual(body.count('"Ouvrir la carte");'), 2)   # les 2 titres
-        self.assertIn("Plein écran</a>", body)
-        # Pas de second bouton portant le meme libelle que le titre.
-        self.assertNotIn(">Ouvrir la carte</a>", body)
+    L'entree de menu passait par la Web App : petite fenetre intermediaire,
+    nouvel onglet, adresse a construire. Alors que la carte de fin
+    d'optimisation, elle, s'affichait tres bien dans un showModalDialog. Les
+    deux parcours convergent desormais sur un seul helper."""
 
-    def test_the_modal_tries_to_open_the_tab_by_itself(self):
-        body = extract_function(self.code, "ouvrirLaCarte")
-        self.assertIn("window.open(", body)
-        self.assertIn("JSON.stringify(url)", body)
+    def setUp(self):
+        self.code = read_code()
 
-    def test_the_modal_keeps_a_manual_button_and_says_why(self):
-        body = extract_function(self.code, "ouvrirLaCarte")
-        self.assertIn('target="_blank"', body)
-        self.assertIn("Si la carte ne s'ouvre pas automatiquement, cliquez "
-                      "sur ", body)
-        self.assertIn("Plein écran.", body)
+    def test_a_single_helper_shows_the_dialog(self):
+        self.assertEqual(self.code.count("function _afficherDialogueCarte_("),
+                         1)
+        helper = extract_function(self.code, "_afficherDialogueCarte_")
+        self.assertIn("createHtmlOutputFromFile(MAP_HTML_FILE)", helper)
+        self.assertIn("showModalDialog(out, MAP_DIALOG_TITLE)", helper)
+        self.assertIn("MAP_DIALOG_WIDTH", helper)
+        self.assertIn("MAP_DIALOG_HEIGHT", helper)
 
-    def test_the_modal_button_is_touch_sized_and_never_truncated(self):
+    def test_both_paths_converge_on_that_helper(self):
+        for name in ("afficherCarteTournees", "ouvrirLaCarte"):
+            body = extract_function(self.code, name)
+            self.assertIn("_afficherDialogueCarte_();", body,
+                          "%s n'utilise pas le helper commun" % name)
+        # Deux appels, et deux seulement : la definition est exclue.
+        appels = re.findall(r"(?<!function )_afficherDialogueCarte_\(\)",
+                            self.code)
+        self.assertEqual(len(appels), 2)
+        # Un seul showModalDialog pour la carte dans tout le fichier.
+        self.assertEqual(self.code.count("createHtmlOutputFromFile(MAP_HTML_FILE)\n"
+                                         "    .setWidth(MAP_DIALOG_WIDTH)"), 1)
+
+    def test_the_menu_opens_no_tab_and_no_web_app(self):
         body = extract_function(self.code, "ouvrirLaCarte")
-        self.assertIn("min-height:44px", body)
-        self.assertIn("text-align:center", body)
-        self.assertIn("box-sizing:border-box", body)
-        self.assertIn("max-width:100%", body)
+        for interdit in ("window.open", "target=\"_blank\"", "/exec", "/dev",
+                         "drive.google.com", "getWebAppUrl", "ScriptApp",
+                         "HtmlService.createHtmlOutput("):
+            self.assertNotIn(interdit, body,
+                             "l'entree de menu passe encore par %s" % interdit)
+
+    def test_no_payload_says_so_and_opens_nothing(self):
+        body = extract_function(self.code, "ouvrirLaCarte")
+        self.assertIn("if (!getCarteTourneesPayload())", body)
+        self.assertIn("MSG_AUCUNE_CARTE", body)
+        self.assertIn("return;", body)
+        self.assertIn('const MSG_AUCUNE_CARTE =\n  "Aucune carte disponible. '
+                      'Lancez d\'abord une optimisation.";', self.code)
+        # La garde precede l'ouverture : jamais de dialogue vide.
+        self.assertLess(body.index("if (!getCarteTourneesPayload())"),
+                        body.index("_afficherDialogueCarte_();"))
+
+    def test_the_duplicate_reopen_function_is_gone(self):
+        """afficherDerniereCarte faisait exactement cela, hors du menu."""
+        self.assertNotIn("afficherDerniereCarte", self.code)
+        self.assertNotIn("_ouvrirDialogueCarte_", self.code)
+
+    def test_reopening_launches_no_optimisation_and_writes_nothing(self):
+        body = extract_function(self.code, "ouvrirLaCarte")
+        for interdit in ("callAPI", "runOptimisation", "appendBenchmark",
+                         "getPoints(", "setValue", "_saveCartePayload_",
+                         "buildCartePayload"):
+            self.assertNotIn(interdit, body,
+                             "rouvrir la carte declenche %s" % interdit)
 
 
 class TestMapResponsive(unittest.TestCase):

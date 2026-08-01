@@ -1407,61 +1407,21 @@ function getWebAppUrl() {
 
 
 /**
- * Entrée de menu « Ouvrir la carte ».
+ * Entrée de menu « Ouvrir la carte » : rouvre la DERNIÈRE carte produite.
  *
- * Un menu Apps Script ne peut pas ouvrir un onglet lui-même. On affiche donc
- * une petite fenêtre qui tente window.open, et qui garde en toutes
- * circonstances un grand bouton : un pop-up bloqué n'est pas une erreur, il
- * suffit de cliquer.
+ * Exactement la même fenêtre que celle qui s'ouvre en fin d'optimisation, et
+ * exactement le même payload : rien n'est recalculé, aucune optimisation
+ * n'est relancée, aucun onglet n'est ouvert, aucune adresse n'est construite.
  *
- * L'adresse vient de _getWebAppUrl_ et de nulle part ailleurs. Sans Web App
- * valide, la fenêtre le dit ; elle ne propose JAMAIS l'archive Drive en
- * remplacement, puisque Drive n'affiche pas les fichiers HTML.
+ * La Web App n'intervient plus ici. Elle ne sert qu'au partage d'un
+ * instantané, ce qui est un autre besoin et un autre chemin.
  */
 function ouvrirLaCarte() {
-  const url = _getWebAppUrl_();
-
-  if (!url) {
-    SpreadsheetApp.getUi().showModalDialog(
-      HtmlService.createHtmlOutput(
-          '<div style="font-family:Arial,sans-serif;font-size:13px;'
-        + 'line-height:1.6;padding:16px">'
-        + "<b>" + MSG_WEB_APP_INDISPONIBLE + "</b><br><br>"
-        + "Dans l'éditeur Apps Script : <i>Déployer &rsaquo; Gérer les "
-        + "déploiements</i>, puis mettez à jour la version de l'application "
-        + "Web, en l'exécutant « en tant qu'utilisateur accédant » et en "
-        + "limitant l'accès aux utilisateurs connectés."
-        + "</div>").setWidth(460).setHeight(240),
-      "Ouvrir la carte");
+  if (!getCarteTourneesPayload()) {
+    SpreadsheetApp.getActive().toast(MSG_AUCUNE_CARTE, "Carte", 6);
     return;
   }
-
-  const esc = function (s) {
-    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
-                    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-  };
-
-  // inline-flex plutôt que line-height : le texte reste centré et entier même
-  // si la police du poste est plus grande que prévu, et le bouton grandit au
-  // lieu de rogner son libellé.
-  SpreadsheetApp.getUi().showModalDialog(
-    HtmlService.createHtmlOutput(
-        '<div style="font-family:Arial,sans-serif;font-size:13px;'
-      + 'line-height:1.6;padding:20px 16px;text-align:center;'
-      + 'box-sizing:border-box;max-width:100%;overflow-wrap:break-word">'
-      + '<a id="plein-ecran" href="' + esc(url) + '" target="_blank" '
-      + 'style="display:inline-flex;align-items:center;justify-content:center;'
-      + 'box-sizing:border-box;min-height:44px;min-width:180px;max-width:100%;'
-      + 'padding:0 26px;background:#1a73e8;color:#fff;border-radius:6px;'
-      + 'text-decoration:none;font-weight:bold;font-size:14px">'
-      + "Plein écran</a>"
-      + '<div style="margin-top:16px;color:#5f6368">'
-      + "Si la carte ne s'ouvre pas automatiquement, cliquez sur "
-      + "Plein écran.</div>"
-      + "<script>try{window.open("
-      + JSON.stringify(url) + ",'_blank');}catch(e){}<\/script>"
-      + "</div>").setWidth(420).setHeight(230),
-    "Ouvrir la carte");
+  _afficherDialogueCarte_();
 }
 
 
@@ -1575,18 +1535,37 @@ function buildCartePayload(result, params, points) {
 }
 
 
-function _ouvrirDialogueCarte_() {
+// Titre et dimensions du dialogue. Définis une seule fois : l'ouverture
+// automatique en fin d'optimisation et l'entrée de menu doivent produire
+// exactement la même fenêtre, pas deux fenêtres qui se ressemblent.
+const MAP_DIALOG_TITLE  = "Carte des deux tournées";
+const MAP_DIALOG_WIDTH  = 1200;
+const MAP_DIALOG_HEIGHT = 800;
+
+const MSG_AUCUNE_CARTE =
+  "Aucune carte disponible. Lancez d'abord une optimisation.";
+
+
+/**
+ * UNIQUE chemin d'affichage de la carte.
+ *
+ * Le gabarit part sans données : il réclame ensuite le dernier payload par
+ * google.script.run.getCarteTourneesPayload(). Les deux parcours — fin
+ * d'optimisation et entrée de menu — convergent ici, et nulle part ailleurs.
+ * Aucun onglet, aucune Web App, aucune URL : un dialogue, point.
+ */
+function _afficherDialogueCarte_() {
   const out = HtmlService.createHtmlOutputFromFile(MAP_HTML_FILE)
-    .setWidth(1200)
-    .setHeight(800);
-  SpreadsheetApp.getUi().showModalDialog(out, "Carte des deux tournées");
+    .setWidth(MAP_DIALOG_WIDTH)
+    .setHeight(MAP_DIALOG_HEIGHT);
+  SpreadsheetApp.getUi().showModalDialog(out, MAP_DIALOG_TITLE);
 }
 
 
 /** Construit, enregistre puis affiche la carte du run courant. */
 function afficherCarteTournees(result, params, points) {
   _saveCartePayload_(buildCartePayload(result, params, points));
-  _ouvrirDialogueCarte_();
+  _afficherDialogueCarte_();
 }
 
 
@@ -1856,15 +1835,6 @@ function exporterCartePartageable() {
 }
 
 
-/** Entrée de menu : rouvre la dernière carte sans relancer d'optimisation. */
-function afficherDerniereCarte() {
-  if (!getCarteTourneesPayload()) {
-    SpreadsheetApp.getActive().toast(
-      "Aucune carte enregistrée. Lancez une optimisation.", "Carte", 5);
-    return;
-  }
-  _ouvrirDialogueCarte_();
-}
 
 
 // =========================
