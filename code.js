@@ -1294,8 +1294,11 @@ function _pageMessage_(titre, message) {
  * classeur. C'est ce qui permet d'ouvrir le déploiement au partage sans
  * ouvrir en même temps l'accès au dernier run à quiconque connaît l'adresse.
  *
- * La page servie est le fichier d'archive lui-même, relu depuis Drive : le
- * lien et le fichier téléchargé montrent donc exactement la même carte.
+ * Aucun appel Drive sur ce chemin, et c'est délibéré. La version précédente
+ * relisait le fichier d'archive par DriveApp.getFileById : c'était le seul
+ * maillon Drive entre l'adresse script.google.com et le contenu, et donc le
+ * seul endroit d'où pouvait surgir une page d'erreur Drive. L'instantané est
+ * désormais lu dans le classeur et la page assemblée ici même.
  */
 function doGet(e) {
   const jeton = (e && e.parameter && e.parameter[SHARE_PARAM])
@@ -1307,23 +1310,23 @@ function doGet(e) {
       + "envoyé de vous transmettre le lien en entier.");
   }
 
-  var partage = null;
+  var payload = null;
   try {
-    partage = _lirePartage_(jeton);
+    payload = _lirePartage_(jeton);
   } catch (err) {
-    partage = null;
+    payload = null;
   }
-  if (!partage) {
+  if (!payload) {
     return _pageMessage_("Carte indisponible", MSG_PARTAGE_INDISPONIBLE);
   }
 
   var html = "";
   try {
-    html = DriveApp.getFileById(partage.fileId)
-      .getBlob().getDataAsString("UTF-8");
+    // Le MÊME constructeur que l'archive téléchargeable : gabarit courant
+    // plus instantané injecté. La page rend donc seule, sans google.script.run
+    // et sans le moindre accès au classeur.
+    html = _buildStandaloneCarteHtml_(payload);
   } catch (err) {
-    // Fichier supprimé de Drive : le partage n'a plus d'objet, et la réponse
-    // reste la même que pour un jeton inconnu.
     return _pageMessage_("Carte indisponible", MSG_PARTAGE_INDISPONIBLE);
   }
 
@@ -1721,8 +1724,24 @@ function _deposerCarteSurDrive_(html, signature) {
 // plus « la dernière carte », cet usage étant revenu au dialogue.
 
 const SHARE_SHEET = "_CartesPartagees";
-const SHARE_HEADERS = ["Jeton", "Fichier Drive", "Nom", "Créée le",
-                       "Expire le", "Signature jeu"];
+
+// Colonnes fixes du registre. Les fragments de l'instantané suivent, à
+// partir de SHARE_COL_FRAGMENTS.
+const SHARE_HEADERS = ["Jeton", "Créée le", "Expire le", "Nom",
+                       "Signature jeu", "Fragments"];
+const SHARE_COL_FRAGMENTS = SHARE_HEADERS.length + 1;
+
+// Une cellule de feuille plafonne à 50 000 caractères, et deux tracés
+// routiers dépassent largement. L'instantané est donc découpé, et le nombre
+// de morceaux écrit à côté : la relecture ne devine rien.
+const SHARE_CHUNK = 45000;
+const SHARE_MAX_FRAGMENTS = 40;
+
+// Un fragment peut commencer n'importe où dans le JSON — y compris sur « = »,
+// « + » ou « - ». Sheets y verrait une formule ou un nombre et corromprait
+// la donnée en silence. Ce préfixe garantit que la cellule reste du texte ;
+// il est retiré à la relecture.
+const SHARE_FRAGMENT_PREFIX = "~";
 
 // Paramètre d'URL portant le jeton. Court, parce qu'il voyage dans un lien
 // que quelqu'un va recopier ou coller dans une messagerie.
@@ -1772,13 +1791,35 @@ function _sharesSheet_(createIfMissing) {
  * coordonnée, ni géométrie. Les données de la carte restent dans le fichier
  * Drive, dont ce registre ne fait que désigner l'emplacement.
  */
-function _enregistrerPartage_(fileId, nom, signature) {
+function _enregistrerPartage_(payloadJson, nom, signature) {
+  const texte = String(payloadJson || "");
+  if (!texte) throw new Error("Instantané vide.");
+
+  const morceaux = [];
+  for (var i = 0; i < texte.length; i += SHARE_CHUNK) {
+    morceaux.push(SHARE_FRAGMENT_PREFIX + texte.slice(i, i + SHARE_CHUNK));
+  }
+  if (morceaux.length > SHARE_MAX_FRAGMENTS) {
+    throw new Error("Instantané trop volumineux pour être partagé ("
+      + Math.round(texte.length / 1024) + " Ko).");
+  }
+
   const jeton = _jetonPartage_();
   const cree = new Date();
   const expire = new Date(cree.getTime() + SHARE_TTL_DAYS * 24 * 3600 * 1000);
-  _sharesSheet_(true).appendRow(
-    [jeton, String(fileId), String(nom || ""), cree, expire,
-     String(signature || "")]);
+
+  const sh = _sharesSheet_(true);
+  const largeur = SHARE_HEADERS.length + morceaux.length;
+  if (sh.getMaxColumns() < largeur) {
+    sh.insertColumnsAfter(sh.getMaxColumns(), largeur - sh.getMaxColumns());
+  }
+
+  const ligne = sh.getLastRow() + 1;
+  const plage = sh.getRange(ligne, 1, 1, largeur);
+  plage.setNumberFormat("@");   // ceinture, en plus du préfixe
+  plage.setValues([[jeton, cree, expire, String(nom || ""),
+                    String(signature || ""), morceaux.length]
+                   .concat(morceaux)]);
   return jeton;
 }
 
@@ -1803,12 +1844,23 @@ function _lirePartage_(jeton) {
   const maintenant = new Date();
   for (var i = 0; i < rows.length; i++) {
     if (String(rows[i][0]).trim() !== cle) continue;
-    const expire = rows[i][4];
+
+    const expire = rows[i][2];
     if (expire instanceof Date && expire.getTime() < maintenant.getTime()) {
       return null;
     }
-    const fileId = String(rows[i][1] || "").trim();
-    return fileId ? {fileId: fileId, nom: String(rows[i][2] || "")} : null;
+
+    const nb = Number(rows[i][5]) || 0;
+    if (nb < 1 || nb > SHARE_MAX_FRAGMENTS) return null;
+
+    const morceaux = sh.getRange(i + 2, SHARE_COL_FRAGMENTS, 1, nb).getValues()[0];
+    var texte = "";
+    for (var k = 0; k < nb; k++) {
+      const brut = (morceaux[k] === null || morceaux[k] === undefined)
+        ? "" : String(morceaux[k]);
+      texte += brut.slice(SHARE_FRAGMENT_PREFIX.length);
+    }
+    return texte || null;
   }
   return null;
 }
@@ -1870,7 +1922,7 @@ function exporterCarteDepuisDialogue(geometriesJson) {
     const base = _getWebAppUrl_();
     if (base) {
       info.shareUrl = base + "?" + SHARE_PARAM + "="
-        + _enregistrerPartage_(info.id, info.name, signature);
+        + _enregistrerPartage_(enrichi, info.name, signature);
     } else {
       info.shareError = MSG_WEB_APP_INDISPONIBLE;
     }

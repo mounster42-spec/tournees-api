@@ -862,7 +862,9 @@ class TestMapDownloadButton(unittest.TestCase):
         """Aucune seconde logique d'export : les deux chemins passent par le
         meme constructeur."""
         self.assertEqual(self.code.count("function _buildStandaloneCarteHtml_("), 1)
-        self.assertEqual(self.code.count("_buildStandaloneCarteHtml_("), 3)
+        # Un constructeur, trois usages : l'archive de la fenetre, l'archive
+        # depuis l'editeur, et la page servie par le lien de partage.
+        self.assertEqual(self.code.count("_buildStandaloneCarteHtml_("), 4)
         self.assertEqual(self.code.count("DriveApp.createFile("), 1)
 
     def test_the_filename_is_deterministic_and_sanitised(self):
@@ -933,10 +935,10 @@ class TestWebApp(unittest.TestCase):
     def test_the_token_is_checked_before_anything_is_served(self):
         """Le jeton est la seule cle, et il est verifie avant toute lecture."""
         body = extract_function(self.code, "doGet")
-        garde = body.index("if (!partage)")
-        service = body.index("DriveApp.getFileById(partage.fileId)")
+        garde = body.index("if (!payload)")
+        service = body.index("_buildStandaloneCarteHtml_(payload)")
         self.assertLess(garde, service,
-                        "le fichier est lu avant le controle du jeton")
+                        "la page est assemblee avant le controle du jeton")
         self.assertLess(body.index("if (!jeton)"), garde)
 
     def test_an_unknown_or_expired_token_gets_one_single_answer(self):
@@ -978,24 +980,33 @@ class TestWebApp(unittest.TestCase):
         self.assertEqual(
             self.code.count("function _buildStandaloneCarteHtml_("), 1)
 
-    def test_the_web_app_page_is_served_without_an_injected_payload(self):
-        """Servi sans payload, le gabarit passe par google.script.run : c'est
-        ce qui lui donne le trace routier et les memes boutons."""
+    def test_the_web_app_page_is_served_with_its_payload_injected(self):
+        """L'inverse de l'ancienne regle, et c'est le but.
+
+        Servi SANS payload, le gabarit reclamait ses donnees par
+        google.script.run — donc un compte autorise sur le classeur. Injecte,
+        il rend seul : c'est ce qui rend la page ouvrable par un ami."""
         body = extract_function(self.code, "doGet")
-        self.assertNotIn("_buildStandaloneCarteHtml_", body)
+        self.assertIn("_buildStandaloneCarteHtml_(payload)", body)
+        # Sans commentaires : celui qui explique la regle doit la nommer.
+        sans = strip_comments(body)
+        self.assertNotIn("google.script.run", sans)
+        self.assertNotIn("getCarteTourneesPayload", sans)
 
     def test_no_permission_is_ever_changed_by_the_code(self):
-        # DriveApp.getFileById n'est plus interdit : la Web App LIT l'archive
-        # pour la servir. Lire n'accorde aucun droit — l'acces reste porte par
-        # le jeton, et la revocation par la suppression de sa ligne.
         for interdit in ("setSharing", "addEditor", "addViewer", "ANYONE",
                          "setAccess", "setOwner", "removeEditor"):
             self.assertNotIn(interdit, self.code,
                              "le code modifie un partage : %s" % interdit)
-        lecture = extract_function(self.code, "doGet")
-        self.assertIn("DriveApp.getFileById(partage.fileId)", lecture)
-        self.assertIn(".getBlob().getDataAsString(", lecture)
-        self.assertEqual(self.code.count("DriveApp.getFileById("), 1)
+        # DriveApp.getFileById redevient interdit : plus AUCUNE lecture Drive
+        # sur le chemin de service. C'etait le seul maillon Drive entre
+        # l'adresse script.google.com et le contenu.
+        sans = strip_comments(self.code)
+        self.assertNotIn("DriveApp.getFileById", sans)
+        self.assertNotIn("getDownloadUrl", sans)
+        # Drive ne sert plus qu'a DEPOSER l'archive.
+        self.assertEqual(sans.count("DriveApp."), 1)
+        self.assertIn("DriveApp.createFile(", sans)
 
     def test_the_backend_is_untouched_by_the_web_app(self):
         with open(os.path.join(HERE, "app.py"), encoding="utf-8") as handle:
@@ -1173,16 +1184,40 @@ class TestShareableSnapshot(unittest.TestCase):
             self.assertNotIn(interdit, body,
                              "le jeton est previsible : %s" % interdit)
 
-    def test_the_registry_stores_no_map_data(self):
-        """Le registre designe un fichier ; il ne contient pas la carte."""
-        body = extract_function(self.code, "_enregistrerPartage_")
-        for interdit in ("lat", "lon", "routes", "geometr", "adresse",
-                         "payload"):
-            self.assertNotIn(interdit, body.lower(),
-                             "le registre stocke %s" % interdit)
+    def test_the_registry_holds_the_snapshot_itself(self):
+        """Le registre porte desormais l'instantane, pas un pointeur Drive.
+
+        C'est ce qui supprime la lecture Drive du chemin de service."""
         entetes = header_list("SHARE_HEADERS")
-        self.assertEqual(entetes, ["Jeton", "Fichier Drive", "Nom",
-                                   "Créée le", "Expire le", "Signature jeu"])
+        self.assertEqual(entetes, ["Jeton", "Créée le", "Expire le",
+                                   "Nom", "Signature jeu", "Fragments"])
+        self.assertNotIn("Fichier Drive", self.code)
+        body = extract_function(self.code, "_enregistrerPartage_")
+        self.assertNotIn("DriveApp", body)
+        self.assertNotIn("fileId", body)
+
+    def test_the_snapshot_is_split_under_the_cell_limit(self):
+        """Une cellule plafonne a 50 000 caracteres ; deux traces routiers
+        depassent largement."""
+        self.assertIn("const SHARE_CHUNK = 45000;", self.code)
+        body = extract_function(self.code, "_enregistrerPartage_")
+        self.assertIn("texte.slice(i, i + SHARE_CHUNK)", body)
+        self.assertIn("morceaux.length", body)
+        # Un instantane aberrant est refuse net plutot qu'ecrit tronque.
+        self.assertIn("SHARE_MAX_FRAGMENTS", body)
+        self.assertIn("trop volumineux", body)
+        lire = extract_function(self.code, "_lirePartage_")
+        self.assertIn("SHARE_COL_FRAGMENTS, 1, nb", lire)
+
+    def test_a_fragment_can_never_be_read_as_a_formula(self):
+        """Un decoupage peut tomber sur « = », « + » ou « - » : Sheets y
+        verrait une formule et corromprait la donnee en silence."""
+        self.assertIn('const SHARE_FRAGMENT_PREFIX = "~";', self.code)
+        ecrit = extract_function(self.code, "_enregistrerPartage_")
+        self.assertIn("SHARE_FRAGMENT_PREFIX + texte.slice(", ecrit)
+        self.assertIn('setNumberFormat("@")', ecrit)
+        lit = extract_function(self.code, "_lirePartage_")
+        self.assertIn("brut.slice(SHARE_FRAGMENT_PREFIX.length)", lit)
 
     def test_a_share_expires(self):
         self.assertIn("const SHARE_TTL_DAYS = 30;", self.code)
@@ -1212,7 +1247,7 @@ class TestShareableSnapshot(unittest.TestCase):
         export = extract_function(self.code, "exporterCarteDepuisDialogue")
         self.assertIn("_getWebAppUrl_()", export)
         self.assertIn('base + "?" + SHARE_PARAM + "="', export)
-        self.assertIn("_enregistrerPartage_(info.id", export)
+        self.assertIn("_enregistrerPartage_(enrichi", export)
         # Sans Web App deployee, pas de lien mort : un message.
         self.assertIn("info.shareError = MSG_WEB_APP_INDISPONIBLE;", export)
 
@@ -1235,10 +1270,17 @@ class TestShareableSnapshot(unittest.TestCase):
 
     # --- ce que voit l'ami -----------------------------------------------
 
-    def test_the_shared_page_is_the_archive_itself(self):
+    def test_the_shared_page_is_assembled_without_touching_drive(self):
+        """Le seul maillon Drive du chemin de service a disparu."""
         body = extract_function(self.code, "doGet")
-        self.assertIn("DriveApp.getFileById(partage.fileId)", body)
+        self.assertIn("_buildStandaloneCarteHtml_(payload)", body)
         self.assertIn("HtmlService.createHtmlOutput(html)", body)
+        for interdit in ("DriveApp", "drive.google.com", "/file/d/",
+                         "uc?export=", "/view", "getDownloadUrl",
+                         "setLocation", "window.location", "location.href",
+                         "http-equiv", "refresh"):
+            self.assertNotIn(interdit, strip_comments(body),
+                             "doGet passe encore par %s" % interdit)
         # Servie responsive, comme le dialogue.
         self.assertIn("width=device-width, initial-scale=1, viewport-fit=cover",
                       body)
