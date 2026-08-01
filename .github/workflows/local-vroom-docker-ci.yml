@@ -10,12 +10,12 @@ name: local vroom docker ci
 # Il ne publie aucune image et ne deploie rien.
 
 on:
-  push:
-    branches:
-      - exp-local-vroom-alns
   pull_request:
     branches:
-      - lot-ors-matrix-connected
+      - main
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
