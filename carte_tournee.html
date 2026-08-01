@@ -36,7 +36,7 @@
   #actions button{font:inherit;padding:5px 12px;cursor:pointer;
     border:1px solid #999;border-radius:4px;background:#fff}
   #actions button:disabled{opacity:.5;cursor:default}
-  #geo-status,#download-result{margin-left:10px;color:#555}
+  #geo-status,#download-result,#fullscreen-result{margin-left:10px;color:#555}
   #geo-status.loaded{color:#1e8449}
   #geo-status.fallback{color:#b9770e}
   .block h2{margin:0 0 4px;font-size:13px}
@@ -126,9 +126,12 @@
          exporté, ni les boutons ni le chargement n'ont de sens. -->
     <div class="block" id="actions" style="display:none">
       <div class="actions">
-        <button id="btn-fullscreen" type="button" class="primaire">Ouvrir en grand</button>
+        <button id="btn-fullscreen" type="button" class="primaire">Plein écran</button>
         <button id="btn-download" type="button">Exporter</button>
       </div>
+      <!-- Deux sorties distinctes : l'ouverture en grand et l'export ne se
+           recouvrent plus, chacune garde son message. -->
+      <div id="fullscreen-result"></div>
       <div id="geo-status"></div>
       <div id="download-result"></div>
     </div>
@@ -163,6 +166,11 @@ var COLOR_END   = "#6c3483";   // violet
 var FALLBACK_COLORS = ["#1f5fa9", "#d35400"];
 
 var MSG_EMPTY = "Aucune tournée récente disponible. Lancez une optimisation.";
+
+// Même phrase que côté script : une Web App absente se dit d'une seule façon,
+// et jamais en renvoyant l'utilisateur vers l'archive Drive.
+var MSG_WEB_APP_KO = "La Web App n'est pas encore disponible. Mettez à jour "
+                   + "ou déployez l'application Web Apps Script.";
 
 
 /* ---------- utilitaires ---------- */
@@ -781,28 +789,36 @@ function chargerGeometrie(){
 }
 
 /**
- * « Ouvrir en grand » : la même carte dans un vrai onglet HTTPS.
+ * « Plein écran » : la même carte dans un vrai onglet HTTPS.
  *
  * Le Fullscreen API n'est pas fiable dans l'iframe sandboxée d'un dialogue
  * Apps Script. Agrandir l'iframe donnerait un faux plein écran, toujours
  * borné par le dialogue. On ouvre donc la Web App, qui est une vraie page.
+ *
+ * L'adresse vient de getWebAppUrl, qui délègue au seul helper validé côté
+ * script. Ni archive Drive, ni lien /view, ni URL de téléchargement ne
+ * peuvent arriver ici : le helper les refuse.
  */
 function ouvrirEnGrand(){
   if (!enAppsScript()) return;
-  var sortie = document.getElementById("download-result");
+  var sortie = document.getElementById("fullscreen-result");
   sortie.textContent = " Ouverture…";
   google.script.run
     .withSuccessHandler(function(url){
       if (!url){
-        sortie.innerHTML = " <span style='color:#b06000'>La Web App n'est pas "
-          + "encore déployée. Utilisez Exporter en attendant.</span>";
+        sortie.innerHTML = " <span style='color:#b06000'>"
+          + esc(MSG_WEB_APP_KO) + "</span>";
         return;
       }
-      // Une fenêtre ouverte hors clic direct peut être bloquée : le lien
-      // reste affiché pour que l'utilisateur décide lui-même.
-      window.open(url, "_blank");
-      sortie.innerHTML = ' <a href="' + esc(url) + '" target="_blank">'
-        + "Ouvrir la carte ↗</a>";
+      // Une fenêtre ouverte hors clic direct peut être bloquée. La carte
+      // courante n'est jamais fermée : le lien reste affiché et un second
+      // clic, celui-là direct, aboutit toujours.
+      var onglet = null;
+      try { onglet = window.open(url, "_blank"); } catch (e){ onglet = null; }
+      var lien = ' <a href="' + esc(url) + '" target="_blank">Plein écran ↗</a>';
+      sortie.innerHTML = onglet ? lien
+        : " <span style='color:#b06000'>Votre navigateur a bloqué la "
+          + "fenêtre.</span>" + lien;
     })
     .withFailureHandler(function(){
       sortie.textContent = " Impossible d'obtenir l'adresse de la carte.";

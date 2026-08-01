@@ -943,18 +943,6 @@ class TestWebApp(unittest.TestCase):
         body = extract_function(self.code, "doGet")
         self.assertNotIn("_buildStandaloneCarteHtml_", body)
 
-    def test_opening_the_map_survives_a_blocked_popup(self):
-        body = extract_function(self.code, "ouvrirLaCarte")
-        self.assertIn("window.open(", body)
-        self.assertIn("min-height:44px", body)
-        self.assertIn("bloqué la fenêtre", body)
-
-    def test_a_missing_deployment_is_explained_not_a_dead_link(self):
-        body = extract_function(self.code, "ouvrirLaCarte")
-        self.assertIn("if (!url)", body)
-        self.assertIn("pas encore déployée", body)
-        self.assertIn("Exporter la carte", body)
-
     def test_no_permission_is_ever_changed_by_the_code(self):
         for interdit in ("setSharing", "addEditor", "addViewer", "ANYONE",
                          "DriveApp.getFileById", "setAccess"):
@@ -966,6 +954,127 @@ class TestWebApp(unittest.TestCase):
             backend = handle.read()
         routes = sorted(re.findall(r'@app\.route\("([^"]+)"', backend))
         self.assertEqual(routes, ["/", "/healthz", "/map-geometry", "/optimize"])
+
+
+class TestWebAppUrlIsTheOnlySource(unittest.TestCase):
+    """L'ouverture en grand passait une adresse NON VALIDEE a window.open.
+
+    getWebAppUrl rendait telle quelle la chaine reçue de la plateforme :
+    `return url ? String(url) : "";`. Une adresse de brouillon en /dev, une
+    adresse de classeur ou une adresse Drive heritee du chemin d'export
+    partaient donc directement dans l'onglet. Drive n'affiche pas les fichiers
+    HTML — il repond « Impossible d'ouvrir le fichier pour le moment ».
+
+    Un seul helper produit desormais cette adresse, et il la regarde."""
+
+    def setUp(self):
+        self.code = read_code()
+        self.html = read_map_html()
+
+    def test_the_single_source_of_truth_is_the_script_service(self):
+        helper = extract_function(self.code, "_getWebAppUrl_")
+        self.assertIn("ScriptApp.getService().getUrl()", helper)
+        self.assertIn("_validerUrlWebApp_(", helper)
+        self.assertIn("catch (e)", helper)
+        # Une seule lecture de la plateforme dans tout le CODE : aucune autre
+        # fonction ne peut fabriquer une adresse d'ouverture. Le comptage
+        # porte sur le code sans commentaires, la documentation du helper
+        # citant elle-meme l'appel.
+        self.assertEqual(
+            strip_comments(self.code).count("ScriptApp.getService().getUrl()"),
+            1)
+        self.assertEqual(self.code.count("function _getWebAppUrl_("), 1)
+
+    def test_the_rpc_surface_only_delegates(self):
+        """getWebAppUrl reste appelable par google.script.run, sans logique."""
+        wrapper = extract_function(self.code, "getWebAppUrl")
+        self.assertIn("return _getWebAppUrl_();", wrapper)
+        self.assertNotIn("ScriptApp", wrapper)
+        # L'ancienne forme, celle qui rendait la chaine sans la regarder.
+        self.assertNotIn('return url ? String(url) : "";', self.code)
+
+    def test_only_an_exec_deployment_url_is_accepted(self):
+        valider = extract_function(self.code, "_validerUrlWebApp_")
+        self.assertIn('const WEB_APP_URL_SUFFIXE = "/exec";', self.code)
+        self.assertIn("WEB_APP_URL_SUFFIXE", valider)
+        self.assertIn('url.indexOf("https://") !== 0', valider)
+
+    def test_a_drive_url_is_refused_fragment_by_fragment(self):
+        interdits = header_list("WEB_APP_URL_INTERDITS")
+        for fragment in ("drive.google.com", "/file/d/", "uc?export=",
+                         "/view", "/download"):
+            self.assertIn(fragment, interdits,
+                          "%s doit disqualifier une adresse d'ouverture"
+                          % fragment)
+        valider = extract_function(self.code, "_validerUrlWebApp_")
+        self.assertIn("WEB_APP_URL_INTERDITS", valider)
+        self.assertIn('return "";', valider)
+
+    def test_an_empty_url_says_so_and_offers_no_drive_fallback(self):
+        self.assertIn("La Web App n'est pas encore disponible. Mettez à jour ",
+                      self.code)
+        self.assertIn("l'application Web Apps Script.", self.code)
+        body = extract_function(self.code, "ouvrirLaCarte")
+        self.assertIn("if (!url)", body)
+        self.assertIn("MSG_WEB_APP_INDISPONIBLE", body)
+        # Aucun repli vers l'archive : ni lien Drive, ni renvoi vers l'export.
+        for interdit in ("drive.google.com", "downloadUrl", "info.url",
+                         "exporterCartePartageable", "DriveApp"):
+            self.assertNotIn(interdit, body,
+                             "ouvrirLaCarte propose %s en repli" % interdit)
+
+    def test_the_same_helper_serves_the_menu_and_the_map_button(self):
+        menu = extract_function(self.code, "ouvrirLaCarte")
+        self.assertIn("_getWebAppUrl_()", menu)
+        bouton = extract_function(self.html, "ouvrirEnGrand")
+        self.assertIn("getWebAppUrl()", bouton)
+        # Deux points d'appel cote script, et deux seulement : l'entree de
+        # menu et la surface RPC que le bouton de la carte interroge. La
+        # definition elle-meme est exclue du comptage.
+        appels = re.findall(r"(?<!function )_getWebAppUrl_\(\)", self.code)
+        self.assertEqual(len(appels), 2)
+
+    def test_the_drive_archive_url_never_reaches_an_opening_function(self):
+        """L'archive naît dans _deposerCarteSurDrive_ et n'en sort que pour
+        l'export. Aucune fonction d'ouverture ne la voit."""
+        depot = extract_function(self.code, "_deposerCarteSurDrive_")
+        self.assertIn("file.getUrl()", depot)
+        self.assertIn("uc?export=download", depot)
+        for name in ("ouvrirLaCarte", "_getWebAppUrl_", "_validerUrlWebApp_",
+                     "getWebAppUrl"):
+            body = extract_function(self.code, name)
+            for interdit in ("file.getUrl()", "_deposerCarteSurDrive_",
+                             "uc?export=download"):
+                self.assertNotIn(interdit, body,
+                                 "%s manipule l'adresse de l'archive" % name)
+
+    # --- la petite fenetre de repli --------------------------------------
+
+    def test_the_modal_is_titled_open_the_map_and_acts_by_fullscreen(self):
+        body = extract_function(self.code, "ouvrirLaCarte")
+        self.assertEqual(body.count('"Ouvrir la carte");'), 2)   # les 2 titres
+        self.assertIn("Plein écran</a>", body)
+        # Pas de second bouton portant le meme libelle que le titre.
+        self.assertNotIn(">Ouvrir la carte</a>", body)
+
+    def test_the_modal_tries_to_open_the_tab_by_itself(self):
+        body = extract_function(self.code, "ouvrirLaCarte")
+        self.assertIn("window.open(", body)
+        self.assertIn("JSON.stringify(url)", body)
+
+    def test_the_modal_keeps_a_manual_button_and_says_why(self):
+        body = extract_function(self.code, "ouvrirLaCarte")
+        self.assertIn('target="_blank"', body)
+        self.assertIn("Si la carte ne s'ouvre pas automatiquement, cliquez "
+                      "sur ", body)
+        self.assertIn("Plein écran.", body)
+
+    def test_the_modal_button_is_touch_sized_and_never_truncated(self):
+        body = extract_function(self.code, "ouvrirLaCarte")
+        self.assertIn("min-height:44px", body)
+        self.assertIn("text-align:center", body)
+        self.assertIn("box-sizing:border-box", body)
+        self.assertIn("max-width:100%", body)
 
 
 class TestMapResponsive(unittest.TestCase):
@@ -1034,8 +1143,13 @@ class TestMapResponsive(unittest.TestCase):
 
     def test_the_two_dialog_actions_are_the_requested_ones(self):
         self.assertIn('id="btn-fullscreen"', self.html)
-        self.assertIn(">Ouvrir en grand<", self.html)
+        self.assertIn(">Plein écran<", self.html)
         self.assertIn(">Exporter<", self.html)
+        # L'ancien libelle a disparu de la barre d'actions, et « Ouvrir la
+        # carte » n'y reapparait sous aucune forme : c'est le nom de l'entree
+        # de menu, pas celui d'un bouton de la carte.
+        self.assertNotIn("Ouvrir en grand", self.html)
+        self.assertNotIn("Ouvrir la carte", self.html)
 
     def test_fullscreen_opens_the_web_app_not_a_fake_one(self):
         """Le Fullscreen API n'est pas fiable dans l'iframe d'un dialogue :
@@ -1045,13 +1159,28 @@ class TestMapResponsive(unittest.TestCase):
         self.assertIn("getWebAppUrl()", body)
         self.assertNotIn("requestFullscreen", self.html)
 
+    def test_fullscreen_never_opens_the_drive_archive(self):
+        """Le bouton lit l'adresse validee cote script, et rien d'autre."""
+        body = extract_function(self.html, "ouvrirEnGrand")
+        for interdit in ("drive.google.com", "downloadUrl", "info.url",
+                         "exporterCarteDepuisDialogue", "/view", "/file/d/"):
+            self.assertNotIn(interdit, body,
+                             "« Plein écran » peut ouvrir %s" % interdit)
+
+    def test_a_blocked_popup_leaves_the_map_open_and_offers_a_second_click(self):
+        body = extract_function(self.html, "ouvrirEnGrand")
+        self.assertIn("bloqué la ", body)
+        self.assertIn("Plein écran ↗</a>", body)
+        # La carte courante n'est ni fermee ni rechargee.
+        for interdit in ("window.close", "location.reload", "renderCarte("):
+            self.assertNotIn(interdit, body)
+
     def test_a_missing_web_app_is_explained_not_a_dead_link(self):
         body = extract_function(self.html, "ouvrirEnGrand")
-        self.assertIn("n'est pas", body)
-        self.assertIn("encore déployée", body)
-        helper = extract_function(read_code(), "getWebAppUrl")
-        self.assertIn('return url ? String(url) : "";', helper)
-        self.assertIn("catch (e)", helper)
+        self.assertIn("MSG_WEB_APP_KO", body)
+        self.assertIn("La Web App n'est pas encore disponible.", self.html)
+        # La meme phrase des deux cotes : une seule facon de dire la chose.
+        self.assertIn("La Web App n'est pas encore disponible.", read_code())
 
 
 class TestMapGeometryWiring(unittest.TestCase):
@@ -1106,6 +1235,10 @@ class TestMapGeometryWiring(unittest.TestCase):
             "https://tournees-api.onrender.com",
             # Lien AFFICHE a l'utilisateur, pas un appel sortant du script.
             "https://drive.google.com/uc?export=download&id=",
+            # Prefixe de schema, sans hote : sert a REFUSER une adresse
+            # d'ouverture qui ne serait pas en HTTPS. Ne designe aucune
+            # destination et ne peut pas en devenir une.
+            "https://",
         })
 
     def test_the_geometry_request_carries_exactly_two_routes(self):

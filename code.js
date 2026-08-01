@@ -1323,6 +1323,89 @@ function doGet(e) {
 }
 
 
+// =========================
+// URL DE LA WEB APP : SOURCE UNIQUE
+// =========================
+// Toute ouverture « en grand » — entrée de menu comme bouton de la carte —
+// passe par _getWebAppUrl_ et par rien d'autre.
+//
+// Pourquoi une validation, alors que la plateforme est censée rendre la
+// bonne valeur : parce que l'ancienne version rendait TELLE QUELLE la chaîne
+// reçue, sans jamais la regarder. Une adresse de brouillon en /dev, une
+// adresse de classeur, ou une adresse Drive héritée du chemin d'export
+// partaient donc directement dans window.open. Drive n'affiche pas les
+// fichiers HTML : il répond « Impossible d'ouvrir le fichier pour le
+// moment », et l'utilisateur n'avait aucun moyen de savoir d'où venait
+// l'adresse.
+//
+// L'archive Drive naît dans _deposerCarteSurDrive_ et n'en sort JAMAIS pour
+// alimenter une ouverture de carte. Les deux mondes ne se croisent plus :
+// l'un sert à consulter, l'autre à archiver.
+
+const WEB_APP_URL_SUFFIXE = "/exec";
+
+// Fragments qui disqualifient une adresse. Ce sont ceux d'un fichier Drive,
+// d'un export, d'un téléchargement ou d'un aperçu — jamais ceux d'une Web App.
+const WEB_APP_URL_INTERDITS = [
+  "drive.google.com", "/file/d/", "uc?export=", "/view", "/download"
+];
+
+const MSG_WEB_APP_INDISPONIBLE =
+    "La Web App n'est pas encore disponible. Mettez à jour ou déployez "
+  + "l'application Web Apps Script.";
+
+
+/**
+ * Rend l'adresse si elle est utilisable pour ouvrir la carte, "" sinon.
+ *
+ * Une adresse refusée n'est jamais remplacée par un repli : mieux vaut un
+ * message clair qu'un lien qui mène ailleurs que là où il annonce.
+ */
+function _validerUrlWebApp_(brut) {
+  const url = String(brut === null || brut === undefined ? "" : brut).trim();
+  if (!url) return "";
+  if (url.indexOf("https://") !== 0) return "";
+
+  const bas = url.toLowerCase();
+  for (var i = 0; i < WEB_APP_URL_INTERDITS.length; i++) {
+    if (bas.indexOf(WEB_APP_URL_INTERDITS[i]) !== -1) return "";
+  }
+
+  // Un déploiement d'application Web se termine par /exec. /dev est l'adresse
+  // de brouillon : réservée aux éditeurs du script, elle n'ouvrirait rien
+  // pour la personne qui conduit la tournée.
+  const fin = bas.length - WEB_APP_URL_SUFFIXE.length;
+  if (fin < 0 || bas.lastIndexOf(WEB_APP_URL_SUFFIXE) !== fin) return "";
+
+  return url;
+}
+
+
+/**
+ * Source de vérité unique de l'URL Web App : ScriptApp.getService().getUrl().
+ *
+ * Ne lève jamais — avant le premier déploiement, ScriptApp n'a pas d'URL à
+ * donner, et l'appelant doit alors le dire plutôt qu'afficher un lien mort.
+ */
+function _getWebAppUrl_() {
+  try {
+    return _validerUrlWebApp_(ScriptApp.getService().getUrl());
+  } catch (e) {
+    return "";
+  }
+}
+
+
+/**
+ * Surface appelée depuis le HTML par google.script.run : doit rester au
+ * niveau global. Aucune logique ici, uniquement la délégation — le helper
+ * reste le seul endroit où une adresse d'ouverture est produite et validée.
+ */
+function getWebAppUrl() {
+  return _getWebAppUrl_();
+}
+
+
 /**
  * Entrée de menu « Ouvrir la carte ».
  *
@@ -1330,21 +1413,24 @@ function doGet(e) {
  * une petite fenêtre qui tente window.open, et qui garde en toutes
  * circonstances un grand bouton : un pop-up bloqué n'est pas une erreur, il
  * suffit de cliquer.
+ *
+ * L'adresse vient de _getWebAppUrl_ et de nulle part ailleurs. Sans Web App
+ * valide, la fenêtre le dit ; elle ne propose JAMAIS l'archive Drive en
+ * remplacement, puisque Drive n'affiche pas les fichiers HTML.
  */
 function ouvrirLaCarte() {
-  const url = getWebAppUrl();
+  const url = _getWebAppUrl_();
 
   if (!url) {
     SpreadsheetApp.getUi().showModalDialog(
       HtmlService.createHtmlOutput(
           '<div style="font-family:Arial,sans-serif;font-size:13px;'
         + 'line-height:1.6;padding:16px">'
-        + "<b>La Web App n'est pas encore déployée.</b><br><br>"
-        + "Dans l'éditeur Apps Script : <i>Déployer &rsaquo; Nouveau "
-        + "déploiement &rsaquo; Application Web</i>, en exécutant "
-        + "« en tant qu'utilisateur accédant » et en limitant l'accès aux "
-        + "utilisateurs connectés.<br><br>"
-        + "En attendant, <b>Exporter la carte</b> reste disponible."
+        + "<b>" + MSG_WEB_APP_INDISPONIBLE + "</b><br><br>"
+        + "Dans l'éditeur Apps Script : <i>Déployer &rsaquo; Gérer les "
+        + "déploiements</i>, puis mettez à jour la version de l'application "
+        + "Web, en l'exécutant « en tant qu'utilisateur accédant » et en "
+        + "limitant l'accès aux utilisateurs connectés."
         + "</div>").setWidth(460).setHeight(240),
       "Ouvrir la carte");
     return;
@@ -1355,20 +1441,26 @@ function ouvrirLaCarte() {
                     .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
   };
 
+  // inline-flex plutôt que line-height : le texte reste centré et entier même
+  // si la police du poste est plus grande que prévu, et le bouton grandit au
+  // lieu de rogner son libellé.
   SpreadsheetApp.getUi().showModalDialog(
     HtmlService.createHtmlOutput(
         '<div style="font-family:Arial,sans-serif;font-size:13px;'
-      + 'line-height:1.6;padding:16px;text-align:center">'
-      + '<a id="lien" href="' + esc(url) + '" target="_blank" '
-      + 'style="display:inline-block;min-height:44px;line-height:44px;'
-      + 'padding:0 22px;background:#1a73e8;color:#fff;border-radius:6px;'
-      + 'text-decoration:none;font-weight:bold">Ouvrir la carte</a>'
-      + '<div style="margin-top:14px;color:#5f6368">'
-      + "Si rien ne s'ouvre, votre navigateur a bloqué la fenêtre : "
-      + "cliquez sur le bouton ci-dessus.</div>"
+      + 'line-height:1.6;padding:20px 16px;text-align:center;'
+      + 'box-sizing:border-box;max-width:100%;overflow-wrap:break-word">'
+      + '<a id="plein-ecran" href="' + esc(url) + '" target="_blank" '
+      + 'style="display:inline-flex;align-items:center;justify-content:center;'
+      + 'box-sizing:border-box;min-height:44px;min-width:180px;max-width:100%;'
+      + 'padding:0 26px;background:#1a73e8;color:#fff;border-radius:6px;'
+      + 'text-decoration:none;font-weight:bold;font-size:14px">'
+      + "Plein écran</a>"
+      + '<div style="margin-top:16px;color:#5f6368">'
+      + "Si la carte ne s'ouvre pas automatiquement, cliquez sur "
+      + "Plein écran.</div>"
       + "<script>try{window.open("
       + JSON.stringify(url) + ",'_blank');}catch(e){}<\/script>"
-      + "</div>").setWidth(420).setHeight(210),
+      + "</div>").setWidth(420).setHeight(230),
     "Ouvrir la carte");
 }
 
@@ -1510,24 +1602,6 @@ function afficherCarteTournees(result, params, points) {
 // et c'est la seule raison pour laquelle cet aller-retour existe.
 
 const MAP_GEOMETRY_TIMEOUT_MS = 25000;
-
-
-/**
- * URL de la Web App, ou "" tant qu'aucun déploiement n'existe.
- *
- * Appelée depuis le HTML par google.script.run : doit rester au niveau
- * global. Ne lève jamais — avant le premier déploiement, ScriptApp n'a pas
- * d'URL à donner, et la carte doit alors le dire plutôt que d'afficher un
- * lien mort.
- */
-function getWebAppUrl() {
-  try {
-    const url = ScriptApp.getService().getUrl();
-    return url ? String(url) : "";
-  } catch (e) {
-    return "";
-  }
-}
 
 
 /** Coordonnées [lon, lat] des deux tournées, dans l'ordre EXACT de passage. */
