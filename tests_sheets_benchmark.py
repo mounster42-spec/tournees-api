@@ -1030,11 +1030,27 @@ class TestWebAppUrlIsTheOnlySource(unittest.TestCase):
         self.code = read_code()
         self.html = read_map_html()
 
-    def test_the_single_source_of_truth_is_the_script_service(self):
+    def test_the_registered_url_wins_over_the_script_service(self):
+        """ScriptApp.getService().getUrl() rend l'adresse du SERVICE, qui
+        reste celle du deploiement d'origine.
+
+        Creer un NOUVEAU deploiement au lieu d'une nouvelle version fait
+        diverger les deux, et les liens partent vers un deploiement qui ne
+        sert plus le code courant. L'adresse enregistree l'emporte donc."""
         helper = extract_function(self.code, "_getWebAppUrl_")
-        self.assertIn("ScriptApp.getService().getUrl()", helper)
-        self.assertIn("_validerUrlWebApp_(", helper)
-        self.assertIn("catch (e)", helper)
+        self.assertIn("_urlWebAppEnregistree_() || _urlServiceScript_()",
+                      helper)
+        enregistree = extract_function(self.code, "_urlWebAppEnregistree_")
+        self.assertIn("getProperty(PROP_WEBAPP_URL)", enregistree)
+        self.assertIn("_validerUrlWebApp_(", enregistree)
+        self.assertIn("catch (e)", enregistree)
+        service = extract_function(self.code, "_urlServiceScript_")
+        self.assertIn("ScriptApp.getService().getUrl()", service)
+        self.assertIn("_validerUrlWebApp_(", service)
+        self.assertIn("catch (e)", service)
+        # Les deux sources sont validees par le MEME controleur.
+        self.assertEqual(strip_comments(self.code)
+                         .count("ScriptApp.getService().getUrl()"), 1)
         # Une seule lecture de la plateforme dans tout le CODE : aucune autre
         # fonction ne peut fabriquer une adresse d'ouverture. Le comptage
         # porte sur le code sans commentaires, la documentation du helper
@@ -1242,6 +1258,59 @@ class TestShareableSnapshot(unittest.TestCase):
         self.assertNotIn("revoquerPartagesCarte", menu)
 
     # --- le lien ---------------------------------------------------------
+
+    def test_the_deployment_url_is_configurable_not_hardcoded(self):
+        """Aucun identifiant de deploiement fige dans le code."""
+        self.assertIn('const PROP_WEBAPP_URL = "TOURNEES_WEBAPP_URL";',
+                      self.code)
+        setter = extract_function(self.code, "definirUrlWebApp")
+        self.assertIn("_validerUrlWebApp_(url)", setter)
+        self.assertIn("setProperty(PROP_WEBAPP_URL, propre)", setter)
+        # Une adresse refusee n'est PAS enregistree.
+        self.assertLess(setter.index("if (!propre)"),
+                        setter.index("setProperty("))
+        self.assertIn("MSG_URL_INVALIDE", setter)
+        # On peut revenir en arriere.
+        self.assertIn("deleteProperty(PROP_WEBAPP_URL)",
+                      extract_function(self.code, "oublierUrlWebApp"))
+        # Aucun AKfycb... en dur nulle part.
+        self.assertNotIn("AKfycb", self.code)
+        self.assertNotIn("AKfycb", read_map_html())
+
+    def test_the_deployment_id_is_shown_before_a_link_is_created(self):
+        """Voir la divergence AVANT d'envoyer un lien mort a quelqu'un."""
+        info = extract_function(self.code, "getInfoDeploiement")
+        for champ in ("deploiement:", "source:", "divergent:",
+                      "deploiementService:", "buildId:"):
+            self.assertIn(champ, info)
+        html = read_map_html()
+        self.assertIn("chargerInfoDeploiement();", html)
+        # Demande a l'ouverture de la carte, pas au moment du partage.
+        boot = html[html.index("function boot()"):]
+        self.assertIn("chargerInfoDeploiement();", boot)
+        bloc = extract_function(html, "blocDeploiement")
+        self.assertIn("Déploiement utilisé : ", bloc)
+        self.assertIn("info.divergent", bloc)
+        self.assertIn("esc(info.source", bloc)
+
+    def test_the_deployment_id_is_read_from_the_url(self):
+        body = extract_function(self.code, "_idDeploiement_")
+        self.assertIn("match(/\\/s\\/([^\\/]+)\\/exec$/)", body)
+        # Rendu vide plutot que faux quand l'adresse n'est pas une /exec.
+        self.assertIn('return trouve ? trouve[1] : "";', body)
+
+    def test_a_pasted_url_goes_through_the_same_validation(self):
+        """Une adresse Drive, une /dev ou un domaine inattendu sont refuses
+        a l'enregistrement comme ils le sont a la lecture."""
+        setter = extract_function(self.code, "definirUrlWebApp")
+        self.assertIn("_validerUrlWebApp_(", setter)
+        self.assertNotIn("setProperty(PROP_WEBAPP_URL, url)", setter)
+        saisie = extract_function(read_map_html(), "enregistrerUrlWebApp")
+        self.assertIn(".definirUrlWebApp(champ.value)", saisie)
+        self.assertIn('getElementById("webapp-url")', saisie)
+        # Rien n'est ouvert, rien n'est copie depuis ce champ.
+        for interdit in ("window.open", "href", "clipboard"):
+            self.assertNotIn(interdit, saisie)
 
     def test_the_parameter_is_named_share_on_both_sides(self):
         """Poser et lire le parametre viennent de la MEME constante : les

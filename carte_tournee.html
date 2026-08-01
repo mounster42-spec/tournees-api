@@ -95,6 +95,15 @@
      retire : plus aucun lien sortant dans la barre d'actions, donc plus de
      regle a maintenir. */
 
+  /* Reglage du deploiement : replie par defaut, il ne sert qu'une fois. */
+  details.deploiement{margin-top:8px;font-size:11px;color:#666}
+  details.deploiement>summary{cursor:pointer;min-height:44px;display:flex;
+    align-items:center;color:#5f6368}
+  details.deploiement input{width:100%;box-sizing:border-box;min-height:44px;
+    padding:0 10px;font:inherit;font-size:12px;color:#222;background:#fff;
+    border:1px solid #999;border-radius:6px;margin:6px 0}
+  .divergent{color:#b06000;font-weight:600}
+
   /* Bloc de partage : le lien doit etre visible et selectionnable, y compris
      si la copie automatique est refusee par le navigateur. */
   .partage{margin-top:10px}
@@ -1016,17 +1025,97 @@ function afficherPartage(info){
   html += "<div class='meta'>Archive dans votre Drive : "
         + esc(info.name) + " — " + esc(String(info.sizeKb)) + " Ko<br>"
         + esc(MSG_PARTAGE_AIDE)
-        + "<br>version " + esc(info.buildId || "?") + "</div></div>";
+        + "<br>version " + esc(info.buildId || "?") + "</div>"
+        + blocDeploiement() + "</div>";
 
   sortie.innerHTML = html;
 
   var copier = document.getElementById("btn-copy");
   if (copier) copier.addEventListener("click", copierLien);
+  brancherDeploiement();
 
   var fermer = document.getElementById("btn-close-share");
   if (fermer) fermer.addEventListener("click", function(){
     sortie.innerHTML = "";
   });
+}
+
+
+/* ---------- déploiement utilisé ---------- */
+
+// Rempli avant l'export par getInfoDeploiement() : on veut SAVOIR quel
+// déploiement le lien va désigner avant de l'envoyer à quelqu'un.
+var infoDeploiement = null;
+
+/** Demande au script quel déploiement le partage utilisera. */
+function chargerInfoDeploiement(){
+  if (!enAppsScript()) return;
+  google.script.run
+    .withSuccessHandler(function(json){
+      try { infoDeploiement = JSON.parse(json); } catch (e){ infoDeploiement = null; }
+    })
+    .withFailureHandler(function(){ infoDeploiement = null; })
+    .getInfoDeploiement();
+}
+
+/**
+ * Bloc « Déploiement utilisé », replié.
+ *
+ * ScriptApp.getService().getUrl() rend l'adresse du service du script, pas
+ * celle du déploiement qu'on vient de mettre à jour. Créer un NOUVEAU
+ * déploiement au lieu d'une nouvelle version fait diverger les deux, et le
+ * lien part alors vers un déploiement qui ne sert plus le code courant. On
+ * montre donc l'identifiant retenu, et on laisse le corriger.
+ */
+function blocDeploiement(){
+  var info = infoDeploiement || {};
+  var id = info.deploiement || "(inconnu)";
+  var alerte = info.divergent
+    ? "<div class='divergent'>L'adresse enregistrée et celle du service "
+      + "diffèrent. C'est l'adresse enregistrée qui est utilisée.</div>"
+    : "";
+
+  return "<details class='deploiement'><summary>Déploiement utilisé : "
+       + esc(id) + "</summary>"
+       + alerte
+       + "<div>Source : " + esc(info.source || "aucune") + ".</div>"
+       + "<div>Si ce n'est pas le déploiement actif, collez son adresse "
+       + "/exec ci-dessous, puis relancez « Exporter et partager ».</div>"
+       + "<input id='webapp-url' type='text' placeholder='https://script."
+       + "google.com/macros/s/.../exec'>"
+       + "<div class='actions'>"
+       + "<button type='button' id='btn-save-url'>Enregistrer ce déploiement"
+       + "</button></div>"
+       + "<div id='url-state' class='meta'></div></details>";
+}
+
+function brancherDeploiement(){
+  var bouton = document.getElementById("btn-save-url");
+  if (bouton) bouton.addEventListener("click", enregistrerUrlWebApp);
+}
+
+/** Enregistre l'adresse collée, après validation côté script. */
+function enregistrerUrlWebApp(){
+  if (!enAppsScript()) return;
+  var champ = document.getElementById("webapp-url");
+  var etat = document.getElementById("url-state");
+  if (!champ || !etat) return;
+
+  etat.textContent = "Vérification…";
+  google.script.run
+    .withSuccessHandler(function(json){
+      var r;
+      try { r = JSON.parse(json); }
+      catch (e){ etat.textContent = "Réponse illisible."; return; }
+      if (!r.ok){ etat.textContent = r.message || "Adresse refusée."; return; }
+      etat.textContent = "Déploiement enregistré : " + r.deploiement
+        + ". Relancez « Exporter et partager » pour obtenir un lien à jour.";
+      chargerInfoDeploiement();
+    })
+    .withFailureHandler(function(){
+      etat.textContent = "Enregistrement impossible.";
+    })
+    .definirUrlWebApp(champ.value);
 }
 
 
@@ -1078,6 +1167,9 @@ document.getElementById("drawer-handle")
             .addEventListener("click", telechargerCarte);
     document.getElementById("btn-zoom")
             .addEventListener("click", basculerAgrandissement);
+    // Demandé dès l'ouverture : le déploiement retenu doit être connu AVANT
+    // qu'un lien soit créé, pas découvert après l'avoir envoyé.
+    chargerInfoDeploiement();
 
     google.script.run
       .withSuccessHandler(function(json){

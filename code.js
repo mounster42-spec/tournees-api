@@ -1434,18 +1434,105 @@ function _validerUrlWebApp_(brut) {
 }
 
 
-/**
- * Source de vérité unique de l'URL Web App : ScriptApp.getService().getUrl().
- *
- * Ne lève jamais — avant le premier déploiement, ScriptApp n'a pas d'URL à
- * donner, et l'appelant doit alors le dire plutôt qu'afficher un lien mort.
- */
-function _getWebAppUrl_() {
+// Adresse /exec enregistrée explicitement. C'est elle qui fait foi.
+//
+// ScriptApp.getService().getUrl() rend l'adresse du SERVICE du script, qui
+// reste celle du déploiement d'origine. Créer un NOUVEAU déploiement au lieu
+// d'une nouvelle version de l'ancien fait donc diverger les deux : les liens
+// partent vers un déploiement qui ne sert plus le code courant, et rien dans
+// le script ne le signale. Apps Script n'offre aucune API pour énumérer ses
+// déploiements depuis l'intérieur — d'où cette adresse, réglable une fois.
+const PROP_WEBAPP_URL = "TOURNEES_WEBAPP_URL";
+
+const MSG_URL_INVALIDE =
+    "Adresse refusée. Attendu : une adresse https de déploiement Web App "
+  + "Apps Script se terminant par /exec, sans paramètre.";
+
+
+/** Identifiant de déploiement porté par une URL /exec, "" sinon. */
+function _idDeploiement_(url) {
+  const trouve = String(url || "").match(/\/s\/([^\/]+)\/exec$/);
+  return trouve ? trouve[1] : "";
+}
+
+
+/** Ce que la plateforme propose, validé. Ne lève jamais. */
+function _urlServiceScript_() {
   try {
     return _validerUrlWebApp_(ScriptApp.getService().getUrl());
   } catch (e) {
     return "";
   }
+}
+
+
+/** Ce qui a été enregistré à la main, validé. Ne lève jamais. */
+function _urlWebAppEnregistree_() {
+  try {
+    return _validerUrlWebApp_(
+      PropertiesService.getScriptProperties().getProperty(PROP_WEBAPP_URL));
+  } catch (e) {
+    return "";
+  }
+}
+
+
+/**
+ * Adresse retenue pour tout lien de partage.
+ *
+ * L'adresse enregistrée l'emporte ; à défaut seulement, celle du service.
+ * Ne lève jamais — sans déploiement, l'appelant doit le dire plutôt que
+ * d'afficher un lien mort.
+ */
+function _getWebAppUrl_() {
+  return _urlWebAppEnregistree_() || _urlServiceScript_();
+}
+
+
+/**
+ * Enregistre l'adresse /exec du déploiement ACTIF.
+ *
+ * Appelée depuis la carte, ou depuis l'éditeur Apps Script. L'adresse est
+ * validée avant d'être retenue : une adresse Drive, une adresse /dev ou un
+ * domaine inattendu sont refusés plutôt qu'enregistrés.
+ */
+function definirUrlWebApp(url) {
+  const propre = _validerUrlWebApp_(url);
+  if (!propre) {
+    return JSON.stringify({ok: false, message: MSG_URL_INVALIDE});
+  }
+  PropertiesService.getScriptProperties().setProperty(PROP_WEBAPP_URL, propre);
+  return JSON.stringify({ok: true, url: propre,
+                         deploiement: _idDeploiement_(propre)});
+}
+
+
+/** Oublie l'adresse enregistrée et revient à celle du service. */
+function oublierUrlWebApp() {
+  PropertiesService.getScriptProperties().deleteProperty(PROP_WEBAPP_URL);
+  return JSON.stringify({ok: true, url: _urlServiceScript_()});
+}
+
+
+/**
+ * Quel déploiement le partage va-t-il utiliser ?
+ *
+ * Rendu à la carte AVANT toute création de lien : c'est ce qui permet de
+ * voir que l'adresse du service et le déploiement actif ont divergé, au lieu
+ * de le découvrir en envoyant un lien mort à quelqu'un.
+ */
+function getInfoDeploiement() {
+  const service = _urlServiceScript_();
+  const enregistree = _urlWebAppEnregistree_();
+  const retenue = enregistree || service;
+  return JSON.stringify({
+    url: retenue,
+    deploiement: _idDeploiement_(retenue),
+    source: enregistree ? "enregistrée" : (service ? "service du script" : ""),
+    deploiementService: _idDeploiement_(service),
+    divergent: !!(enregistree && service && enregistree !== service),
+    buildId: SHARE_BUILD_ID
+  });
 }
 
 
