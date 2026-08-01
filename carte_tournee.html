@@ -63,11 +63,15 @@
 
   /* Boutons et cases : 44 px, le minimum tactile. Sur ordinateur la souris
      s'en accommode ; sur telephone c'est la difference entre viser et rater. */
+  /* Les boutons ne descendent jamais sous la largeur de leur libelle : le
+     min-width:auto par defaut d'un element flex les fait passer a la ligne
+     plutot que de rogner le texte. max-width borne la largeur au panneau,
+     donc rien ne deborde de l'ecran. */
   .actions{display:flex;flex-wrap:wrap;gap:8px}
   .actions button{font:inherit;min-height:44px;padding:0 14px;cursor:pointer;
     border:1px solid #1a73e8;border-radius:6px;background:#fff;color:#1a73e8;
-    flex:1 1 auto}
-  .actions button.primaire{background:#1a73e8;color:#fff}
+    flex:1 1 auto;max-width:100%;box-sizing:border-box;white-space:nowrap}
+  .actions button.primaire{background:#1a73e8;color:#fff;font-weight:bold}
   .actions button:disabled{opacity:.5;cursor:default}
   .toggles label{display:inline-flex;align-items:center;min-height:44px;
                  margin-right:12px;cursor:pointer;white-space:nowrap}
@@ -134,6 +138,9 @@
       <div id="fullscreen-result"></div>
       <div id="geo-status"></div>
       <div id="download-result"></div>
+      <div class="meta" id="export-hint">L'export crée une archive HTML dans
+        Google Drive. Pour consulter la carte sur PC ou smartphone, utilisez
+        Plein écran.</div>
     </div>
 
     <details class="tech" id="technique">
@@ -171,6 +178,8 @@ var MSG_EMPTY = "Aucune tournée récente disponible. Lancez une optimisation.";
 // et jamais en renvoyant l'utilisateur vers l'archive Drive.
 var MSG_WEB_APP_KO = "La Web App n'est pas encore disponible. Mettez à jour "
                    + "ou déployez l'application Web Apps Script.";
+
+var MSG_AUCUNE_TOURNEE = "Sélectionnez au moins une tournée.";
 
 
 /* ---------- utilitaires ---------- */
@@ -277,6 +286,9 @@ function drawRoute(route, index){
   var group = L.layerGroup();
   var pts = Array.isArray(route.points) ? route.points : [];
   var valid = [];
+  // Coordonnees de CETTE tournee seulement : le recentrage doit pouvoir
+  // ignorer une tournee decochee, ce qu'une liste globale ne permet pas.
+  var routeLatLngs = [];
 
   for (var i = 0; i < pts.length; i++){
     if (hasValidCoords(pts[i])) {
@@ -291,7 +303,7 @@ function drawRoute(route, index){
 
   // Tournée vide : aucun tracé, aucune erreur. La seconde tournée s'affiche seule.
   if (valid.length === 0){
-    layers.push({label:label, color:color, group:group, count:0});
+    layers.push({label:label, color:color, group:group, count:0, latlngs:[]});
     return;
   }
 
@@ -306,6 +318,7 @@ function drawRoute(route, index){
     L.polyline(latlngs, {pane:"routeLines", color:color,
                          weight:5, opacity:0.85}).addTo(group);
     allLatLngs = allLatLngs.concat(latlngs);
+    routeLatLngs = routeLatLngs.concat(latlngs);
   } else {
     // Aucune géométrie routière disponible : segments droits, en POINTILLÉS,
     // pour ne jamais faire passer une ligne droite pour un itinéraire réel.
@@ -333,6 +346,7 @@ function drawRoute(route, index){
     if (isDepotRole(p.role)){
       registerDepot(p, p.role);
       allLatLngs.push(toLatLng(p));
+      routeLatLngs.push(toLatLng(p));
       continue;                        // marqueurs de dépôt posés une seule fois
     }
 
@@ -353,10 +367,12 @@ function drawRoute(route, index){
       );
 
     allLatLngs.push(toLatLng(p));
+    routeLatLngs.push(toLatLng(p));
   }
 
   group.addTo(map);
-  layers.push({label:label, color:color, group:group, count:valid.length});
+  layers.push({label:label, color:color, group:group, count:valid.length,
+               latlngs:routeLatLngs});
 }
 
 
@@ -578,7 +594,10 @@ function buildToggles(){
     html += "<label><input type='checkbox' data-layer='" + i + "' checked> "
           + esc(layers[i].label) + "</label>";
   }
-  html += "<br><button type='button' id='showAll'>Afficher les deux</button>";
+  // Aucun bouton « Afficher les deux » : les deux cases disent deja tout ce
+  // qu'il rejouait, et il occupait une place qui compte sur telephone.
+  html += "<div id='toggles-hint' class='meta'></div>"
+        + "<br><button type='button' id='btn-fit'>Ajuster la vue</button>";
   host.innerHTML = html;
 
   var boxes = host.querySelectorAll("input[data-layer]");
@@ -586,16 +605,41 @@ function buildToggles(){
     boxes[b].addEventListener("change", function(){
       var g = layers[Number(this.getAttribute("data-layer"))].group;
       if (this.checked) { map.addLayer(g); } else { map.removeLayer(g); }
+      majIndicationTournees();
     });
   }
 
-  document.getElementById("showAll").addEventListener("click", function(){
-    for (var i = 0; i < layers.length; i++){
-      if (!map.hasLayer(layers[i].group)) map.addLayer(layers[i].group);
-    }
-    var bx = host.querySelectorAll("input[data-layer]");
-    for (var j = 0; j < bx.length; j++) bx[j].checked = true;
-  });
+  document.getElementById("btn-fit").addEventListener("click", recadrer);
+  majIndicationTournees();
+}
+
+
+/**
+ * Aucune tournée cochée : on le signale discrètement.
+ *
+ * Le fond de carte reste en place et rien ne plante — décocher les deux est
+ * une façon légitime de regarder le terrain seul.
+ */
+function majIndicationTournees(){
+  var host = document.getElementById("toggles");
+  var hint = document.getElementById("toggles-hint");
+  if (!host || !hint) return;
+  var boxes = host.querySelectorAll("input[data-layer]");
+  var coches = 0;
+  for (var i = 0; i < boxes.length; i++){ if (boxes[i].checked) coches++; }
+  hint.textContent = coches ? "" : MSG_AUCUNE_TOURNEE;
+}
+
+
+/** Coordonnées des seules tournées actuellement affichées. */
+function latLngsVisibles(){
+  var out = [];
+  for (var i = 0; i < layers.length; i++){
+    if (map && !map.hasLayer(layers[i].group)) continue;
+    var pts = layers[i].latlngs || [];
+    for (var j = 0; j < pts.length; j++) out.push(pts[j]);
+  }
+  return out;
 }
 
 
@@ -674,15 +718,21 @@ function renderCarte(payload){
 
 /* ---------- tiroir et redimensionnement ---------- */
 
-/** Recadre après un changement de taille ou d'orientation.
+/** Recadre après un changement de taille, d'orientation ou de sélection.
  *
  *  Leaflet ne détecte pas seul qu'on est passé en paysage ou que le tiroir
  *  s'est ouvert : sans invalidateSize, la carte garde l'ancienne taille et
- *  laisse une bande grise. */
+ *  laisse une bande grise.
+ *
+ *  Le cadrage ne retient que les tournées VISIBLES : recadrer sur une
+ *  tournée décochée ramènerait à l'écran ce qu'on vient d'en retirer. Sans
+ *  aucune tournée visible, le cadre courant est conservé tel quel. */
 function recadrer(){
   if (!map) return;
   map.invalidateSize();
-  if (allLatLngs.length > 1) map.fitBounds(L.latLngBounds(allLatLngs).pad(0.08));
+  var pts = latLngsVisibles();
+  if (pts.length > 1) map.fitBounds(L.latLngBounds(pts).pad(0.08));
+  else if (pts.length === 1) map.setView(pts[0], 15);
 }
 
 function basculerTiroir(){

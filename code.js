@@ -1779,8 +1779,13 @@ function _buildStandaloneCarteHtml_(payloadJson) {
 
 
 /**
- * Entrée de menu : exporte la dernière carte en un fichier HTML autonome
- * déposé sur Drive, puis affiche son lien.
+ * Exporte la dernière carte en un fichier HTML autonome déposé sur Drive,
+ * puis affiche son lien.
+ *
+ * Retirée du menu : l'export existe déjà dans la carte, via le bouton
+ * « Exporter », qui réutilise les géométries déjà chargées et ne coûte donc
+ * aucun appel de plus. Cette variante reste exécutable depuis l'éditeur Apps
+ * Script pour archiver une carte sans rouvrir la fenêtre.
  *
  * Le fichier est créé PRIVÉ. Le partage reste une décision explicite, à
  * prendre dans Drive : ces données sont opérationnelles.
@@ -1838,6 +1843,9 @@ function exporterCartePartageable() {
     + "<br><br>"
     + "<b>Pour partager</b> : dans Drive, clic droit sur le fichier &rsaquo; Partager.<br>"
     + "Il est créé <b>privé</b> : rien n'est publié sans votre décision.<br><br>"
+    + "<b>Pour consulter la carte</b> sur ordinateur ou sur téléphone, "
+    + "utilisez <i>Tournées &rsaquo; Ouvrir la carte</i> : Drive n'affiche "
+    + "pas les fichiers HTML, il propose seulement de les télécharger.<br><br>"
     + "<small>Le fichier contient les données du run. Il charge Leaflet et les "
     + "tuiles OpenStreetMap depuis Internet : une connexion reste nécessaire "
     + "pour l'afficher.</small></div>";
@@ -1950,10 +1958,19 @@ function runHybridLocalVroomTerritorial() { runOptimisation(EXP_STRATEGY); }
 /**
  * Menu « Tournées ».
  *
- * L'usage quotidien est en tête, les méthodes techniques sont reléguées dans
- * un sous-menu. Les stratégies retirées du menu visible ne sont PAS
- * supprimées : leurs fonctions restent définies et exécutables depuis
- * l'éditeur Apps Script, et le backend les accepte toujours.
+ * Trois entrées au premier niveau, et ce sont les trois gestes d'une journée :
+ * choisir les points, optimiser, regarder la carte. Tout le reste — le
+ * benchmark et les méthodes de comparaison — descend sous « Outils dev »,
+ * parce que rien de tout cela ne sert à conduire une tournée.
+ *
+ * « Exporter la carte » quitte le menu : l'export existe déjà DANS la carte,
+ * et le proposer deux fois laissait croire que l'archive Drive était le moyen
+ * normal de consulter la carte. Elle ne l'est pas — Drive n'affiche pas les
+ * fichiers HTML.
+ *
+ * Rien n'est supprimé pour autant : les stratégies et fonctions retirées du
+ * menu visible restent définies, exécutables depuis l'éditeur Apps Script, et
+ * le backend les accepte toujours.
  */
 function onOpen() {
   // Le classeur est mémorisé à chaque ouverture : c'est la seule occasion où
@@ -1965,13 +1982,16 @@ function onOpen() {
     .addItem("Sélectionner les points par ID", "ouvrirSelectionParId")
     .addItem(MENU_OPTIMISER_LABEL, "runHybridLocalVroomTerritorial")
     .addItem("Ouvrir la carte", "ouvrirLaCarte")
-    .addItem("Exporter la carte", "exporterCartePartageable")
-    .addItem("Ouvrir le benchmark", "ouvrirBenchmark")
     .addSeparator()
     .addSubMenu(
-      ui.createMenu("Méthodes de comparaison")
-        .addItem("K-means — référence", "runKmeans")
-        .addItem("ORS connecté — comparaison", "runOrtoolsOrsMatrixConnected")
+      ui.createMenu("Outils dev")
+        .addItem("Ouvrir le benchmark", "ouvrirBenchmark")
+        .addSubMenu(
+          ui.createMenu("Méthodes de comparaison")
+            .addItem("K-means — référence", "runKmeans")
+            .addItem("ORS connecté — comparaison",
+                     "runOrtoolsOrsMatrixConnected")
+        )
     )
     .addToUi();
 }

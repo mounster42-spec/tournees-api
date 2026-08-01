@@ -451,8 +451,8 @@ class TestMenuWiring(unittest.TestCase):
     def test_the_menu_has_exactly_the_expected_entries_in_order(self):
         """Ordre exact du menu, entree par entree.
 
-        L'ordre porte l'intention : l'usage quotidien d'abord, les methodes de
-        comparaison releguees en dernier."""
+        L'ordre porte l'intention : les trois gestes d'une journee au premier
+        niveau, tout l'outillage technique sous « Outils dev »."""
         flat = re.sub(r"\s+", " ", self.code)
         menu = flat[flat.index('ui.createMenu("Tournées")'):]
         menu = menu[:menu.index(".addToUi()")]
@@ -471,9 +471,9 @@ class TestMenuWiring(unittest.TestCase):
             ("Sélectionner les points par ID", "ouvrirSelectionParId"),
             ("MENU_OPTIMISER_LABEL", "runHybridLocalVroomTerritorial"),
             ("Ouvrir la carte", "ouvrirLaCarte"),
-            ("Exporter la carte", "exporterCartePartageable"),
-            ("Ouvrir le benchmark", "ouvrirBenchmark"),
             ("separateur", ""),
+            ("sous-menu", "Outils dev"),
+            ("Ouvrir le benchmark", "ouvrirBenchmark"),
             ("sous-menu", "Méthodes de comparaison"),
             ("K-means — référence", "runKmeans"),
             ("ORS connecté — comparaison", "runOrtoolsOrsMatrixConnected"),
@@ -486,14 +486,33 @@ class TestMenuWiring(unittest.TestCase):
         self.assertNotIn('"Ouvrir la dernière carte"', flat)
         self.assertEqual(flat.count('.addItem("Ouvrir la carte"'), 1)
 
-    def test_the_export_entry_says_export_because_it_writes_to_drive(self):
-        """Le libellé doit décrire le comportement réel : l'action crée un
-        fichier Drive avant de proposer un lien, elle ne télécharge pas
-        directement."""
-        self.assertIn("DriveApp.createFile", self.code)
+    def test_the_export_entry_left_the_menu_but_keeps_its_function(self):
+        """L'export existe DEJA dans la carte ouverte.
+
+        Le proposer une seconde fois au menu laissait croire que l'archive
+        Drive etait le moyen normal de consulter la carte. La fonction, elle,
+        reste executable depuis l'editeur Apps Script."""
         flat = re.sub(r"\s+", " ", self.code)
-        self.assertIn('.addItem("Exporter la carte", '
-                      '"exporterCartePartageable")', flat)
+        menu = flat[flat.index('ui.createMenu("Tournées")'):]
+        menu = menu[:menu.index(".addToUi()")]
+        self.assertNotIn("Exporter la carte", menu)
+        self.assertNotIn("exporterCartePartageable", menu)
+        self.assertIn("function exporterCartePartageable(", self.code)
+        # L'action d'export interne, elle, n'a pas bouge.
+        self.assertIn("function exporterCarteDepuisDialogue(", self.code)
+        self.assertIn("DriveApp.createFile", self.code)
+
+    def test_the_developer_tools_submenu_gathers_the_technical_entries(self):
+        """« Ouvrir le benchmark » et les methodes de comparaison n'encombrent
+        plus le premier niveau."""
+        flat = re.sub(r"\s+", " ", self.code)
+        outils = flat[flat.index('ui.createMenu("Outils dev")'):]
+        outils = outils[:outils.index(".addToUi()")]
+        self.assertIn('.addItem("Ouvrir le benchmark", "ouvrirBenchmark")',
+                      outils)
+        self.assertIn('ui.createMenu("Méthodes de comparaison")', outils)
+        # Le gestionnaire existant est reutilise tel quel, sans duplication.
+        self.assertEqual(self.code.count("function ouvrirBenchmark("), 1)
 
     def test_the_comparison_submenu_holds_exactly_two_methods(self):
         flat = re.sub(r"\s+", " ", self.code)
@@ -1181,6 +1200,101 @@ class TestMapResponsive(unittest.TestCase):
         self.assertIn("La Web App n'est pas encore disponible.", self.html)
         # La meme phrase des deux cotes : une seule facon de dire la chose.
         self.assertIn("La Web App n'est pas encore disponible.", read_code())
+
+    def test_the_export_is_described_as_an_archive_not_as_the_way_to_consult(self):
+        self.assertIn("L'export crée une archive HTML dans", self.html)
+        self.assertIn("Plein écran", self.html[self.html.index("export-hint"):])
+
+
+class TestMapRouteToggles(unittest.TestCase):
+    """Les deux cases suffisent a choisir les tournees visibles."""
+
+    def setUp(self):
+        self.html = read_map_html()
+
+    def test_the_show_both_button_is_gone(self):
+        # Sur le fichier SANS commentaires : le commentaire qui explique le
+        # retrait cite forcement le libelle retire.
+        rendu = strip_comments(self.html)
+        for interdit in ("Afficher les deux", "showAll"):
+            self.assertNotIn(interdit, rendu,
+                             "le bouton %r est de retour" % interdit)
+
+    def test_one_checkbox_per_route_still_drives_the_layers(self):
+        body = extract_function(self.html, "buildToggles")
+        self.assertIn("type='checkbox' data-layer='", body)
+        self.assertIn("map.addLayer(g)", body)
+        self.assertIn("map.removeLayer(g)", body)
+        # Les libelles viennent des tournees, jamais d'une liste ecrite ici.
+        self.assertIn("esc(layers[i].label)", body)
+
+    def test_no_route_checked_is_said_not_crashed(self):
+        body = extract_function(self.html, "majIndicationTournees")
+        self.assertIn("MSG_AUCUNE_TOURNEE", body)
+        self.assertIn('var MSG_AUCUNE_TOURNEE = "Sélectionnez au moins une '
+                      'tournée.";', self.html)
+        # Compte les cases, pas les couches : une tournee vide reste cochee.
+        self.assertIn("boxes[i].checked", body)
+
+    def test_the_fit_button_exists_and_recentres(self):
+        body = extract_function(self.html, "buildToggles")
+        self.assertIn("id='btn-fit'", body)
+        self.assertIn("Ajuster la vue", body)
+        self.assertIn('getElementById("btn-fit").addEventListener("click", '
+                      "recadrer)", body)
+
+    def test_recentring_only_considers_the_visible_routes(self):
+        body = extract_function(self.html, "recadrer")
+        self.assertIn("latLngsVisibles()", body)
+        self.assertNotIn("allLatLngs", body)
+        visible = extract_function(self.html, "latLngsVisibles")
+        self.assertIn("map.hasLayer(layers[i].group)", visible)
+        self.assertIn("layers[i].latlngs", visible)
+
+    def test_the_edited_functions_are_balanced_and_defined_once(self):
+        """Aucun interpreteur JavaScript n'est disponible dans ce depot.
+
+        Le controle porte donc sur les fonctions REELLEMENT editees, ou il
+        est exact : une accolade ou une parenthese manquante s'y verrait."""
+        for name in ("drawRoute", "buildToggles", "majIndicationTournees",
+                     "latLngsVisibles", "recadrer", "ouvrirEnGrand"):
+            body = extract_function(self.html, name)
+            self.assertTrue(body.strip(), "%s introuvable" % name)
+            # extract_function s'arrete AVANT l'accolade fermante de la
+            # fonction : on la remet, sinon tout corps parait desequilibre.
+            sans = strip_comments(body) + "\n}"
+            for ouvrant, fermant in (("(", ")"), ("[", "]"), ("{", "}")):
+                self.assertEqual(
+                    sans.count(ouvrant), sans.count(fermant),
+                    "%s : %s et %s desequilibres" % (name, ouvrant, fermant))
+
+        # Chaque fonction appelee par les cases a cocher existe, une fois.
+        for helper in ("majIndicationTournees", "latLngsVisibles", "recadrer"):
+            self.assertEqual(self.html.count("function %s(" % helper), 1,
+                             "%s n'est pas defini une fois et une seule"
+                             % helper)
+
+    def test_every_route_carries_its_own_coordinates(self):
+        """Sans coordonnees par tournee, le recentrage ne saurait pas quoi
+        ignorer quand une case est decochee."""
+        body = extract_function(self.html, "drawRoute")
+        self.assertIn("var routeLatLngs = [];", body)
+        self.assertIn("latlngs:routeLatLngs", body)
+        # Y compris pour une tournee vide : la liste existe, elle est vide.
+        self.assertIn("count:0, latlngs:[]", body)
+        # allLatLngs reste alimente : le premier cadrage montre tout.
+        self.assertIn("allLatLngs", body)
+
+    def test_the_route_geometry_and_order_are_untouched(self):
+        """Les cases changent la VISIBILITE, jamais les donnees."""
+        for name in ("buildToggles", "majIndicationTournees",
+                     "latLngsVisibles", "recadrer"):
+            body = extract_function(self.html, name)
+            for interdit in ("sort(", "reverse(", "splice(", ".lat =",
+                             ".lon =", ".color =", "geometry ="):
+                self.assertNotIn(interdit, body,
+                                 "%s modifie les donnees de la tournee : %s"
+                                 % (name, interdit))
 
 
 class TestMapGeometryWiring(unittest.TestCase):
