@@ -4,8 +4,24 @@
 const API_BASE = "https://tournees-api.onrender.com";
 
 const STRATEGIES = ["kmeans", "ortools_haversine", "ortools_ors_matrix",
-                    "ortools_ors_matrix_connected"];
+                    "ortools_ors_matrix_connected",
+                    "hybrid_local_vroom_territorial"];
 const DEFAULT_STRATEGY = "kmeans";
+
+// Identifiant backend de la stratégie expérimentale. Le libellé de menu et
+// cet identifiant sont liés en UN SEUL endroit : une entrée de menu qui
+// enverrait un autre nom produirait un 501 côté API, et surtout une ligne de
+// Benchmark étiquetée avec une stratégie qui n'a pas tourné.
+const EXP_STRATEGY = "hybrid_local_vroom_territorial";
+
+// Libellé de l'entrée principale du menu. Elle lance la stratégie hybride :
+// c'est devenu l'usage quotidien, les autres méthodes ne servent plus qu'à
+// la comparaison. Le nom interne de la stratégie, lui, ne change pas.
+const MENU_OPTIMISER_LABEL = "Optimiser les tournées";
+
+// Titre du menu racine. « Menu tournées » se repère mieux au milieu des
+// menus de Google Sheets, qui sont tous des noms communs.
+const MENU_RACINE_LABEL = "Menu tournées";
 
 // Ligne de la feuille "Paramètres" portant la stratégie
 const STRATEGY_ROW = 6;
@@ -21,7 +37,9 @@ const ENGINE_LABELS = {
   "ortools_haversine":  "OR-Tools Haversine (affectation) + Vroom (séquencement)",
   "ortools_ors_matrix": "OR-Tools ORS Matrix (affectation) + Vroom (séquencement)",
   "ortools_ors_matrix_connected":
-    "OR-Tools ORS Matrix — territoires connexes (affectation) + Vroom (séquencement)"
+    "OR-Tools ORS Matrix — territoires connexes (affectation) + Vroom (séquencement)",
+  "hybrid_local_vroom_territorial":
+    "VROOM local conjoint + ALNS territoriale (affectation + séquencement)"
 };
 
 // Repli si partition_engine est absent (backend antérieur au lot 3).
@@ -30,7 +48,9 @@ const STRATEGY_LABELS = {
   "ortools_haversine":  "OR-Tools Haversine (affectation) + Vroom (séquencement)",
   "ortools_ors_matrix": "OR-Tools ORS Matrix (affectation) + Vroom (séquencement)",
   "ortools_ors_matrix_connected":
-    "OR-Tools ORS Matrix — territoires connexes (affectation) + Vroom (séquencement)"
+    "OR-Tools ORS Matrix — territoires connexes (affectation) + Vroom (séquencement)",
+  "hybrid_local_vroom_territorial":
+    "VROOM local conjoint + ALNS territoriale (affectation + séquencement)"
 };
 
 const BENCH_SHEET = "Benchmark";
@@ -106,11 +126,58 @@ const BENCH_HEADERS_ORSFIRST = [
   "post_optimization_kept", "post_optimization_note"
 ];
 
+// Colonnes de la stratégie expérimentale VROOM local + ALNS territoriale,
+// strictement à la fin. Aucune colonne existante n'est déplacée, renommée ni
+// supprimée : ces colonnes restent vides pour les quatre stratégies de
+// production, qui ne renvoient pas ce bloc de diagnostic.
+//
+// Toutes ces valeurs proviennent de result.ors_matrix.hybrid, déjà présent
+// dans la réponse : aucune route Flask n'a eu besoin de changer.
+const BENCH_HEADERS_HYBRID = [
+  // contexte du run expérimental
+  "hybrid_error", "local_vroom_enabled", "local_vroom_version",
+  // juge commun : la seule mesure qui classe les solutions
+  "common_rescore_duration_s", "common_rescore_distance_m",
+  "common_rescore_matrix_hash",
+  // résultat de chaque bloc
+  "joint_direct_valid", "joint_direct_duration_s", "joint_direct_sizes",
+  "joint_nucleus_attempted", "joint_nucleus_valid",
+  "joint_nucleus_best_duration_s",
+  "route_first_unique", "route_first_best_duration_s",
+  "joint_alns_iterations", "joint_alns_accepted", "joint_alns_seed",
+  "joint_alns_best_duration_s",
+  "joint_finalists", "joint_finalists_local_vroom_solved",
+  "joint_finalists_reused",
+  // sélection finale
+  "joint_solutions_considered", "joint_selected_source",
+  "joint_selected_duration_s", "joint_selected_distance_m",
+  "joint_selected_sizes", "joint_selected_components",
+  "joint_selected_enclaves",
+  // admissibilité territoriale
+  "joint_territorial_level", "joint_territorial_max_enclaves",
+  "joint_territorial_admissible", "joint_territorial_fallback_used",
+  "joint_territorial_fallback_reason", "joint_territorial_thresholds",
+  "joint_territorial_level_counts",
+  // compteur de résolutions locales
+  "local_vroom_max_solves", "local_vroom_attempted", "local_vroom_succeeded",
+  "local_vroom_failed", "local_vroom_timed_out", "local_vroom_reused",
+  "local_vroom_skipped_for_time", "local_vroom_elapsed_ms",
+  "local_vroom_stop_reason", "local_vroom_last_error",
+  // discipline temporelle, un temps par bloc réellement renvoyé
+  "hybrid_stage_matrix_ms", "hybrid_stage_joint_direct_ms",
+  "hybrid_stage_route_first_ms", "hybrid_stage_joint_nucleus_ms",
+  "hybrid_stage_joint_alns_ms", "hybrid_stage_alns_refine_ms",
+  "hybrid_stage_joint_finalists_ms",
+  "hybrid_stage_timings_text", "hybrid_stage_stops_text",
+  "hybrid_total_elapsed_ms", "hybrid_soft_limit_reached"
+];
+
 const BENCH_HEADERS = BENCH_HEADERS_BASE
   .concat(BENCH_HEADERS_D3)
   .concat(BENCH_HEADERS_TERR)
   .concat(BENCH_HEADERS_CONN)
-  .concat(BENCH_HEADERS_ORSFIRST);
+  .concat(BENCH_HEADERS_ORSFIRST)
+  .concat(BENCH_HEADERS_HYBRID);
 
 
 
@@ -284,6 +351,271 @@ function getPoints() {
   }
 
   return points;
+}
+
+
+// =========================
+// SÉLECTION PAR ID
+// =========================
+// Prépare la sélection AVANT l'optimisation. Une seule plage est écrite dans
+// tout ce bloc : Horodateurs!E, la colonne des cases à cocher. Les ID, les
+// adresses et surtout les coordonnées ne sont jamais touchés, pas plus que
+// Paramètres!B4:B5 — les deux dépôts restent pilotés depuis la feuille.
+
+// Nom EXACT du fichier HTML à créer dans l'éditeur Apps Script
+// (Fichier > Nouveau > Fichier HTML), sans l'extension.
+const SELECTION_HTML_FILE = "SelectionParId";
+
+const HORO_SHEET   = "Horodateurs";
+const HORO_COL_ID  = 1;   // A
+const HORO_COL_SEL = 5;   // E
+const PARAM_SHEET  = "Paramètres";
+const PARAM_ROW_START = 4;   // B4 : ID de départ
+const PARAM_ROW_END   = 5;   // B5 : ID d'arrivée
+
+
+/**
+ * Lit la feuille Horodateurs une seule fois.
+ *
+ * Deux lectures de la colonne ID, et c'est délibéré. getValues() rend le type
+ * natif : un ID « 0012 » saisi dans une cellule numérique revient 12, et ne
+ * correspondrait plus à ce que l'utilisateur colle. getDisplayValues() rend
+ * ce qui est AFFICHÉ. On indexe les deux formes, donc les deux fonctionnent,
+ * et un écart entre elles est signalé plutôt que subi.
+ */
+function _lireHorodateurs_() {
+  const sheet = SpreadsheetApp.getActive().getSheetByName(HORO_SHEET);
+  if (!sheet) throw new Error("Feuille « " + HORO_SHEET + " » introuvable.");
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return {sheet: sheet, lastRow: lastRow, lignes: [], index: {}};
+
+  const brut = sheet.getRange(2, 1, lastRow - 1, 4).getValues();
+  const affiche = sheet.getRange(2, HORO_COL_ID, lastRow - 1, 1).getDisplayValues();
+
+  const lignes = [];
+  const index = {};
+  for (var i = 0; i < brut.length; i++) {
+    const ligne = {
+      row: i + 2,
+      idBrut: brut[i][0] === null || brut[i][0] === undefined ? "" : String(brut[i][0]).trim(),
+      idAffiche: String(affiche[i][0] || "").trim(),
+      libelle: String(brut[i][1] || "")
+    };
+    lignes.push(ligne);
+    // Les deux écritures pointent vers la même ligne : coller « 12 » ou
+    // « 0012 » trouve la cellule dans les deux cas.
+    [ligne.idAffiche, ligne.idBrut].forEach(function (cle) {
+      if (!cle) return;
+      if (!index[cle]) index[cle] = [];
+      if (index[cle].indexOf(ligne.row) === -1) index[cle].push(ligne.row);
+    });
+  }
+  return {sheet: sheet, lastRow: lastRow, lignes: lignes, index: index};
+}
+
+
+/** Résout un ID : {trouve, ambigu, rows, libelle}. Ne choisit jamais seul. */
+function _resoudreId_(index, lignes, id) {
+  const rows = index[String(id || "").trim()] || [];
+  const parRow = {};
+  for (var i = 0; i < lignes.length; i++) parRow[lignes[i].row] = lignes[i];
+  return {
+    id: String(id || "").trim(),
+    trouve: rows.length === 1,
+    ambigu: rows.length > 1,
+    rows: rows,
+    libelle: rows.length ? (parRow[rows[0]].libelle || "") : ""
+  };
+}
+
+
+/**
+ * Découpe la saisie libre en ID.
+ *
+ * Séparateurs : retour à la ligne, virgule, point-virgule, tabulation — soit
+ * un collage direct depuis une colonne de tableur. L'espace n'en est PAS un :
+ * un identifiant peut légitimement en contenir. La normalisation se limite au
+ * rognage des bords, au retrait des vides et au dédoublonnage exact. Aucun ID
+ * n'est converti : « 0012 » reste « 0012 ».
+ */
+function _parseIds_(texte) {
+  const bruts = String(texte || "").split(/[\n\r,;\t]+/);
+  const vus = {};
+  const uniques = [];
+  var saisis = 0;
+  for (var i = 0; i < bruts.length; i++) {
+    const id = bruts[i].trim();
+    if (!id) continue;
+    saisis++;
+    if (vus[id]) continue;
+    vus[id] = true;
+    uniques.push(id);
+  }
+  return {saisis: saisis, uniques: uniques};
+}
+
+
+/**
+ * Contexte affiché à l'ouverture de la barre latérale.
+ *
+ * Lecture SEULE de Paramètres!B4 et B5 : la barre latérale montre les deux
+ * dépôts, elle ne les modifie jamais. Les corriger reste une action dans la
+ * feuille Paramètres.
+ */
+function getSelectionContexte() {
+  try {
+    const param = SpreadsheetApp.getActive().getSheetByName(PARAM_SHEET);
+    if (!param) throw new Error("Feuille « " + PARAM_SHEET + " » introuvable.");
+
+    const startId = String(param.getRange(PARAM_ROW_START, 2).getValue() || "").trim();
+    const endId = String(param.getRange(PARAM_ROW_END, 2).getValue() || "").trim();
+
+    const data = _lireHorodateurs_();
+    const depart = _resoudreId_(data.index, data.lignes, startId);
+    const arrivee = endId ? _resoudreId_(data.index, data.lignes, endId) : null;
+
+    return JSON.stringify({
+      depart: {id: startId, libelle: depart.libelle, trouve: depart.trouve,
+               ambigu: depart.ambigu, vide: !startId},
+      arrivee: arrivee
+        ? {id: endId, libelle: arrivee.libelle, trouve: arrivee.trouve,
+           ambigu: arrivee.ambigu, vide: false}
+        : {id: startId, libelle: depart.libelle, trouve: depart.trouve,
+           ambigu: depart.ambigu, vide: true},
+      memeDepot: !endId || endId === startId,
+      nbLignes: data.lignes.length
+    });
+  } catch (e) {
+    return JSON.stringify({erreur: String(e && e.message ? e.message : e)});
+  }
+}
+
+
+/**
+ * Valide la saisie et applique la sélection.
+ *
+ * `appliquer` à false ne fait que rapporter : rien n'est écrit tant que
+ * l'utilisateur n'a pas vu le bilan. Un dépôt vide, introuvable ou ambigu
+ * bloque dans les deux cas.
+ */
+function appliquerSelectionParId(texteCollectes, appliquer) {
+  try {
+    const param = SpreadsheetApp.getActive().getSheetByName(PARAM_SHEET);
+    if (!param) throw new Error("Feuille « " + PARAM_SHEET + " » introuvable.");
+
+    const startId = String(param.getRange(PARAM_ROW_START, 2).getValue() || "").trim();
+    const endIdBrut = String(param.getRange(PARAM_ROW_END, 2).getValue() || "").trim();
+    const endId = endIdBrut || startId;
+
+    const data = _lireHorodateurs_();
+    const rapport = {
+      applique: false, bloquant: null,
+      depart: null, arrivee: null,
+      saisis: 0, uniques: 0, trouves: 0,
+      inconnus: [], ambigus: [], depotsDansCollectes: [],
+      lignesCochees: 0, collectesCochees: 0
+    };
+
+    // --- dépôts : bloquants, et corrigés dans la feuille, pas ici ---
+    if (!startId) {
+      rapport.bloquant = "Aucun point de départ n'est configuré dans "
+        + PARAM_SHEET + "!B" + PARAM_ROW_START
+        + ". Renseignez-le avant de sélectionner les collectes.";
+      return JSON.stringify(rapport);
+    }
+    const depart = _resoudreId_(data.index, data.lignes, startId);
+    const arrivee = _resoudreId_(data.index, data.lignes, endId);
+    rapport.depart = {id: startId, libelle: depart.libelle,
+                      trouve: depart.trouve, ambigu: depart.ambigu};
+    rapport.arrivee = {id: endId, libelle: arrivee.libelle,
+                       trouve: arrivee.trouve, ambigu: arrivee.ambigu};
+
+    if (!depart.trouve) {
+      rapport.bloquant = depart.ambigu
+        ? ("Le point de départ « " + startId + " » correspond à plusieurs lignes ("
+           + depart.rows.join(", ") + "). Corrigez la feuille " + HORO_SHEET + ".")
+        : ("Le point de départ configuré dans " + PARAM_SHEET + "!B" + PARAM_ROW_START
+           + " est introuvable. Corrigez la feuille " + PARAM_SHEET
+           + " avant de sélectionner les collectes.");
+      return JSON.stringify(rapport);
+    }
+    if (!arrivee.trouve) {
+      rapport.bloquant = arrivee.ambigu
+        ? ("Le point d'arrivée « " + endId + " » correspond à plusieurs lignes ("
+           + arrivee.rows.join(", ") + "). Corrigez la feuille " + HORO_SHEET + ".")
+        : ("Le point d'arrivée configuré dans " + PARAM_SHEET + "!B" + PARAM_ROW_END
+           + " est introuvable. Corrigez la feuille " + PARAM_SHEET
+           + " avant de sélectionner les collectes.");
+      return JSON.stringify(rapport);
+    }
+
+    // --- collectes ---
+    const parsed = _parseIds_(texteCollectes);
+    rapport.saisis = parsed.saisis;
+    rapport.uniques = parsed.uniques.length;
+
+    const rowsDepots = {};
+    rowsDepots[depart.rows[0]] = true;
+    rowsDepots[arrivee.rows[0]] = true;   // même ligne si départ = arrivée
+
+    const rowsCollectes = [];
+    for (var i = 0; i < parsed.uniques.length; i++) {
+      const id = parsed.uniques[i];
+      const trouve = _resoudreId_(data.index, data.lignes, id);
+      if (trouve.ambigu) { rapport.ambigus.push({id: id, rows: trouve.rows}); continue; }
+      if (!trouve.trouve) { rapport.inconnus.push(id); continue; }
+      if (rowsDepots[trouve.rows[0]]) { rapport.depotsDansCollectes.push(id); continue; }
+      rapport.trouves++;
+      rowsCollectes.push(trouve.rows[0]);
+    }
+
+    if (!parsed.uniques.length) {
+      rapport.bloquant = "Aucun identifiant de collecte n'a été saisi.";
+      return JSON.stringify(rapport);
+    }
+
+    const nbDepots = Object.keys(rowsDepots).length;
+    rapport.collectesCochees = rowsCollectes.length;
+    rapport.lignesCochees = rowsCollectes.length + nbDepots;
+    rapport.nbDepots = nbDepots;
+
+    if (!appliquer) return JSON.stringify(rapport);
+
+    // Rien n'est appliqué tant qu'un ID reste inconnu ou ambigu : les ignorer
+    // en silence produirait une tournée incomplète sans que personne ne le voie.
+    if (rapport.inconnus.length || rapport.ambigus.length) {
+      rapport.bloquant = "Des identifiants sont inconnus ou ambigus. "
+        + "Corrigez la saisie, ou confirmez explicitement.";
+      return JSON.stringify(rapport);
+    }
+
+    // --- UNIQUE écriture de tout ce bloc ---
+    // Une seule plage, une seule setValues() : la colonne des cases. Aucune
+    // écriture ligne par ligne, aucune autre colonne.
+    const aCocher = {};
+    Object.keys(rowsDepots).forEach(function (r) { aCocher[r] = true; });
+    rowsCollectes.forEach(function (r) { aCocher[r] = true; });
+
+    const valeurs = [];
+    for (var r = 2; r <= data.lastRow; r++) valeurs.push([!!aCocher[r]]);
+    data.sheet.getRange(2, HORO_COL_SEL, valeurs.length, 1).setValues(valeurs);
+
+    rapport.applique = true;
+    return JSON.stringify(rapport);
+
+  } catch (e) {
+    return JSON.stringify({applique: false,
+                           bloquant: String(e && e.message ? e.message : e)});
+  }
+}
+
+
+/** Entrée de menu : ouvre la barre latérale de sélection. */
+function ouvrirSelectionParId() {
+  const html = HtmlService.createHtmlOutputFromFile(SELECTION_HTML_FILE)
+    .setTitle("Sélectionner les points");
+  SpreadsheetApp.getUi().showSidebar(html);
 }
 
 
@@ -597,6 +929,11 @@ function appendBenchmark(result, params, points, extra) {
   const calls = result.api_calls || {};
   const sizes = result.partition_sizes || [];
 
+  // Diagnostic de la stratégie expérimentale. Absent des quatre stratégies de
+  // production : hyb vaut alors {} et toutes ses colonnes restent vides.
+  const hyb = _hybridDiag(result);
+  const stages = hyb.hybrid_stages || [];
+
   // Les champs D-3 sont absents des réponses d'un backend antérieur :
   // _cell() rend "" plutôt que de lever, les runs normaux restent valides.
   const row = [
@@ -704,10 +1041,121 @@ function appendBenchmark(result, params, points, extra) {
     _cell(result.connected_matrix_hash),
     _cell(result.connected_per_source_text),
     _cell(result.post_optimization_kept),
-    _cell(result.post_optimization_note)
+    _cell(result.post_optimization_note),
+
+    // --- stratégie expérimentale VROOM local + ALNS territoriale ---
+    // hyb est {} pour les quatre stratégies de production : toutes ces
+    // cellules restent alors vides, aucune ligne existante ne change de forme.
+    _cell(hyb.hybrid_error),
+    _cell(hyb.local_vroom_enabled),
+    _cell(hyb.local_vroom_version),
+    _cell(hyb.common_rescore_duration_s),
+    _cell(hyb.common_rescore_distance_m),
+    _cell(hyb.common_rescore_matrix_hash),
+    _cell(hyb.joint_direct_valid),
+    _cell(hyb.joint_direct_duration_s),
+    _cellList(hyb.joint_direct_sizes),
+    _cell(hyb.joint_nucleus_attempted),
+    _cell(hyb.joint_nucleus_valid),
+    _cell(hyb.joint_nucleus_best_duration_s),
+    _cell(hyb.route_first_unique),
+    _cell(hyb.route_first_best_duration_s),
+    _cell(hyb.joint_alns_iterations),
+    _cell(hyb.joint_alns_accepted),
+    _cell(hyb.joint_alns_seed),
+    _cell(hyb.joint_alns_best_duration_s),
+    _cell(hyb.joint_finalists),
+    _cell(hyb.joint_finalists_local_vroom_solved),
+    _cell(hyb.joint_finalists_reused),
+    _cell(hyb.joint_solutions_considered),
+    _cell(hyb.joint_selected_source),
+    _cell(hyb.joint_selected_duration_s),
+    _cell(hyb.joint_selected_distance_m),
+    _cellList(hyb.joint_selected_sizes),
+    _cellList(hyb.joint_selected_components),
+    _cell(hyb.joint_selected_enclaves),
+    _cell(hyb.joint_territorial_level),
+    _cell(hyb.joint_territorial_max_enclaves),
+    _cell(hyb.joint_territorial_admissible),
+    _cell(hyb.joint_territorial_fallback_used),
+    _cell(hyb.joint_territorial_fallback_reason),
+    _cellList(hyb.joint_territorial_thresholds),
+    _cellCounts(hyb.joint_territorial_level_counts),
+    // Le plafond configuré, à lire en regard de local_vroom_attempted :
+    // "4 lancées sur 4 autorisées" ne se voit pas sans lui.
+    _cell(hyb.local_vroom_max_solves),
+    _cell(hyb.local_vroom_attempted),
+    _cell(hyb.local_vroom_succeeded),
+    _cell(hyb.local_vroom_failed),
+    _cell(hyb.local_vroom_timed_out),
+    _cell(hyb.local_vroom_reused),
+    _cell(hyb.local_vroom_skipped_for_time),
+    _cell(hyb.local_vroom_elapsed_ms),
+    _cell(hyb.local_vroom_stop_reason),
+    _cell(hyb.local_vroom_last_error),
+    _cell(_stageMs(stages, "matrix")),
+    _cell(_stageMs(stages, "joint_direct")),
+    _cell(_stageMs(stages, "route_first")),
+    _cell(_stageMs(stages, "joint_nucleus")),
+    _cell(_stageMs(stages, "joint_alns")),
+    _cell(_stageMs(stages, "alns_refine")),
+    _cell(_stageMs(stages, "joint_finalists")),
+    // Texte de repli : si le backend ajoute un bloc, son temps apparaît ici
+    // au lieu d'être perdu en silence.
+    _stagesText(stages, "elapsed_ms"),
+    _stagesText(stages, "stop_reason"),
+    _cell(hyb.total_elapsed_ms),
+    _cell(hyb.soft_limit_reached)
   ];
 
   sheet.appendRow(row);
+}
+
+
+/**
+ * Bloc de diagnostic de la stratégie expérimentale.
+ *
+ * Il voyage dans result.ors_matrix.hybrid, là où la stratégie connexe passe
+ * par result.ors_matrix.connected. Rend {} pour les quatre stratégies de
+ * production, qui ne produisent pas ce bloc : les colonnes restent vides
+ * plutôt que de lever.
+ */
+function _hybridDiag(result) {
+  const meta = (result && result.ors_matrix) || {};
+  return meta.hybrid || {};
+}
+
+
+/** Temps consommé par un bloc, "" si le bloc n'a pas tourné. */
+function _stageMs(stages, name) {
+  for (var i = 0; i < stages.length; i++) {
+    if (stages[i] && stages[i].stage === name) return stages[i].elapsed_ms;
+  }
+  return "";
+}
+
+
+/** "bloc=valeur;bloc=valeur" sur tous les blocs réellement renvoyés. */
+function _stagesText(stages, field) {
+  const parts = [];
+  for (var i = 0; i < stages.length; i++) {
+    const stage = stages[i];
+    if (!stage || !stage.stage) continue;
+    parts.push(stage.stage + "=" + _cell(stage[field]));
+  }
+  return parts.join(";");
+}
+
+
+/** Sérialise un dictionnaire {clé: nombre} en "clé=valeur;clé=valeur". */
+function _cellCounts(v) {
+  if (v === null || v === undefined) return "";
+  const keys = Object.keys(v).sort();
+  const parts = [];
+  for (var i = 0; i < keys.length; i++) {
+    parts.push(keys[i] + "=" + v[keys[i]]);
+  }
+  return parts.join(";");
 }
 
 
@@ -740,8 +1188,44 @@ const MAP_DATA_SHEET = "_CarteData";
 const MAP_COLORS = ["#1f5fa9", "#d35400"];   // Tournée 1 bleu, Tournée 2 orange foncé
 
 
+// Identifiant du classeur, mémorisé depuis le classeur lui-même.
+// SpreadsheetApp.getActive() ne veut rien dire dans une Web App : il n'y a
+// ni classeur actif, ni interface. Sans cet identifiant explicite, doGet
+// n'aurait aucun moyen fiable de retrouver les données.
+const PROP_SPREADSHEET_ID = "TOURNEES_SPREADSHEET_ID";
+
+
+/** Enregistre l'ID du classeur. Appelé depuis le classeur, jamais ailleurs. */
+function _memoriserClasseur_() {
+  try {
+    PropertiesService.getScriptProperties()
+      .setProperty(PROP_SPREADSHEET_ID, SpreadsheetApp.getActive().getId());
+  } catch (e) {
+    // Contexte sans classeur actif : rien à mémoriser, rien à signaler.
+  }
+}
+
+
+/**
+ * Le classeur, dans les deux contextes.
+ *
+ * Depuis le classeur, getActive() suffit. Depuis la Web App il rend null :
+ * on ouvre alors explicitement par identifiant. openById s'exécute avec les
+ * droits de l'utilisateur accédant et LÈVE s'il n'a pas accès — c'est
+ * exactement la barrière voulue, et elle est portée par Google, pas par nous.
+ */
+function _classeur_() {
+  const actif = SpreadsheetApp.getActive();
+  if (actif) return actif;
+  const id = PropertiesService.getScriptProperties()
+    .getProperty(PROP_SPREADSHEET_ID);
+  if (!id) throw new Error("Classeur non mémorisé.");
+  return SpreadsheetApp.openById(id);
+}
+
+
 function _mapDataSheet_(createIfMissing) {
-  const ss = SpreadsheetApp.getActive();
+  const ss = _classeur_();
   let sh = ss.getSheetByName(MAP_DATA_SHEET);
   if (!sh && createIfMissing) {
     sh = ss.insertSheet(MAP_DATA_SHEET);
@@ -764,10 +1248,320 @@ function _saveCartePayload_(payload) {
  * alors « Aucune tournée récente disponible ».
  */
 function getCarteTourneesPayload() {
-  const sh = _mapDataSheet_(false);
-  if (!sh) return null;
-  const v = sh.getRange(1, 1).getValue();
-  return v ? String(v) : null;
+  try {
+    const sh = _mapDataSheet_(false);
+    if (!sh) return null;
+    const v = sh.getRange(1, 1).getValue();
+    return v ? String(v) : null;
+  } catch (e) {
+    // Utilisateur sans accès au classeur : aucune donnée ne sort d'ici.
+    return null;
+  }
+}
+
+
+// =========================
+// WEB APP
+// =========================
+// Une seule page responsive, la même sur ordinateur, Android et iPhone.
+//
+// doGet n'utilise NI SpreadsheetApp.getActive(), NI getUi(), NI aucune notion
+// de feuille active : rien de tout cela n'existe hors du classeur. Le
+// classeur est retrouvé par son identifiant mémorisé, puis ouvert avec les
+// droits de l'utilisateur qui consulte la page.
+
+/** Page de message. Ne contient jamais la moindre donnée de tournée. */
+function _pageMessage_(titre, message) {
+  const esc = function (s) {
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+                    .replace(/>/g, "&gt;");
+  };
+  return HtmlService.createHtmlOutput(
+      '<div style="font-family:Arial,Helvetica,sans-serif;max-width:520px;'
+    + 'margin:12vh auto;padding:0 24px;line-height:1.6;color:#222">'
+    + "<h1 style=\"font-size:19px\">" + esc(titre) + "</h1>"
+    + "<p>" + esc(message) + "</p></div>")
+    .setTitle("Carte des tournées")
+    .addMetaTag("viewport", "width=device-width, initial-scale=1");
+}
+
+
+/**
+ * Point d'entrée de la Web App : un instantané partagé, et RIEN d'autre.
+ *
+ * Le jeton est la seule clé. Sans jeton valide, aucune donnée ne sort d'ici :
+ * la Web App ne sert plus « la dernière carte », usage revenu au dialogue du
+ * classeur. C'est ce qui permet d'ouvrir le déploiement au partage sans
+ * ouvrir en même temps l'accès au dernier run à quiconque connaît l'adresse.
+ *
+ * Aucun appel Drive sur ce chemin, et c'est délibéré. La version précédente
+ * relisait le fichier d'archive par DriveApp.getFileById : c'était le seul
+ * maillon Drive entre l'adresse script.google.com et le contenu, et donc le
+ * seul endroit d'où pouvait surgir une page d'erreur Drive. L'instantané est
+ * désormais lu dans le classeur et la page assemblée ici même.
+ */
+function doGet(e) {
+  const params = (e && e.parameter) || {};
+
+  // Diagnostic : répond « Web App active » et le marqueur de version, rien
+  // d'autre. Aucune lecture du classeur, aucune donnée, aucun jeton requis.
+  // C'est ce qui permet de distinguer « mauvaise adresse » de « version
+  // ancienne encore servie ».
+  if (params[DIAG_PARAM]) {
+    return _pageMessage_("Web App active",
+      "Version servie : " + SHARE_BUILD_ID + ".");
+  }
+
+  const jeton = params[SHARE_PARAM] ? String(params[SHARE_PARAM]) : "";
+
+  if (!jeton) {
+    return _pageMessage_("Lien incomplet",
+      "Ce lien ne désigne aucune carte. Demandez à la personne qui vous l'a "
+      + "envoyé de vous transmettre le lien en entier.");
+  }
+
+  var payload = null;
+  try {
+    payload = _lirePartage_(jeton);
+  } catch (err) {
+    payload = null;
+  }
+  if (!payload) {
+    return _pageMessage_("Carte indisponible", MSG_PARTAGE_INDISPONIBLE);
+  }
+
+  var html = "";
+  try {
+    // Le MÊME constructeur que l'archive téléchargeable : gabarit courant
+    // plus instantané injecté. La page rend donc seule, sans google.script.run
+    // et sans le moindre accès au classeur.
+    // Marqueur en commentaire HTML, visible par « afficher la source » : il
+    // dit quelle version a réellement produit la page, sans rien exposer.
+    html = _buildStandaloneCarteHtml_(payload)
+      + "\n<!-- tournees-build " + SHARE_BUILD_ID + " -->\n";
+  } catch (err) {
+    return _pageMessage_("Carte indisponible", MSG_PARTAGE_INDISPONIBLE);
+  }
+
+  return HtmlService.createHtmlOutput(html)
+    .setTitle("Carte des tournées")
+    .addMetaTag("viewport",
+                "width=device-width, initial-scale=1, viewport-fit=cover");
+}
+
+
+// =========================
+// URL DE LA WEB APP : SOURCE UNIQUE
+// =========================
+// Toute ouverture « en grand » — entrée de menu comme bouton de la carte —
+// passe par _getWebAppUrl_ et par rien d'autre.
+//
+// Pourquoi une validation, alors que la plateforme est censée rendre la
+// bonne valeur : parce que l'ancienne version rendait TELLE QUELLE la chaîne
+// reçue, sans jamais la regarder. Une adresse de brouillon en /dev, une
+// adresse de classeur, ou une adresse Drive héritée du chemin d'export
+// partaient donc directement dans window.open. Drive n'affiche pas les
+// fichiers HTML : il répond « Impossible d'ouvrir le fichier pour le
+// moment », et l'utilisateur n'avait aucun moyen de savoir d'où venait
+// l'adresse.
+//
+// L'archive Drive naît dans _deposerCarteSurDrive_ et n'en sort JAMAIS pour
+// alimenter une ouverture de carte. Les deux mondes ne se croisent plus :
+// l'un sert à consulter, l'autre à archiver.
+
+const WEB_APP_URL_SUFFIXE = "/exec";
+
+// Fragments qui disqualifient une adresse. Ce sont ceux d'un fichier Drive,
+// d'un export, d'un téléchargement ou d'un aperçu — jamais ceux d'une Web App.
+const WEB_APP_URL_INTERDITS = [
+  "drive.google.com", "/file/d/", "uc?export=", "/view", "/download"
+];
+
+// Hôtes acceptables pour une Web App Apps Script. Contrôler le domaine, et
+// pas seulement l'absence de motifs Drive : une liste de motifs interdits
+// ne dit rien de ce qui n'y figure pas encore.
+const WEB_APP_URL_HOTES = ["script.google.com", "googleusercontent.com"];
+
+const MSG_WEB_APP_INDISPONIBLE =
+    "La Web App n'est pas encore disponible. Mettez à jour ou déployez "
+  + "l'application Web Apps Script.";
+
+
+/**
+ * Rend l'adresse si elle est utilisable pour ouvrir la carte, "" sinon.
+ *
+ * Une adresse refusée n'est jamais remplacée par un repli : mieux vaut un
+ * message clair qu'un lien qui mène ailleurs que là où il annonce.
+ */
+function _validerUrlWebApp_(brut) {
+  const url = String(brut === null || brut === undefined ? "" : brut).trim();
+  if (!url) return "";
+  if (url.indexOf("https://") !== 0) return "";
+
+  const bas = url.toLowerCase();
+
+  // Ni fragment, ni paramètre hérité : le jeton est le seul paramètre, et il
+  // est ajouté ensuite. Une adresse qui en porte déjà n'est pas celle qu'on
+  // croit.
+  if (bas.indexOf("#") !== -1 || bas.indexOf("?") !== -1) return "";
+
+  for (var i = 0; i < WEB_APP_URL_INTERDITS.length; i++) {
+    if (bas.indexOf(WEB_APP_URL_INTERDITS[i]) !== -1) return "";
+  }
+
+  // Domaine attendu, et pas seulement absence de motifs Drive.
+  const apresSchema = bas.slice("https://".length);
+  const barre = apresSchema.indexOf("/");
+  const hote = barre === -1 ? apresSchema : apresSchema.slice(0, barre);
+  var hoteConnu = false;
+  for (var h = 0; h < WEB_APP_URL_HOTES.length; h++) {
+    const attendu = WEB_APP_URL_HOTES[h];
+    if (hote === attendu
+        || hote.slice(-(attendu.length + 1)) === "." + attendu) {
+      hoteConnu = true;
+      break;
+    }
+  }
+  if (!hoteConnu) return "";
+
+  // Un déploiement d'application Web se termine par /exec. /dev est l'adresse
+  // de brouillon : réservée aux éditeurs du script, elle n'ouvrirait rien
+  // pour la personne qui conduit la tournée.
+  const fin = bas.length - WEB_APP_URL_SUFFIXE.length;
+  if (fin < 0 || bas.lastIndexOf(WEB_APP_URL_SUFFIXE) !== fin) return "";
+
+  return url;
+}
+
+
+// Adresse /exec enregistrée explicitement. C'est elle qui fait foi.
+//
+// ScriptApp.getService().getUrl() rend l'adresse du SERVICE du script, qui
+// reste celle du déploiement d'origine. Créer un NOUVEAU déploiement au lieu
+// d'une nouvelle version de l'ancien fait donc diverger les deux : les liens
+// partent vers un déploiement qui ne sert plus le code courant, et rien dans
+// le script ne le signale. Apps Script n'offre aucune API pour énumérer ses
+// déploiements depuis l'intérieur — d'où cette adresse, réglable une fois.
+const PROP_WEBAPP_URL = "TOURNEES_WEBAPP_URL";
+
+const MSG_URL_INVALIDE =
+    "Adresse refusée. Attendu : une adresse https de déploiement Web App "
+  + "Apps Script se terminant par /exec, sans paramètre.";
+
+
+/** Identifiant de déploiement porté par une URL /exec, "" sinon. */
+function _idDeploiement_(url) {
+  const trouve = String(url || "").match(/\/s\/([^\/]+)\/exec$/);
+  return trouve ? trouve[1] : "";
+}
+
+
+/** Ce que la plateforme propose, validé. Ne lève jamais. */
+function _urlServiceScript_() {
+  try {
+    return _validerUrlWebApp_(ScriptApp.getService().getUrl());
+  } catch (e) {
+    return "";
+  }
+}
+
+
+/** Ce qui a été enregistré à la main, validé. Ne lève jamais. */
+function _urlWebAppEnregistree_() {
+  try {
+    return _validerUrlWebApp_(
+      PropertiesService.getScriptProperties().getProperty(PROP_WEBAPP_URL));
+  } catch (e) {
+    return "";
+  }
+}
+
+
+/**
+ * Adresse retenue pour tout lien de partage.
+ *
+ * L'adresse enregistrée l'emporte ; à défaut seulement, celle du service.
+ * Ne lève jamais — sans déploiement, l'appelant doit le dire plutôt que
+ * d'afficher un lien mort.
+ */
+function _getWebAppUrl_() {
+  return _urlWebAppEnregistree_() || _urlServiceScript_();
+}
+
+
+/**
+ * Enregistre l'adresse /exec du déploiement ACTIF.
+ *
+ * Appelée depuis la carte, ou depuis l'éditeur Apps Script. L'adresse est
+ * validée avant d'être retenue : une adresse Drive, une adresse /dev ou un
+ * domaine inattendu sont refusés plutôt qu'enregistrés.
+ */
+function definirUrlWebApp(url) {
+  const propre = _validerUrlWebApp_(url);
+  if (!propre) {
+    return JSON.stringify({ok: false, message: MSG_URL_INVALIDE});
+  }
+  PropertiesService.getScriptProperties().setProperty(PROP_WEBAPP_URL, propre);
+  return JSON.stringify({ok: true, url: propre,
+                         deploiement: _idDeploiement_(propre)});
+}
+
+
+/** Oublie l'adresse enregistrée et revient à celle du service. */
+function oublierUrlWebApp() {
+  PropertiesService.getScriptProperties().deleteProperty(PROP_WEBAPP_URL);
+  return JSON.stringify({ok: true, url: _urlServiceScript_()});
+}
+
+
+/**
+ * Quel déploiement le partage va-t-il utiliser ?
+ *
+ * Rendu à la carte AVANT toute création de lien : c'est ce qui permet de
+ * voir que l'adresse du service et le déploiement actif ont divergé, au lieu
+ * de le découvrir en envoyant un lien mort à quelqu'un.
+ */
+function getInfoDeploiement() {
+  const service = _urlServiceScript_();
+  const enregistree = _urlWebAppEnregistree_();
+  const retenue = enregistree || service;
+  return JSON.stringify({
+    url: retenue,
+    deploiement: _idDeploiement_(retenue),
+    source: enregistree ? "enregistrée" : (service ? "service du script" : ""),
+    deploiementService: _idDeploiement_(service),
+    divergent: !!(enregistree && service && enregistree !== service),
+    buildId: SHARE_BUILD_ID
+  });
+}
+
+
+/**
+ * Surface appelée depuis le HTML par google.script.run : doit rester au
+ * niveau global. Aucune logique ici, uniquement la délégation — le helper
+ * reste le seul endroit où une adresse d'ouverture est produite et validée.
+ */
+function getWebAppUrl() {
+  return _getWebAppUrl_();
+}
+
+
+/**
+ * Entrée de menu « Ouvrir la carte » : rouvre la DERNIÈRE carte produite.
+ *
+ * Exactement la même fenêtre que celle qui s'ouvre en fin d'optimisation, et
+ * exactement le même payload : rien n'est recalculé, aucune optimisation
+ * n'est relancée, aucun onglet n'est ouvert, aucune adresse n'est construite.
+ *
+ * La Web App n'intervient plus ici. Elle ne sert qu'au partage d'un
+ * instantané, ce qui est un autre besoin et un autre chemin.
+ */
+function ouvrirLaCarte() {
+  if (!getCarteTourneesPayload()) {
+    SpreadsheetApp.getActive().toast(MSG_AUCUNE_CARTE, "Carte", 6);
+    return;
+  }
+  _afficherDialogueCarte_();
 }
 
 
@@ -881,18 +1675,417 @@ function buildCartePayload(result, params, points) {
 }
 
 
-function _ouvrirDialogueCarte_() {
+// Titre et dimensions du dialogue. Définis une seule fois : l'ouverture
+// automatique en fin d'optimisation et l'entrée de menu doivent produire
+// exactement la même fenêtre, pas deux fenêtres qui se ressemblent.
+const MAP_DIALOG_TITLE  = "Carte des deux tournées";
+const MAP_DIALOG_WIDTH  = 1200;
+const MAP_DIALOG_HEIGHT = 800;
+
+const MSG_AUCUNE_CARTE =
+  "Aucune carte disponible. Lancez d'abord une optimisation.";
+
+
+/**
+ * UNIQUE chemin d'affichage de la carte.
+ *
+ * Le gabarit part sans données : il réclame ensuite le dernier payload par
+ * google.script.run.getCarteTourneesPayload(). Les deux parcours — fin
+ * d'optimisation et entrée de menu — convergent ici, et nulle part ailleurs.
+ * Aucun onglet, aucune Web App, aucune URL : un dialogue, point.
+ */
+function _afficherDialogueCarte_() {
   const out = HtmlService.createHtmlOutputFromFile(MAP_HTML_FILE)
-    .setWidth(1200)
-    .setHeight(800);
-  SpreadsheetApp.getUi().showModalDialog(out, "Carte des deux tournées");
+    .setWidth(MAP_DIALOG_WIDTH)
+    .setHeight(MAP_DIALOG_HEIGHT);
+  SpreadsheetApp.getUi().showModalDialog(out, MAP_DIALOG_TITLE);
 }
 
 
 /** Construit, enregistre puis affiche la carte du run courant. */
 function afficherCarteTournees(result, params, points) {
   _saveCartePayload_(buildCartePayload(result, params, points));
-  _ouvrirDialogueCarte_();
+  _afficherDialogueCarte_();
+}
+
+
+// =========================
+// GÉOMÉTRIE ROUTIÈRE DE LA CARTE
+// =========================
+// Entièrement séparé de l'optimisation. Ces appels partent APRÈS qu'un run
+// est terminé et mesuré : ils n'entrent ni dans le temps Benchmark, ni dans
+// les appels comptés de l'optimisation, et un échec ne peut pas transformer
+// une optimisation réussie en erreur.
+//
+// La clé ORS n'apparaît nulle part ici : c'est le backend qui la détient,
+// et c'est la seule raison pour laquelle cet aller-retour existe.
+
+const MAP_GEOMETRY_TIMEOUT_MS = 25000;
+
+
+/** Coordonnées [lon, lat] des deux tournées, dans l'ordre EXACT de passage. */
+function _coordsDesRoutes_(payload) {
+  const routes = (payload && payload.routes) || [];
+  const out = [];
+  for (var r = 0; r < routes.length; r++) {
+    const pts = routes[r].points || [];
+    const coords = [];
+    for (var i = 0; i < pts.length; i++) {
+      const lat = Number(pts[i].lat), lon = Number(pts[i].lon);
+      if (isFinite(lat) && isFinite(lon)) coords.push([lon, lat]);
+    }
+    out.push(coords);
+  }
+  return out;
+}
+
+
+/**
+ * Demande au backend le tracé routier des deux tournées.
+ *
+ * Appelée depuis le HTML par google.script.run : doit rester au niveau
+ * global. Ne lève jamais — la carte doit pouvoir garder ses segments
+ * indicatifs sans qu'aucune erreur ne remonte à l'utilisateur.
+ *
+ * @param {string} coordsJson  [[[lon,lat],...],[[lon,lat],...]]
+ * @return {string} JSON de la réponse backend, ou d'un repli local.
+ */
+function getCarteGeometrie(coordsJson) {
+  try {
+    const routes = JSON.parse(coordsJson);
+    if (!Array.isArray(routes) || routes.length !== 2) {
+      return JSON.stringify({geometries: null, status: "invalid_request",
+                             cache_hit: false, calls: 0, elapsed_ms: 0,
+                             fallback_used: true});
+    }
+
+    // Aucun réveil du serveur ici, contrairement à callAPI : la carte est
+    // déjà affichée et ne doit pas attendre un démarrage à froid de Render
+    // pendant une minute. Si le serveur dort, on retombe sur les pointillés.
+    const response = UrlFetchApp.fetch(API_BASE + "/map-geometry", {
+      method: "post",
+      contentType: "application/json",
+      payload: JSON.stringify({routes: routes, profile: "driving-car"}),
+      muteHttpExceptions: true
+    });
+
+    const code = response.getResponseCode();
+    const text = response.getContentText();
+    if (code !== 200 || text.charAt(0) !== "{") {
+      return JSON.stringify({geometries: null, status: "http_" + code,
+                             cache_hit: false, calls: 0, elapsed_ms: 0,
+                             fallback_used: true});
+    }
+    return text;
+
+  } catch (e) {
+    return JSON.stringify({geometries: null, status: "unreachable",
+                           cache_hit: false, calls: 0, elapsed_ms: 0,
+                           fallback_used: true,
+                           error: String(e && e.message ? e.message : e)});
+  }
+}
+
+
+/**
+ * Recopie du payload avec les géométries greffées sur les tournées.
+ *
+ * La géométrie n'est JAMAIS réécrite dans _CarteData : une cellule de
+ * feuille plafonne à 50 000 caractères, et deux tracés routiers la feraient
+ * sauter. Elle ne vit que dans la fenêtre et dans le fichier exporté.
+ */
+function _payloadAvecGeometries_(json, geometries) {
+  if (!geometries) return json;
+  const payload = JSON.parse(json);
+  const routes = payload.routes || [];
+  for (var i = 0; i < routes.length && i < geometries.length; i++) {
+    if (Array.isArray(geometries[i]) && geometries[i].length > 1) {
+      routes[i].geometry = geometries[i];
+    }
+  }
+  return JSON.stringify(payload);
+}
+
+
+/** Nom de fichier déterministe, réduit à une liste de caractères sûrs. */
+function _nomFichierCarte_(signature) {
+  const propre = String(signature || "sans-signature")
+    .replace(/[^A-Za-z0-9_-]/g, "")
+    .slice(0, 40) || "sans-signature";
+  const stamp = Utilities.formatDate(
+    new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd_HH-mm");
+  return "carte_tournees_" + propre + "_" + stamp + ".html";
+}
+
+
+/** Crée le fichier Drive et rend de quoi l'ouvrir. Aucun secret n'y entre. */
+function _deposerCarteSurDrive_(html, signature) {
+  const name = _nomFichierCarte_(signature);
+  const file = DriveApp.createFile(name, html, MimeType.HTML);
+  return {
+    id: file.getId(),
+    name: name,
+    sizeKb: Math.round(html.length / 1024),
+    url: file.getUrl(),
+    downloadUrl: "https://drive.google.com/uc?export=download&id=" + file.getId()
+  };
+}
+
+
+// =========================
+// PARTAGE D'UN INSTANTANÉ DE CARTE
+// =========================
+// Pourquoi ce détour plutôt que d'envoyer le fichier : Drive ne PRÉVISUALISE
+// pas le HTML qu'il n'a pas produit. Il propose de le télécharger, et sur
+// téléphone cela ne mène à rien d'utilisable — d'où « Impossible d'ouvrir le
+// fichier pour le moment ». Un fichier reçu par messagerie ne s'ouvre pas
+// mieux : l'aperçu d'iOS n'exécute pas JavaScript, et Chrome Android refuse
+// souvent d'ouvrir un HTML local.
+//
+// Ce qui marche partout, sans installation ni compte, c'est une vraie adresse
+// HTTPS. La Web App en est déjà une. Elle sert donc l'instantané — le MÊME
+// fichier que l'archive, relu depuis Drive — identifié par un jeton.
+//
+// Le jeton est la seule clé. Sans lui la Web App ne rend rien : elle n'expose
+// plus « la dernière carte », cet usage étant revenu au dialogue.
+
+const SHARE_SHEET = "_CartesPartagees";
+
+// Colonnes fixes du registre. Les fragments de l'instantané suivent, à
+// partir de SHARE_COL_FRAGMENTS.
+const SHARE_HEADERS = ["Jeton", "Créée le", "Expire le", "Nom",
+                       "Signature jeu", "Fragments"];
+const SHARE_COL_FRAGMENTS = SHARE_HEADERS.length + 1;
+
+// Une cellule de feuille plafonne à 50 000 caractères, et deux tracés
+// routiers dépassent largement. L'instantané est donc découpé, et le nombre
+// de morceaux écrit à côté : la relecture ne devine rien.
+const SHARE_CHUNK = 45000;
+const SHARE_MAX_FRAGMENTS = 40;
+
+// Un fragment peut commencer n'importe où dans le JSON — y compris sur « = »,
+// « + » ou « - ». Sheets y verrait une formule ou un nombre et corromprait
+// la donnée en silence. Ce préfixe garantit que la cellule reste du texte ;
+// il est retiré à la relecture.
+const SHARE_FRAGMENT_PREFIX = "~";
+
+// Paramètre d'URL portant le jeton. Nommé « share » plutôt que « c » : un
+// lien que quelqu'un va coller dans une messagerie doit dire ce qu'il est.
+// Une seule constante sert à le POSER et à le LIRE — les deux côtés ne
+// peuvent donc pas diverger.
+const SHARE_PARAM = "share";
+
+// Paramètre de diagnostic. Ne rend que le marqueur de version : aucune
+// donnée du classeur, aucune adresse, aucune coordonnée.
+const DIAG_PARAM = "diagnostic";
+
+// Marqueur de version, non sensible. Il sert à répondre sans ambiguïté à
+// une seule question : le navigateur exécute-t-il bien le code recopié, ou
+// le déploiement sert-il encore une version antérieure ?
+const SHARE_BUILD_ID = "6634323-fix1";
+
+// Au-delà, le lien cesse de fonctionner sans qu'on ait à y penser. Une carte
+// de tournée n'a de sens que peu de temps.
+const SHARE_TTL_DAYS = 30;
+
+const MSG_PARTAGE_INDISPONIBLE =
+    "Ce lien n'est plus valable. Il a peut-être expiré, ou le partage a été "
+  + "révoqué.";
+
+
+/**
+ * Jeton de partage : deux UUID concaténés, tirets retirés.
+ *
+ * 64 caractères hexadécimaux, soit largement au-delà de ce qu'une recherche
+ * exhaustive peut atteindre. C'est ce qui rend le lien non devinable — et
+ * c'est aussi pourquoi il ne doit être transmis qu'aux personnes concernées.
+ */
+function _jetonPartage_() {
+  return (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, "");
+}
+
+
+/** Registre des partages. Feuille masquée, lisible et modifiable à la main. */
+function _sharesSheet_(createIfMissing) {
+  const ss = _classeur_();
+  let sh = ss.getSheetByName(SHARE_SHEET);
+  if (!sh && createIfMissing) {
+    sh = ss.insertSheet(SHARE_SHEET);
+    sh.getRange(1, 1, 1, SHARE_HEADERS.length).setValues([SHARE_HEADERS]);
+    sh.getRange(1, 1, 1, SHARE_HEADERS.length)
+      .setBackground("#434343").setFontColor("#ffffff").setFontWeight("bold");
+    sh.setFrozenRows(1);
+    sh.hideSheet();
+  }
+  return sh;
+}
+
+
+/**
+ * Enregistre un instantané partageable et rend son jeton.
+ *
+ * Seuls un identifiant de fichier et des dates entrent ici : ni adresse, ni
+ * coordonnée, ni géométrie. Les données de la carte restent dans le fichier
+ * Drive, dont ce registre ne fait que désigner l'emplacement.
+ */
+function _enregistrerPartage_(payloadJson, nom, signature) {
+  const texte = String(payloadJson || "");
+  if (!texte) throw new Error("Instantané vide.");
+
+  const morceaux = [];
+  for (var i = 0; i < texte.length; i += SHARE_CHUNK) {
+    morceaux.push(SHARE_FRAGMENT_PREFIX + texte.slice(i, i + SHARE_CHUNK));
+  }
+  if (morceaux.length > SHARE_MAX_FRAGMENTS) {
+    throw new Error("Instantané trop volumineux pour être partagé ("
+      + Math.round(texte.length / 1024) + " Ko).");
+  }
+
+  const jeton = _jetonPartage_();
+  const cree = new Date();
+  const expire = new Date(cree.getTime() + SHARE_TTL_DAYS * 24 * 3600 * 1000);
+
+  const sh = _sharesSheet_(true);
+  const largeur = SHARE_HEADERS.length + morceaux.length;
+  if (sh.getMaxColumns() < largeur) {
+    sh.insertColumnsAfter(sh.getMaxColumns(), largeur - sh.getMaxColumns());
+  }
+
+  const ligne = sh.getLastRow() + 1;
+
+  // Le format texte s'applique aux SEULS fragments. Appliqué à toute la
+  // ligne, il transformait « Expire le » en chaîne : à la relecture
+  // `expire instanceof Date` était faux et l'expiration ne se déclenchait
+  // jamais. Les deux dates doivent rester des dates.
+  sh.getRange(ligne, SHARE_COL_FRAGMENTS, 1, morceaux.length)
+    .setNumberFormat("@");
+
+  sh.getRange(ligne, 1, 1, largeur).setValues(
+    [[jeton, cree, expire, String(nom || ""),
+      String(signature || ""), morceaux.length].concat(morceaux)]);
+  return jeton;
+}
+
+
+/**
+ * Retrouve un partage valide, ou null.
+ *
+ * Un jeton inconnu, expiré ou effacé rend null, sans distinction : la page
+ * d'erreur ne doit pas révéler qu'un jeton a existé.
+ */
+function _lirePartage_(jeton) {
+  const cle = String(jeton || "").trim();
+  if (!cle) return null;
+
+  const sh = _sharesSheet_(false);
+  if (!sh) return null;
+
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return null;
+
+  const rows = sh.getRange(2, 1, lastRow - 1, SHARE_HEADERS.length).getValues();
+  const maintenant = new Date();
+  for (var i = 0; i < rows.length; i++) {
+    if (String(rows[i][0]).trim() !== cle) continue;
+
+    const expire = rows[i][2];
+    if (expire instanceof Date && expire.getTime() < maintenant.getTime()) {
+      return null;
+    }
+
+    const nb = Number(rows[i][5]) || 0;
+    if (nb < 1 || nb > SHARE_MAX_FRAGMENTS) return null;
+
+    const morceaux = sh.getRange(i + 2, SHARE_COL_FRAGMENTS, 1, nb).getValues()[0];
+    var texte = "";
+    for (var k = 0; k < nb; k++) {
+      const brut = (morceaux[k] === null || morceaux[k] === undefined)
+        ? "" : String(morceaux[k]);
+      texte += brut.slice(SHARE_FRAGMENT_PREFIX.length);
+    }
+    return texte || null;
+  }
+  return null;
+}
+
+
+/**
+ * Révoque TOUS les partages : les liens déjà envoyés cessent de fonctionner.
+ *
+ * Sans entrée de menu, volontairement — c'est une action rare, et le menu
+ * doit rester celui de la conduite des tournées. Elle s'exécute depuis
+ * l'éditeur Apps Script. Révoquer un seul lien se fait en supprimant sa
+ * ligne dans la feuille « _CartesPartagees », qu'il suffit d'afficher.
+ *
+ * Les fichiers Drive ne sont pas supprimés : ils restent votre archive.
+ */
+function revoquerPartagesCarte() {
+  const sh = _sharesSheet_(false);
+  if (!sh || sh.getLastRow() < 2) return 0;
+  const n = sh.getLastRow() - 1;
+  sh.deleteRows(2, n);
+  return n;
+}
+
+
+/**
+ * Export déclenché par le bouton de la fenêtre carte.
+ *
+ * Les géométries déjà chargées dans la fenêtre sont transmises telles
+ * quelles : aucun nouvel appel Directions n'est émis, l'export ne coûte donc
+ * rien de plus que le tracé déjà affiché. Sans géométrie, l'export part en
+ * segments indicatifs plutôt que d'attendre.
+ *
+ * Ne relance aucune optimisation, n'écrit ni dans le Benchmark ni dans
+ * _CarteData.
+ */
+function exporterCarteDepuisDialogue(geometriesJson) {
+  const json = getCarteTourneesPayload();
+  if (!json) return JSON.stringify({error: "Aucune carte enregistrée."});
+
+  var geometries = null;
+  try {
+    geometries = geometriesJson ? JSON.parse(geometriesJson) : null;
+  } catch (e) {
+    geometries = null;
+  }
+
+  const enrichi = _payloadAvecGeometries_(json, geometries);
+  const html = _buildStandaloneCarteHtml_(enrichi);
+
+  var signature = "";
+  try { signature = JSON.parse(json).points_signature || ""; } catch (e) {}
+
+  const info = _deposerCarteSurDrive_(html, signature);
+  info.withGeometry = !!(geometries && geometries.length);
+
+  // L'archive Drive ne sort PLUS d'ici. Ni son URL d'aperçu, ni son URL de
+  // téléchargement : toutes deux mènent à « Impossible d'ouvrir le fichier
+  // pour le moment » sur un fichier HTML. Le fichier existe dans Drive, on
+  // en donne le nom, pas un lien.
+  delete info.url;
+  delete info.downloadUrl;
+  delete info.id;
+
+  info.buildId = SHARE_BUILD_ID;
+
+  // Lien de consultation. Un échec ici ne fait pas échouer l'export : le
+  // fichier existe déjà, et la fenêtre le dira plutôt que de tout perdre.
+  try {
+    const base = _getWebAppUrl_();
+    if (base) {
+      info.shareUrl = base + "?" + SHARE_PARAM + "="
+        + encodeURIComponent(_enregistrerPartage_(enrichi, info.name,
+                                                  signature));
+    } else {
+      info.shareError = MSG_WEB_APP_INDISPONIBLE;
+    }
+  } catch (e) {
+    info.shareError = "Lien de partage indisponible : "
+      + (e && e.message ? e.message : e);
+  }
+
+  return JSON.stringify(info);
 }
 
 
@@ -929,8 +2122,13 @@ function _buildStandaloneCarteHtml_(payloadJson) {
 
 
 /**
- * Entrée de menu : exporte la dernière carte en un fichier HTML autonome
- * déposé sur Drive, puis affiche son lien.
+ * Exporte la dernière carte en un fichier HTML autonome déposé sur Drive,
+ * puis affiche son lien.
+ *
+ * Retirée du menu : l'export existe déjà dans la carte, via le bouton
+ * « Exporter », qui réutilise les géométries déjà chargées et ne coûte donc
+ * aucun appel de plus. Cette variante reste exécutable depuis l'éditeur Apps
+ * Script pour archiver une carte sans rouvrir la fenêtre.
  *
  * Le fichier est créé PRIVÉ. Le partage reste une décision explicite, à
  * prendre dans Drive : ces données sont opérationnelles.
@@ -944,12 +2142,29 @@ function exporterCartePartageable() {
     return;
   }
 
-  const html = _buildStandaloneCarteHtml_(json);
-  const stamp = Utilities.formatDate(
-    new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd_HH-mm");
-  const name = "carte_tournees_" + stamp + ".html";
+  // Tracé routier demandé à la volée. Sur cache backend il ne coûte aucun
+  // appel ; sinon deux au maximum. Un échec n'empêche pas l'export : le
+  // fichier part alors avec ses segments indicatifs.
+  var payload = null;
+  try { payload = JSON.parse(json); } catch (e) {}
+  var geometries = null;
+  var geoStatus = "non_demande";
+  if (payload) {
+    try {
+      const reponse = JSON.parse(
+        getCarteGeometrie(JSON.stringify(_coordsDesRoutes_(payload))));
+      geometries = reponse.geometries;
+      geoStatus = reponse.status;
+    } catch (e) {
+      geoStatus = "erreur";
+    }
+  }
 
-  const file = DriveApp.createFile(name, html, MimeType.HTML);
+  const html = _buildStandaloneCarteHtml_(
+    _payloadAvecGeometries_(json, geometries));
+  const info = _deposerCarteSurDrive_(html,
+    payload ? payload.points_signature : "");
+  const name = info.name;
 
   const esc = function (s) {
     return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
@@ -960,14 +2175,20 @@ function exporterCartePartageable() {
       '<div style="font-family:Arial,sans-serif;font-size:13px;line-height:1.7;padding:14px">'
     + "<b>Carte exportée.</b><br>"
     + "Fichier : <code>" + esc(name) + "</code>"
-    + " &mdash; " + Math.round(html.length / 1024) + " Ko<br><br>"
-    + '<a href="' + esc(file.getUrl()) + '" target="_blank">Ouvrir dans Drive</a>'
+    + " &mdash; " + info.sizeKb + " Ko<br>"
+    + "Tracé : " + (geometries ? "itinéraires routiers réels"
+                               : "segments indicatifs (" + esc(geoStatus) + ")")
+    + "<br><br>"
+    + '<a href="' + esc(info.url) + '" target="_blank">Ouvrir dans Drive</a>'
     + " &nbsp;|&nbsp; "
-    + '<a href="https://drive.google.com/uc?export=download&id='
-    + esc(file.getId()) + '" target="_blank">Télécharger le fichier</a>'
+    + '<a href="' + esc(info.downloadUrl)
+    + '" target="_blank">Télécharger le fichier</a>'
     + "<br><br>"
     + "<b>Pour partager</b> : dans Drive, clic droit sur le fichier &rsaquo; Partager.<br>"
     + "Il est créé <b>privé</b> : rien n'est publié sans votre décision.<br><br>"
+    + "<b>Pour consulter la carte</b> sur ordinateur ou sur téléphone, "
+    + "utilisez <i>Tournées &rsaquo; Ouvrir la carte</i> : Drive n'affiche "
+    + "pas les fichiers HTML, il propose seulement de les télécharger.<br><br>"
     + "<small>Le fichier contient les données du run. Il charge Leaflet et les "
     + "tuiles OpenStreetMap depuis Internet : une connexion reste nécessaire "
     + "pour l'afficher.</small></div>";
@@ -978,15 +2199,6 @@ function exporterCartePartageable() {
 }
 
 
-/** Entrée de menu : rouvre la dernière carte sans relancer d'optimisation. */
-function afficherDerniereCarte() {
-  if (!getCarteTourneesPayload()) {
-    SpreadsheetApp.getActive().toast(
-      "Aucune carte enregistrée. Lancez une optimisation.", "Carte", 5);
-    return;
-  }
-  _ouvrirDialogueCarte_();
-}
 
 
 // =========================
@@ -1067,30 +2279,69 @@ function runOrtoolsHaversine() { runOptimisation("ortools_haversine"); }
 function runOrtoolsOrsMatrix() { runOptimisation("ortools_ors_matrix"); }
 function runOrtoolsOrsMatrixConnected() { runOptimisation("ortools_ors_matrix_connected"); }
 
+// Stratégie expérimentale. L'identifiant vient de la constante, jamais d'une
+// chaîne recopiée : le libellé de menu et le nom envoyé à l'API ne peuvent
+// pas diverger.
+function runHybridLocalVroomTerritorial() { runOptimisation(EXP_STRATEGY); }
+
 
 
 // =========================
 // MENU PERSONNALISÉ
 // =========================
+/**
+ * Menu « Tournées ».
+ *
+ * Trois entrées au premier niveau, et ce sont les trois gestes d'une journée :
+ * choisir les points, optimiser, regarder la carte. Tout le reste — le
+ * benchmark et les méthodes de comparaison — descend sous « Outils dev »,
+ * parce que rien de tout cela ne sert à conduire une tournée.
+ *
+ * « Exporter la carte » quitte le menu : l'export existe déjà DANS la carte,
+ * et le proposer deux fois laissait croire que l'archive Drive était le moyen
+ * normal de consulter la carte. Elle ne l'est pas — Drive n'affiche pas les
+ * fichiers HTML.
+ *
+ * Rien n'est supprimé pour autant : les stratégies et fonctions retirées du
+ * menu visible restent définies, exécutables depuis l'éditeur Apps Script, et
+ * le backend les accepte toujours.
+ */
 function onOpen() {
+  // Le classeur est mémorisé à chaque ouverture : c'est la seule occasion où
+  // son identifiant est connu de façon fiable, et la Web App en dépend.
+  _memoriserClasseur_();
+
   const ui = SpreadsheetApp.getUi();
-  ui.createMenu("Tournées")
-    .addItem("Optimisation", "runOptimisation")
+  ui.createMenu(MENU_RACINE_LABEL)
+    .addItem("Sélectionner les points par ID", "ouvrirSelectionParId")
+    .addItem(MENU_OPTIMISER_LABEL, "runHybridLocalVroomTerritorial")
+    .addItem("Ouvrir la carte", "ouvrirLaCarte")
+    .addSeparator()
     .addSubMenu(
-      ui.createMenu("Optimiser avec")
-        .addItem("K-Means (baseline)", "runKmeans")
-        .addItem("OR-Tools Haversine", "runOrtoolsHaversine")
-        .addItem("OR-Tools ORS Matrix", "runOrtoolsOrsMatrix")
-        .addItem("OR-Tools ORS Matrix — territoires connexes",
-                 "runOrtoolsOrsMatrixConnected")
+      ui.createMenu("Outils dev")
+        .addItem("Ouvrir le benchmark", "ouvrirBenchmark")
+        .addSubMenu(
+          ui.createMenu("Méthodes de comparaison")
+            .addItem("K-means — référence", "runKmeans")
+            .addItem("ORS connecté — comparaison",
+                     "runOrtoolsOrsMatrixConnected")
+        )
     )
-    .addSeparator()
-    .addItem("Afficher la dernière carte", "afficherDerniereCarte")
-    .addItem("Exporter la carte partageable", "exporterCartePartageable")
-    .addSeparator()
-    .addItem("Effacer tournées", "clearResults")
-    .addItem("Réinitialiser la sélection", "resetSelection")
     .addToUi();
+}
+
+
+/**
+ * Ouvre la feuille Benchmark, en la créant au besoin.
+ *
+ * Aucune logique dupliquée : ensureBenchmarkSheet() reste seule responsable
+ * de la création de la feuille et de la migration de ses colonnes. Ce
+ * wrapper n'ajoute que la navigation, qu'une entrée de menu ne sait pas
+ * faire elle-même.
+ */
+function ouvrirBenchmark() {
+  const sheet = ensureBenchmarkSheet();
+  SpreadsheetApp.getActive().setActiveSheet(sheet);
 }
 
 

@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+
+# Depot Git imbrique, sans rapport avec le service : il ne doit jamais etre
+# suivi par ce depot.
+CLI/
+
+# Sorties locales des mesures CI.
+artifacts/

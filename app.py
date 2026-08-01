@@ -3,6 +3,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import time
 import numpy as np
 import requests
@@ -19,6 +20,16 @@ try:
     ORTOOLS_AVAILABLE = True
 except ImportError:
     ORTOOLS_AVAILABLE = False
+
+# Couche VROOM locale (experimentale). Comme pour OR-Tools, son absence ne doit
+# jamais empecher le service de demarrer : sans elle, seules les strategies
+# existantes repondent, exactement comme aujourd'hui.
+try:
+    import local_vroom
+    LOCAL_VROOM_MODULE_AVAILABLE = True
+except ImportError:
+    local_vroom = None
+    LOCAL_VROOM_MODULE_AVAILABLE = False
 
 app = Flask(__name__)
 
@@ -48,12 +59,25 @@ ORS_MATRIX_URL = "https://api.heigit.org/openrouteservice/v2/matrix/driving-car"
 # 2b. INSTRUMENTATION (compteur d'appels API + strategies)
 # =========================
 VALID_STRATEGIES = ("kmeans", "ortools_haversine", "ortools_ors_matrix",
-                    "ortools_ors_matrix_connected")
+                    "ortools_ors_matrix_connected",
+                    "hybrid_local_vroom_territorial")
+# Les quatre strategies de production. Leur comportement ne doit pas bouger
+# quand une strategie experimentale est ajoutee : ce tuple fige la reference.
+PRODUCTION_STRATEGIES = ("kmeans", "ortools_haversine", "ortools_ors_matrix",
+                         "ortools_ors_matrix_connected")
 IMPLEMENTED_STRATEGIES = {"kmeans"}
 if ORTOOLS_AVAILABLE:
     IMPLEMENTED_STRATEGIES.add("ortools_haversine")
     IMPLEMENTED_STRATEGIES.add("ortools_ors_matrix")
     IMPLEMENTED_STRATEGIES.add("ortools_ors_matrix_connected")
+
+# Strategie experimentale. Elle n'est declaree implementee que si le module
+# local est importable ET si l'experimentation est explicitement activee :
+# par defaut elle repond 501, exactement comme une strategie inconnue. C'est
+# la protection la plus stricte -- aucune requete ne peut l'atteindre par
+# accident.
+if LOCAL_VROOM_MODULE_AVAILABLE and local_vroom.get_config().enabled:
+    IMPLEMENTED_STRATEGIES.add("hybrid_local_vroom_territorial")
 
 # Matrice ORS complete (strategie ortools_ors_matrix).
 # 62 x 62 = 3844 routes depasse le plafond free tier : on decoupe par blocs
@@ -4012,6 +4036,1366 @@ def _tsp_order_ortools(matrix, group, start_idx, end_idx):
 
 
 # =========================
+# 4f. HYBRIDE VROOM LOCAL + ALNS TERRITORIALE (experimental)
+# =========================
+# Strategie experimentale, inactive tant que LOCAL_VROOM_EXPERIMENT_ENABLED
+# n'est pas positionne. Elle n'empile PAS l'ancien pipeline connexe et le
+# nouveau : elle reprend seulement quelques graines peu couteuses de la
+# bibliotheque existante, et construit ses propres candidates.
+#
+# Trois blocs, chacun avec son budget et sa cause d'arret :
+#   A. matrice ORS, juge commun, resolution VROOM conjointe directe ;
+#   B. graphe G5, variante a noyaux, route-first ;
+#   C. ALNS territoriale, puis finalistes VROOM.
+#
+# Invariant de bout en bout : aucun bloc ne jette ce qu'un bloc precedent a
+# obtenu. L'incumbent du bloc A reste retournable meme si B et C expirent.
+
+HYBRID_SERVICE_S = _env_int("LOCAL_VROOM_SERVICE_S", 0, 0, 3600)
+
+
+def score_routes_on_matrix(dur_matrix, dist_matrix, routes, service_s=0):
+    """JUGE COMMUN. Toute solution experimentale passe par ici, sans exception.
+
+    VROOM et OR-Tools ne rendent pas des durees issues du meme estimateur :
+    les comparer directement fausserait le classement. Leurs valeurs propres
+    restent des diagnostics ; le classement, lui, ne connait que cette
+    fonction, appliquee a la MEME matrice ORS, avec les MEMES depart et
+    arrivee et le MEME temps de service par arret.
+
+    Retourne {duration_s, distance_m, stops}. La duree inclut le service :
+    avec le defaut service_s=0, elle vaut exactement la somme des arcs, donc
+    la meme grandeur que celle des strategies existantes.
+    """
+    duration = 0.0
+    distance = 0.0
+    stops = 0
+    for route in routes:
+        if not route or len(route) < 2:
+            continue
+        duration += _matrix_route_cost(dur_matrix, route)
+        if dist_matrix:
+            distance += _matrix_route_cost(dist_matrix, route)
+        stops += len(route) - 2
+    duration += stops * float(service_s)
+    return {"duration_s": duration, "distance_m": distance, "stops": stops}
+
+
+class _HybridClock:
+    """Discipline temporelle des blocs.
+
+    Chaque bloc recoit son debut, son budget, son temps consomme et sa cause
+    d'arret ; le temps global restant est lisible a tout moment. Un budget de
+    bloc ne peut jamais depasser la limite souple globale : quand les deux
+    entrent en conflit, c'est toujours la limite globale qui gagne.
+    """
+
+    def __init__(self, soft_limit_s):
+        self.t0 = time.monotonic()
+        self.soft_limit_s = float(soft_limit_s)
+        self.stages = []
+        self._current = None
+
+    @property
+    def deadline(self):
+        return self.t0 + self.soft_limit_s
+
+    def remaining_s(self):
+        return max(0.0, self.deadline - time.monotonic())
+
+    def soft_limit_reached(self):
+        return time.monotonic() >= self.deadline
+
+    def begin(self, name, budget_s):
+        budget = min(float(budget_s), self.remaining_s())
+        started = time.monotonic()
+        self._current = {
+            "stage": name,
+            "budget_s": round(budget, 3),
+            "started_at_s": round(started - self.t0, 3),
+            "elapsed_ms": 0,
+            "stop_reason": None,
+            "remaining_after_s": None,
+        }
+        self._started = started
+        self._deadline = started + budget
+        return self._current
+
+    def expired(self):
+        """Vrai si le budget du bloc OU la limite globale est atteint."""
+        now = time.monotonic()
+        return now >= self._deadline or now >= self.deadline
+
+    @property
+    def stage_deadline(self):
+        """Le plus contraignant des deux couperets : celui du bloc et le global."""
+        return min(self._deadline, self.deadline)
+
+    def stage_remaining_s(self):
+        return max(0.0, self.stage_deadline - time.monotonic())
+
+    def end(self, stop_reason):
+        if self._current is None:
+            return None
+        # Mesure directe depuis le debut du bloc : une soustraction de deux
+        # arrondis pouvait rendre une duree negative sur les blocs tres brefs.
+        self._current["elapsed_ms"] = int((time.monotonic() - self._started) * 1000)
+        self._current["stop_reason"] = stop_reason
+        self._current["remaining_after_s"] = round(self.remaining_s(), 3)
+        self.stages.append(self._current)
+        done = self._current
+        self._current = None
+        return done
+
+    def as_diagnostics(self):
+        return {
+            "hybrid_stages": list(self.stages),
+            "total_elapsed_ms": int((time.monotonic() - self.t0) * 1000),
+            "soft_limit_reached": self.soft_limit_reached(),
+        }
+
+
+def build_knn_graph_g5(points, indices, k=5):
+    """Graphe spatial STRICT G5 : k plus proches voisins haversine, k fixe.
+
+    Volontairement plus pauvre que build_geo_graph : aucune arete issue de la
+    duree ORS, aucun arbre couvrant, aucune augmentation de k pour forcer la
+    connexite globale. Il ne sert pas a estimer un cout -- la matrice ORS s'en
+    charge -- mais uniquement a dire ce qui est VOISIN : noyaux, frontiere,
+    enclaves. Un k fixe rend cette lecture geographique stable d'un run a
+    l'autre ; un k variable la rendrait dependante du jeu de points.
+    """
+    adjacency = {i: set() for i in indices}
+    n = len(indices)
+    if n <= 1:
+        return adjacency, {"k": 0, "edges": 0, "method": "knn_haversine_strict"}
+
+    coords = {i: (float(points[i]["lat"]), float(points[i]["lon"])) for i in indices}
+    dist = {}
+    for a in range(n):
+        ia = indices[a]
+        for b in range(a + 1, n):
+            ib = indices[b]
+            d = haversine(coords[ia], coords[ib])
+            dist[(ia, ib)] = d
+            dist[(ib, ia)] = d
+
+    used_k = min(int(k), n - 1)
+    edges = set()
+    for i in indices:
+        # Tri par (distance, index) : les egalites sont departagees de facon
+        # stable, le graphe est donc deterministe.
+        near = sorted((j for j in indices if j != i),
+                      key=lambda j: (dist[(i, j)], j))[:used_k]
+        for j in near:
+            edges.add((min(i, j), max(i, j)))
+    for u, v in edges:
+        adjacency[u].add(v)
+        adjacency[v].add(u)
+    return adjacency, {"k": used_k, "edges": len(edges),
+                       "method": "knn_haversine_strict"}
+
+
+def _hybrid_routes(sequences, vehicle_ids, start_idx, end_idx):
+    """Deux ordres complets, depot compris, a partir des sequences VROOM."""
+    return [[start_idx] + list(sequences[vid]) + [end_idx] for vid in vehicle_ids]
+
+
+def _hybrid_solution(group_a, group_b, route_a, route_b, dur_matrix, dist_matrix,
+                     adjacency, points, source, sequencer, service_s,
+                     declared=None):
+    """Solution complete, systematiquement rescoree par le juge commun.
+
+    `declared` porte ce que le solveur a annonce de lui-meme. Cette valeur ne
+    sert JAMAIS au classement : elle est conservee pour pouvoir constater
+    l'ecart entre l'estimateur du solveur et la matrice ORS.
+    """
+    score = score_routes_on_matrix(dur_matrix, dist_matrix,
+                                   [route_a, route_b], service_s)
+    ca = is_connected_partition(group_a, adjacency)
+    cb = is_connected_partition(group_b, adjacency)
+    boundary = boundary_metrics(group_a, group_b, adjacency, points)
+    visited = [p for r in (route_a, route_b) for p in r[1:-1]]
+    expected = sorted(list(group_a) + list(group_b))
+    return {
+        "group_a": sorted(group_a),
+        "group_b": sorted(group_b),
+        "route_a": list(route_a),
+        "route_b": list(route_b),
+        "duration_s": score["duration_s"],
+        "distance_m": score["distance_m"],
+        "connected": bool(ca["connected"] and cb["connected"]),
+        "components_total": ca["component_count"] + cb["component_count"],
+        "components": [ca["component_count"], cb["component_count"]],
+        "cardinality_ok": sorted(visited) == expected,
+        "sizes": [len(group_a), len(group_b)],
+        "boundary": boundary,
+        "partition_key": canonical_partition_key(group_a, group_b),
+        "source": source,
+        "sequencer": sequencer,
+        "selection_reason": "hybrid_" + source,
+        "seed": source,
+        "declared_duration_s": declared,
+    }
+
+
+def _hybrid_matrix_seed(matrix_hash):
+    """Graine deterministe derivee de l'empreinte de matrice.
+
+    Deux runs sur la meme matrice explorent donc exactement la meme suite de
+    mouvements : un resultat different ne peut plus venir du hasard.
+    """
+    return int(hashlib.md5(str(matrix_hash).encode("utf-8")).hexdigest()[:8], 16)
+
+
+def hybrid_direct_joint_solve(points, indices, dur_matrix, dist_matrix, adjacency,
+                              start_idx, end_idx, capacity, ledger, clock,
+                              service_s, diag):
+    """BLOC A -- une seule resolution VROOM conjointe, affectation et ordre.
+
+    Une requete, deux vehicules, donc UNE resolution au compteur. La
+    cardinalite n'est pas esperee du solveur : elle est imposee par la
+    capacite (60 taches, 2 x 30 => 30/30 est la seule affectation
+    admissible ; 58 taches, 2 x 29 => 29/29).
+
+    Retourne une solution ou None. Un echec n'est jamais masque : il est
+    consigne dans le ledger et la strategie continue avec ce qu'elle a.
+    """
+    vehicle_ids = (1, 2)
+    payload = local_vroom.build_joint_payload(
+        job_ids=indices,
+        durations=dur_matrix,
+        start_index=start_idx,
+        end_index=end_idx,
+        max_tasks_per_vehicle=capacity,
+        service_times={i: service_s for i in indices} if service_s else None,
+        job_location_index={i: i for i in indices},
+        vehicle_ids=vehicle_ids,
+    )
+    # L'horloge du bloc et le ledger partagent la meme base monotone : le
+    # couperet global est donc le meme des deux cotes, sans conversion.
+    solution = local_vroom.solve_vroom_local(
+        payload,
+        timeout_s=local_vroom.get_config().per_solve_timeout_s,
+        ledger=ledger,
+        cancellation_deadline=clock.deadline,
+    )
+    sequences = local_vroom.validate_joint_solution(
+        solution, indices, vehicle_ids,
+        max_tasks_per_vehicle=capacity,
+        start_index=start_idx, end_index=end_idx)
+
+    route_a, route_b = _hybrid_routes(sequences, vehicle_ids, start_idx, end_idx)
+    declared = (solution.get("summary") or {}).get("duration")
+    diag["joint_direct_declared_duration_s"] = declared
+    return _hybrid_solution(sequences[1], sequences[2], route_a, route_b,
+                            dur_matrix, dist_matrix, adjacency, points,
+                            "joint_direct", "vroom_local", service_s,
+                            declared=declared)
+
+
+def _hybrid_border_and_cores(group_a, group_b, adjacency, depth=1):
+    """Frontiere et noyaux dans le graphe G5.
+
+    `depth` compte les COUCHES LAISSEES LIBRES autour de la coupure :
+      - depth=1 : seuls les points ayant un voisin dans l'autre territoire
+        sont libres. Le noyau est large, la contrainte est forte ;
+      - depth=2 : leurs voisins sont libres aussi. Le noyau est plus petit,
+        le solveur a plus de latitude pour redessiner la frontiere.
+
+    Ce qui est fixe ne l'est pas parce qu'on le croit optimal, mais parce
+    qu'un point entoure de points du meme territoire n'a aucune raison
+    plausible de changer de camp : le figer concentre la recherche la ou elle
+    peut encore changer quelque chose.
+    """
+    sa, sb = set(group_a), set(group_b)
+    free = {i for i in sa if any(j in sb for j in adjacency.get(i, ()))}
+    free |= {i for i in sb if any(j in sa for j in adjacency.get(i, ()))}
+    for _ in range(max(0, int(depth) - 1)):
+        grown = set(free)
+        for i in free:
+            grown |= set(adjacency.get(i, ()))
+        free = grown
+    return sorted(free), sorted(sa - free), sorted(sb - free)
+
+
+def hybrid_nucleus_solve(points, indices, dur_matrix, dist_matrix, adjacency,
+                         start_idx, end_idx, capacity, seed_solution, depth,
+                         ledger, clock, service_s):
+    """BLOC B -- une resolution VROOM conjointe a noyaux fixes par skills.
+
+    Les points du noyau T1 portent la skill 1, ceux du noyau T2 la skill 2,
+    et les vehicules portent la skill correspondante : VROOM ne peut donc pas
+    les deplacer. Les points de frontiere ne portent aucune skill et restent
+    entierement libres.
+
+    Une variante = une requete a deux vehicules = UNE resolution au compteur.
+    """
+    free, core_a, core_b = _hybrid_border_and_cores(
+        seed_solution["group_a"], seed_solution["group_b"], adjacency, depth)
+
+    if not free:
+        # Aucun point de frontiere : tout est fige, la variante ne peut que
+        # reproduire sa graine. Depenser une resolution pour recalculer une
+        # solution deja connue serait du budget perdu.
+        raise local_vroom.LocalVroomError(
+            local_vroom.ERR_INVALID_SOLUTION,
+            "aucun point de frontiere a la profondeur %d" % depth)
+    if not core_a or not core_b:
+        # Tout est frontiere : la variante ne contraint rien et referait la
+        # resolution directe. On ne depense pas une resolution pour cela.
+        raise local_vroom.LocalVroomError(
+            local_vroom.ERR_INVALID_SOLUTION,
+            "noyau vide a la profondeur %d" % depth)
+    if len(core_a) > capacity or len(core_b) > capacity:
+        raise local_vroom.LocalVroomError(
+            local_vroom.ERR_INVALID_SOLUTION,
+            "noyau plus grand que la capacite")
+
+    job_skills = {}
+    for i in core_a:
+        job_skills[i] = [1]
+    for i in core_b:
+        job_skills[i] = [2]
+
+    vehicle_ids = (1, 2)
+    payload = local_vroom.build_joint_payload(
+        job_ids=indices,
+        durations=dur_matrix,
+        start_index=start_idx,
+        end_index=end_idx,
+        max_tasks_per_vehicle=capacity,
+        service_times={i: service_s for i in indices} if service_s else None,
+        job_location_index={i: i for i in indices},
+        vehicle_ids=vehicle_ids,
+        job_skills=job_skills,
+        vehicle_skills={1: [1], 2: [2]},
+    )
+    solution = local_vroom.solve_vroom_local(
+        payload,
+        timeout_s=local_vroom.get_config().per_solve_timeout_s,
+        ledger=ledger,
+        cancellation_deadline=clock.deadline,
+    )
+    sequences = local_vroom.validate_joint_solution(
+        solution, indices, vehicle_ids,
+        max_tasks_per_vehicle=capacity,
+        start_index=start_idx, end_index=end_idx)
+
+    # Le contrat des skills est verifie NOUS-MEMES : une solution qui aurait
+    # deplace un point du noyau serait valide au sens de la cardinalite mais
+    # violerait la variante demandee.
+    if not set(core_a).issubset(set(sequences[1])) or \
+            not set(core_b).issubset(set(sequences[2])):
+        raise local_vroom.LocalVroomError(
+            local_vroom.ERR_INVALID_SOLUTION,
+            "un point de noyau a change de territoire")
+
+    route_a, route_b = _hybrid_routes(sequences, vehicle_ids, start_idx, end_idx)
+    return _hybrid_solution(
+        sequences[1], sequences[2], route_a, route_b, dur_matrix, dist_matrix,
+        adjacency, points, "joint_nucleus_d%d" % depth, "vroom_local",
+        service_s, declared=(solution.get("summary") or {}).get("duration")), free
+
+
+def _hybrid_nn_cycle(indices, cost, first):
+    """Cycle global par plus proche voisin, sans depot.
+
+    `cost(a, b)` est fourni par l'appelant : la meme construction sert donc
+    aussi bien sur les durees ORS que sur l'haversine, sans dupliquer le code.
+    """
+    remaining = set(indices)
+    remaining.discard(first)
+    cycle = [first]
+    cursor = first
+    while remaining:
+        nxt = min(remaining, key=lambda j: (cost(cursor, j), j))
+        cycle.append(nxt)
+        remaining.discard(nxt)
+        cursor = nxt
+    return cycle
+
+
+def _hybrid_sweep_cycle(points, indices):
+    """Cycle par balayage angulaire autour du barycentre.
+
+    Un balayage produit une tournee geographiquement coherente la ou le plus
+    proche voisin peut zigzaguer : les deux familles de cycles donnent des
+    decoupes differentes, ce qui est exactement le but.
+    """
+    lat = sum(float(points[i]["lat"]) for i in indices) / len(indices)
+    lon = sum(float(points[i]["lon"]) for i in indices) / len(indices)
+    return sorted(indices, key=lambda i: (
+        math.atan2(float(points[i]["lat"]) - lat, float(points[i]["lon"]) - lon), i))
+
+
+def _hybrid_build_cycles(points, indices, dur_matrix):
+    """Plusieurs grandes tournees sur l'ensemble des points, sans reseau."""
+    cycles = []
+    n = len(indices)
+    if n < 4:
+        return [list(indices)]
+
+    def ors_cost(a, b):
+        return dur_matrix[a][b]
+
+    def hav_cost(a, b):
+        return haversine((float(points[a]["lat"]), float(points[a]["lon"])),
+                         (float(points[b]["lat"]), float(points[b]["lon"])))
+
+    # Quatre departs repartis dans la liste plutot qu'un seul : le plus proche
+    # voisin depend fortement de son point de depart, et un seul cycle ne
+    # donnerait qu'une seule famille de decoupes.
+    starts = sorted({indices[0], indices[n // 4], indices[n // 2],
+                     indices[(3 * n) // 4]})
+    for first in starts:
+        cycles.append(_hybrid_nn_cycle(indices, ors_cost, first))
+    cycles.append(_hybrid_nn_cycle(indices, hav_cost, indices[0]))
+    cycles.append(_hybrid_sweep_cycle(points, indices))
+    return cycles
+
+
+def _hybrid_refine_order(dur_matrix, route, deadline):
+    """Or-opt puis 2-opt sur la matrice ORS, sous garde de temps.
+
+    Aucun appel reseau : la matrice est celle deja chargee. La garde evite
+    qu'une seule route consomme tout le budget du bloc.
+    """
+    if time.monotonic() >= deadline or len(route) < 5:
+        return route
+    improved = _or_opt_matrix(dur_matrix, list(route))
+    if time.monotonic() >= deadline:
+        return improved
+    return _two_opt_matrix(dur_matrix, improved)
+
+
+def hybrid_route_first(points, indices, dur_matrix, dist_matrix, adjacency,
+                       start_idx, end_idx, target_a, clock, service_s,
+                       max_refined=6):
+    """BLOC B -- candidates route-first, sans aucun appel reseau.
+
+    Construire d'abord de grandes tournees sur les 60 points, puis les
+    DECOUPER en deux blocs contigus, produit des territoires naturellement
+    compacts : deux points voisins dans la tournee restent voisins dans la
+    decoupe. Chaque cycle est teste dans les deux orientations et sur toutes
+    les rotations echantillonnees.
+
+    Une decoupe fournit directement un ORDRE, donc son cout se lit sur la
+    matrice ORS en une passe. Seules les meilleures decoupes uniques paient
+    ensuite l'affinage Or-opt / 2-opt.
+
+    Retourne (solutions, stats).
+    """
+    n = len(indices)
+    stats = {"cycles": 0, "cuts": 0, "connected": 0, "unique": 0}
+    cycles = _hybrid_build_cycles(points, indices, dur_matrix)
+    stats["cycles"] = len(cycles)
+
+    step = max(1, n // 12)                 # une douzaine de rotations par cycle
+    seen = {}
+    for cycle in cycles:
+        if clock.expired():
+            break
+        for oriented in (cycle, list(reversed(cycle))):
+            for offset in range(0, n, step):
+                if clock.expired():
+                    break
+                rotated = oriented[offset:] + oriented[:offset]
+                block_a = rotated[:target_a]
+                block_b = rotated[target_a:]
+                stats["cuts"] += 1
+                if len(block_a) != target_a or len(block_b) != n - target_a:
+                    continue
+                if not is_connected_partition(block_a, adjacency)["connected"]:
+                    continue
+                if not is_connected_partition(block_b, adjacency)["connected"]:
+                    continue
+                stats["connected"] += 1
+                key = canonical_partition_key(block_a, block_b)
+                route_a = [start_idx] + list(block_a) + [end_idx]
+                route_b = [start_idx] + list(block_b) + [end_idx]
+                score = score_routes_on_matrix(dur_matrix, dist_matrix,
+                                               [route_a, route_b], service_s)
+                previous = seen.get(key)
+                if previous is None or score["duration_s"] < previous[0]:
+                    seen[key] = (score["duration_s"], block_a, block_b,
+                                 route_a, route_b)
+
+    stats["unique"] = len(seen)
+
+    # Affinage reserve aux meilleures decoupes : affiner les cent premieres
+    # consommerait le budget sans changer le classement.
+    ranked = sorted(seen.values(), key=lambda item: (item[0], item[1]))
+    solutions = []
+    for _, block_a, block_b, route_a, route_b in ranked[:max_refined]:
+        if clock.expired():
+            break
+        refined_a = _hybrid_refine_order(dur_matrix, route_a, clock.stage_deadline)
+        refined_b = _hybrid_refine_order(dur_matrix, route_b, clock.stage_deadline)
+        solutions.append(_hybrid_solution(
+            block_a, block_b, refined_a, refined_b, dur_matrix, dist_matrix,
+            adjacency, points, "route_first", "matrix_local_search", service_s))
+    return solutions, stats
+
+
+def _hybrid_partition_cost(dur_matrix, group_a, group_b, start_idx, end_idx):
+    """Cout ORS rapide d'une partition, ordres reconstruits au plus proche
+    voisin SUR LA MATRICE ORS.
+
+    Ce n'est pas un proxy haversine : chaque comparaison de l'ALNS se fait
+    bien sur les durees routieres. L'ordre n'est pas affine ici -- Or-opt et
+    2-opt coutent trop cher pour etre payes a chaque iteration -- il l'est
+    seulement sur les partitions retenues a la fin.
+    """
+    cost_a, route_a = _estimate_group_cost(dur_matrix, group_a, start_idx, end_idx, False)
+    cost_b, route_b = _estimate_group_cost(dur_matrix, group_b, start_idx, end_idx, False)
+    return cost_a + cost_b, route_a, route_b
+
+
+def _hybrid_partition_valid(group_a, group_b, indices, sizes, adjacency):
+    """Contraintes DURES, verifiees a chaque mouvement accepte.
+
+    Cardinalite exacte, union complete, aucun doublon, un seul tenant de
+    chaque cote. Un mouvement qui viole l'une d'elles n'est pas penalise :
+    il est refuse. Une tournee n'est pas "un peu" faisable.
+    """
+    if len(group_a) != sizes[0] or len(group_b) != sizes[1]:
+        return False
+    merged = list(group_a) + list(group_b)
+    if len(set(merged)) != len(merged):
+        return False
+    if sorted(merged) != indices:
+        return False
+    if not is_connected_partition(group_a, adjacency)["connected"]:
+        return False
+    return is_connected_partition(group_b, adjacency)["connected"]
+
+
+def _hybrid_border(group_a, group_b, adjacency):
+    """Points ayant au moins un voisin G5 dans l'autre territoire.
+
+    C'est la seule chose que l'haversine decide ici : OU regarder. Le gain
+    d'un mouvement, lui, est toujours mesure sur la matrice ORS.
+    """
+    sa, sb = set(group_a), set(group_b)
+    border_a = [i for i in group_a if any(j in sb for j in adjacency.get(i, ()))]
+    border_b = [i for i in group_b if any(j in sa for j in adjacency.get(i, ()))]
+    return border_a, border_b
+
+
+def _hybrid_alns_neighbour(rng, group_a, group_b, adjacency, dur_matrix,
+                           start_idx, end_idx):
+    """Un mouvement, choisi parmi les operateurs territoriaux.
+
+    Tous conservent la cardinalite par construction : ils ECHANGENT, ils ne
+    transferent pas. Le seul qui pourrait la rompre, destroy/repair, retire
+    autant de points de chaque cote qu'il en redistribue.
+    """
+    border_a, border_b = _hybrid_border(group_a, group_b, adjacency)
+    if not border_a or not border_b:
+        return None, "no_border"
+
+    operator = rng.choice(("swap_1_1", "swap_2_2", "chain", "destroy_repair"))
+    sa, sb = list(group_a), list(group_b)
+
+    if operator == "swap_1_1":
+        i = rng.choice(border_a)
+        j = rng.choice(border_b)
+        sa[sa.index(i)] = j
+        sb[sb.index(j)] = i
+        return (sorted(sa), sorted(sb)), operator
+
+    if operator == "swap_2_2":
+        if len(border_a) < 2 or len(border_b) < 2:
+            return None, operator
+        take_a = rng.sample(border_a, 2)
+        take_b = rng.sample(border_b, 2)
+        sa = [x for x in sa if x not in take_a] + take_b
+        sb = [x for x in sb if x not in take_b] + take_a
+        return (sorted(sa), sorted(sb)), operator
+
+    if operator == "chain":
+        # Petite chaine : un point de frontiere et ses voisins DU MEME
+        # territoire. Deplacer une chaine coherente plutot que des points
+        # isoles evite de decouper le territoire en confettis.
+        length = rng.randint(2, 3)
+        chain_a = _hybrid_chain(rng, border_a, set(group_a), adjacency, length)
+        chain_b = _hybrid_chain(rng, border_b, set(group_b), adjacency, length)
+        if len(chain_a) != len(chain_b) or not chain_a:
+            return None, operator
+        sa = [x for x in sa if x not in chain_a] + chain_b
+        sb = [x for x in sb if x not in chain_b] + chain_a
+        return (sorted(sa), sorted(sb)), operator
+
+    # destroy / repair : on retire k points de chaque cote, puis on
+    # REINSERE en routier -- chaque point rejoint le territoire ou son
+    # insertion coute le moins cher sur la matrice ORS.
+    k = rng.randint(3, 5)
+    k = min(k, len(border_a), len(border_b))
+    if k < 1:
+        return None, "destroy_repair"
+    removed = rng.sample(border_a, k) + rng.sample(border_b, k)
+    keep_a = [x for x in group_a if x not in removed]
+    keep_b = [x for x in group_b if x not in removed]
+    target_a = len(group_a)
+    for node in sorted(removed, key=lambda x: -_hybrid_insertion_gap(
+            dur_matrix, x, keep_a, keep_b, start_idx)):
+        gap_a = _hybrid_insertion_cost(dur_matrix, node, keep_a, start_idx)
+        gap_b = _hybrid_insertion_cost(dur_matrix, node, keep_b, start_idx)
+        if len(keep_a) >= target_a:
+            keep_b.append(node)
+        elif len(keep_b) >= len(group_b):
+            keep_a.append(node)
+        elif gap_a <= gap_b:
+            keep_a.append(node)
+        else:
+            keep_b.append(node)
+    return (sorted(keep_a), sorted(keep_b)), "destroy_repair"
+
+
+def _hybrid_chain(rng, border, group, adjacency, length):
+    """Chaine de `length` points connexes, partant d'un point de frontiere."""
+    if not border:
+        return []
+    chain = [rng.choice(border)]
+    while len(chain) < length:
+        candidates = [j for i in chain for j in adjacency.get(i, ())
+                      if j in group and j not in chain]
+        if not candidates:
+            break
+        chain.append(min(candidates))
+    return sorted(chain)
+
+
+def _hybrid_insertion_cost(dur_matrix, node, group, start_idx):
+    """Cout d'attache d'un point a un territoire, sur la matrice ORS."""
+    if not group:
+        return dur_matrix[start_idx][node]
+    return min(dur_matrix[other][node] for other in group)
+
+
+def _hybrid_insertion_gap(dur_matrix, node, group_a, group_b, start_idx):
+    """Ecart entre les deux attaches possibles : les points les plus
+    tranches sont replaces en premier, ceux qui hesitent en dernier."""
+    return abs(_hybrid_insertion_cost(dur_matrix, node, group_a, start_idx)
+               - _hybrid_insertion_cost(dur_matrix, node, group_b, start_idx))
+
+
+def hybrid_territorial_alns(points, indices, dur_matrix, dist_matrix, adjacency,
+                            start_idx, end_idx, seeds, matrix_hash, clock,
+                            service_s, max_finalists=12):
+    """BLOC C -- recherche a voisinage large sur les TERRITOIRES.
+
+    Aucun appel reseau, aucune resolution VROOM pendant la recherche : elle
+    ne consulte que la matrice deja chargee. L'haversine, via le graphe G5,
+    dit seulement ou se trouve la frontiere ; l'acceptation et le classement
+    ne regardent que les durees ORS.
+
+    La graine aleatoire derive de l'empreinte de matrice : deux runs sur la
+    meme matrice explorent exactement la meme suite de mouvements, donc un
+    resultat different ne peut pas venir du hasard.
+
+    Retourne (partitions_finalistes, stats). Les partitions sont uniques et
+    classees ; ce bloc ne resout rien, il propose.
+    """
+    stats = {"iterations": 0, "accepted": 0, "rejected": 0,
+             "seed": _hybrid_matrix_seed(matrix_hash), "operators": {}}
+    if not seeds:
+        return [], stats
+
+    rng = random.Random(stats["seed"])
+    sizes = (len(seeds[0]["group_a"]), len(seeds[0]["group_b"]))
+    sorted_indices = sorted(indices)
+
+    pool = {}
+
+    def remember(group_a, group_b, cost):
+        key = canonical_partition_key(group_a, group_b)
+        previous = pool.get(key)
+        if previous is None or cost < previous[0]:
+            pool[key] = (cost, list(group_a), list(group_b))
+        return key
+
+    incumbents = []
+    for seed in seeds:
+        cost, _, _ = _hybrid_partition_cost(dur_matrix, seed["group_a"],
+                                            seed["group_b"], start_idx, end_idx)
+        remember(seed["group_a"], seed["group_b"], cost)
+        incumbents.append((cost, list(seed["group_a"]), list(seed["group_b"])))
+
+    # Tour de role entre les graines : concentrer tout le budget sur une
+    # seule laisserait les autres bassins inexplores.
+    cursor = 0
+    while not clock.expired() and incumbents:
+        stats["iterations"] += 1
+        cost, group_a, group_b = incumbents[cursor % len(incumbents)]
+        cursor += 1
+
+        move, operator = _hybrid_alns_neighbour(
+            rng, group_a, group_b, adjacency, dur_matrix, start_idx, end_idx)
+        stats["operators"][operator] = stats["operators"].get(operator, 0) + 1
+        if move is None:
+            stats["rejected"] += 1
+            continue
+
+        new_a, new_b = move
+        if not _hybrid_partition_valid(new_a, new_b, sorted_indices, sizes,
+                                       adjacency):
+            stats["rejected"] += 1
+            continue
+
+        new_cost, _, _ = _hybrid_partition_cost(dur_matrix, new_a, new_b,
+                                                start_idx, end_idx)
+        remember(new_a, new_b, new_cost)
+        if new_cost < cost - 1e-9:
+            stats["accepted"] += 1
+            incumbents[(cursor - 1) % len(incumbents)] = (new_cost, new_a, new_b)
+        else:
+            stats["rejected"] += 1
+
+    ranked = sorted(pool.items(), key=lambda item: (item[1][0], item[0]))
+    finalists = [{"partition_key": key, "proxy_cost": cost,
+                  "group_a": group_a, "group_b": group_b}
+                 for key, (cost, group_a, group_b) in ranked[:max_finalists]]
+    stats["unique"] = len(pool)
+    return finalists, stats
+
+
+def hybrid_fixed_partition_solve(points, indices, dur_matrix, dist_matrix,
+                                 adjacency, start_idx, end_idx, capacity,
+                                 group_a, group_b, ledger, clock, service_s):
+    """BLOC C -- une partition FIGEE, resolue en une seule requete VROOM.
+
+    Les deux territoires partent dans le MEME appel, avec des skills qui
+    fixent l'appartenance : VROOM n'a plus qu'a ordonner. Deux appels a un
+    vehicule couteraient deux resolutions pour le meme resultat.
+    """
+    job_skills = {}
+    for i in group_a:
+        job_skills[i] = [1]
+    for i in group_b:
+        job_skills[i] = [2]
+
+    vehicle_ids = (1, 2)
+    payload = local_vroom.build_joint_payload(
+        job_ids=indices,
+        durations=dur_matrix,
+        start_index=start_idx,
+        end_index=end_idx,
+        max_tasks_per_vehicle=capacity,
+        service_times={i: service_s for i in indices} if service_s else None,
+        job_location_index={i: i for i in indices},
+        vehicle_ids=vehicle_ids,
+        job_skills=job_skills,
+        vehicle_skills={1: [1], 2: [2]},
+    )
+    solution = local_vroom.solve_vroom_local(
+        payload,
+        timeout_s=local_vroom.get_config().per_solve_timeout_s,
+        ledger=ledger,
+        cancellation_deadline=clock.deadline,
+    )
+    sequences = local_vroom.validate_joint_solution(
+        solution, indices, vehicle_ids,
+        max_tasks_per_vehicle=capacity,
+        start_index=start_idx, end_index=end_idx)
+
+    if sorted(sequences[1]) != sorted(group_a) or \
+            sorted(sequences[2]) != sorted(group_b):
+        raise local_vroom.LocalVroomError(
+            local_vroom.ERR_INVALID_SOLUTION,
+            "la partition figee n'a pas ete respectee")
+
+    route_a, route_b = _hybrid_routes(sequences, vehicle_ids, start_idx, end_idx)
+    return _hybrid_solution(
+        sequences[1], sequences[2], route_a, route_b, dur_matrix, dist_matrix,
+        adjacency, points, "joint_finalist", "vroom_local", service_s,
+        declared=(solution.get("summary") or {}).get("duration"))
+
+
+# --- ADMISSIBILITE TERRITORIALE -----------------------------------------
+# La connexite 1/1 dit qu'un territoire est d'un seul tenant. Elle ne dit
+# rien de sa FORME : une tournee peut etre connexe et laisser des dizaines
+# de points cernes par l'autre. Sur le terrain, une telle decoupe n'est pas
+# livrable, meme si elle est plus rapide sur le papier.
+#
+# Les enclaves deviennent donc un critere d'ADMISSION et non de departage :
+# une solution de niveau territorial inferieur bat toujours une solution de
+# niveau superieur, quel que soit l'ecart de duree. La regle duree / +30 s /
+# distance ne s'applique qu'ENTRE solutions du meme niveau, ou elle reste
+# exactement celle deja validee.
+
+HYBRID_TERRITORIAL_RATIOS = (0.0, 0.05, 0.10)
+
+
+def territorial_thresholds(n_points, max_ratio=0.15):
+    """Plafonds d'enclaves par niveau, en nombre de points.
+
+    Le dernier niveau vaut le plafond configurable ; les niveaux
+    intermediaires y sont bornes, sinon abaisser le plafond a 2 % laisserait
+    un niveau 2 a 10 % plus permissif que la limite annoncee.
+    """
+    n = max(0, int(n_points))
+    cap = int(math.ceil(float(max_ratio) * n))
+    thresholds = [min(int(math.ceil(ratio * n)), cap)
+                  for ratio in HYBRID_TERRITORIAL_RATIOS]
+    thresholds.append(cap)
+    return thresholds
+
+
+def territorial_level(enclaves, n_points, max_ratio=0.15):
+    """Niveau territorial d'une solution, ou None si elle depasse le plafond.
+
+    Niveau 0 : aucune enclave. Niveau 1 : jusqu'a 5 % des points. Niveau 2 :
+    jusqu'a 10 %. Niveau 3 : jusqu'au plafond configure. Au-dela, la solution
+    est territorialement invalide -- pas mauvaise, INVALIDE.
+    """
+    thresholds = territorial_thresholds(n_points, max_ratio)
+    count = int(enclaves or 0)
+    for level, limit in enumerate(thresholds):
+        if count <= limit:
+            return level
+    return None
+
+
+def select_territorial_solution(solutions, n_points, tie_seconds,
+                                max_ratio=0.15):
+    """Selection FINALE de la strategie hybride.
+
+    Trois filtres successifs, du plus dur au plus fin :
+      1. validite structurelle -- connexite et cardinalite, non negociables ;
+      2. admissibilite territoriale -- le plus petit niveau contenant au
+         moins une solution ;
+      3. la regle deja validee, appliquee A L'INTERIEUR de ce niveau :
+         duree minimale, fenetre exacte de +30 s, distance minimale,
+         frontiere, puis departage deterministe.
+
+    Aucun equilibrage entre T1 et T2 n'intervient a aucune de ces etapes.
+
+    Quand rien n'est admissible, la meilleure solution connue est tout de
+    meme retournee pour ne pas perdre le calcul, mais elle est marquee comme
+    non admissible : elle ne doit jamais etre presentee comme une decoupe
+    territorialement acceptable.
+
+    Retourne (solution, info).
+    """
+    thresholds = territorial_thresholds(n_points, max_ratio)
+    info = {
+        "level": None,
+        "max_enclaves": thresholds[-1],
+        "thresholds": thresholds,
+        "admissible": False,
+        "fallback_used": False,
+        "fallback_reason": "",
+        "level_counts": {},
+    }
+    if not solutions:
+        info["fallback_reason"] = "no_solution"
+        return None, info
+
+    structural = [s for s in solutions
+                  if s.get("connected") and s.get("cardinality_ok")]
+    if not structural:
+        # Aucune solution structurellement valide : on garde la moins mauvaise
+        # plutot que de rendre une erreur apres avoir tout calcule, mais on ne
+        # pretend pas qu'elle est acceptable.
+        info["fallback_used"] = True
+        info["fallback_reason"] = "no_structurally_valid_solution"
+        return select_best_solution(solutions, tie_seconds), info
+
+    by_level = {}
+    for solution in structural:
+        enclaves = (solution.get("boundary") or {}).get("enclave_points", 0)
+        level = territorial_level(enclaves, n_points, max_ratio)
+        if level is None:
+            continue
+        by_level.setdefault(level, []).append(solution)
+    info["level_counts"] = {str(k): len(v) for k, v in sorted(by_level.items())}
+
+    if not by_level:
+        info["fallback_used"] = True
+        info["fallback_reason"] = "enclave_cap_exceeded"
+        return select_best_solution(structural, tie_seconds), info
+
+    best_level = min(by_level)
+    info["level"] = best_level
+    info["admissible"] = True
+    # A l'interieur du niveau, la regle ne change pas d'un iota : c'est
+    # exactement select_best_solution, celle deja validee et partagee.
+    return select_best_solution(by_level[best_level], tie_seconds), info
+
+
+def _hybrid_diagnostics_template():
+    """Tous les champs de diagnostic existent des le depart.
+
+    Un champ absent et un champ nul ne se distinguent pas dans une feuille de
+    calcul : declarer la structure complete garantit qu'une colonne vide
+    signifie "etape non atteinte" et jamais "champ oublie".
+    """
+    return {
+        "hybrid_error": "",
+        "hybrid_matrix_calls": 0,
+        # --- juge commun ---
+        "common_rescore_duration_s": None,
+        "common_rescore_distance_m": None,
+        "common_rescore_matrix_hash": None,
+        "common_rescore_service_s": HYBRID_SERVICE_S,
+        # --- bloc A ---
+        "joint_direct_valid": False,
+        "joint_direct_duration_s": None,
+        "joint_direct_distance_m": None,
+        "joint_direct_declared_duration_s": None,
+        "joint_direct_sizes": None,
+        "joint_direct_components": None,
+        "joint_direct_enclaves": None,
+        "joint_direct_error": "",
+        # --- bloc B ---
+        "graph_g5_k": None,
+        "graph_g5_edges": None,
+        "joint_nucleus_attempted": 0,
+        "joint_nucleus_valid": 0,
+        "joint_nucleus_best_duration_s": None,
+        "joint_nucleus_error": "",
+        "route_first_cycles": 0,
+        "route_first_unique": 0,
+        "route_first_best_duration_s": None,
+        # --- bloc C ---
+        "joint_alns_iterations": 0,
+        "joint_alns_accepted": 0,
+        "joint_alns_best_duration_s": None,
+        "joint_alns_best_distance_m": None,
+        "joint_alns_best_enclaves": None,
+        "joint_alns_seed": None,
+        "joint_finalists": 0,
+        "joint_finalists_local_vroom_solved": 0,
+        "joint_finalists_reused": 0,
+        # --- selection ---
+        "joint_selected_source": None,
+        "joint_selected_duration_s": None,
+        "joint_selected_distance_m": None,
+        "joint_selected_sizes": None,
+        "joint_selected_components": None,
+        "joint_selected_enclaves": None,
+        "joint_selection_window_s": CONNECTED_TIE_SECONDS,
+        "joint_solutions_considered": 0,
+        # --- admissibilite territoriale ---
+        "joint_territorial_level": None,
+        "joint_territorial_max_enclaves": None,
+        "joint_territorial_admissible": False,
+        "joint_territorial_fallback_used": False,
+        "joint_territorial_fallback_reason": "",
+        "joint_territorial_thresholds": None,
+        "joint_territorial_level_counts": {},
+        # --- discipline temporelle ---
+        "hybrid_stages": [],
+        "total_elapsed_ms": 0,
+        "soft_limit_reached": False,
+    }
+
+
+def hybrid_local_vroom_territorial(points, num_vehicles, max_per_vehicle,
+                                   start_idx, end_idx, headers,
+                                   solution_limit=None):
+    """Strategie experimentale : VROOM local conjoint + ALNS territoriale.
+
+    Meme contrat de retour que les autres partitions : (groups, err, meta).
+    Les ordres retenus remontent dans meta["hybrid_routes"], comme la
+    strategie connexe : l'appelant ne resequence rien.
+    """
+    diag = _hybrid_diagnostics_template()
+    meta = {"hybrid": diag}
+
+    if local_vroom is None:
+        diag["hybrid_error"] = "local_vroom module unavailable"
+        return None, diag["hybrid_error"], meta
+
+    config = local_vroom.get_config(refresh=True)
+    if not config.enabled:
+        diag["hybrid_error"] = local_vroom.ERR_DISABLED
+        return None, diag["hybrid_error"], meta
+
+    if num_vehicles != 2:
+        diag["hybrid_error"] = ("hybrid local vroom requires 2 vehicles, got %d"
+                                % num_vehicles)
+        return None, diag["hybrid_error"], meta
+
+    depots = {start_idx, end_idx}
+    indices = [i for i in range(len(points)) if i not in depots]
+    if not indices:
+        diag["hybrid_error"] = "no delivery points"
+        return [[] for _ in range(num_vehicles)], None, meta
+
+    bad = [points[i].get("id", i) for i in indices if not _finite_coords(points[i])]
+    if bad:
+        diag["hybrid_error"] = ("%d point(s) with invalid coordinates: %s"
+                                % (len(bad), bad[:5]))
+        return None, diag["hybrid_error"], meta
+
+    n = len(indices)
+    capacity = _exact_capacity(n, 2)
+    if capacity > max_per_vehicle:
+        diag["hybrid_error"] = ("cannot split %d points under capacity %d"
+                                % (n, max_per_vehicle))
+        return None, diag["hybrid_error"], meta
+
+    # Une seule optimisation experimentale a la fois par conteneur. Le refus
+    # est immediat : mettre deux resolutions lourdes en concurrence sur 512 Mo
+    # les ferait echouer toutes les deux plutot que d'en servir une.
+    lock = local_vroom.LocalVroomRunLock()
+    if not lock.acquire():
+        diag["hybrid_error"] = local_vroom.ERR_BUSY
+        return None, diag["hybrid_error"], meta
+
+    try:
+        return _hybrid_run(points, indices, start_idx, end_idx, capacity,
+                           headers, config, diag, meta)
+    finally:
+        lock.release()
+
+
+def _hybrid_run(points, indices, start_idx, end_idx, capacity, headers,
+                config, diag, meta):
+    """Corps de la strategie, verrou deja tenu."""
+    clock = _HybridClock(config.total_soft_limit_s)
+    ledger = local_vroom.LocalVroomLedger(
+        max_solves=config.max_solves,
+        soft_limit_s=config.total_soft_limit_s,
+        started_at=clock.t0,
+        config=config)
+    service_s = HYBRID_SERVICE_S
+    n = len(indices)
+
+    print("Hybride VROOM local: %d points -> %d/%d, capacite %d, budget %.0fs"
+          % (n, n // 2, n - n // 2, capacity, config.total_soft_limit_s),
+          flush=True)
+
+    # --- MATRICE ORS : le seul acces reseau de toute la strategie -----------
+    clock.begin("matrix", clock.remaining_s())
+    dur_matrix, dist_matrix, mmeta, err = _build_full_matrix_chunked(points, headers)
+    clock.end("done" if dur_matrix is not None else "matrix_failed")
+    meta.update(mmeta)
+    meta["hybrid"] = diag
+    diag["hybrid_matrix_calls"] = mmeta.get("calls", 0)
+    if dur_matrix is None:
+        diag["hybrid_error"] = "ORS matrix failed: %s" % err
+        return None, diag["hybrid_error"], meta
+
+    matrix_hash = _matrix_content_hash(dur_matrix, dist_matrix)
+    diag["common_rescore_matrix_hash"] = matrix_hash
+
+    # --- GRAPHE G5 : geographie seule, aucune arete routiere ----------------
+    adjacency, gmeta = build_knn_graph_g5(points, indices, k=5)
+    diag["graph_g5_k"] = gmeta["k"]
+    diag["graph_g5_edges"] = gmeta["edges"]
+
+    solutions = []
+
+    # =====================================================================
+    # BLOC A -- RESOLUTION VROOM CONJOINTE DIRECTE
+    # =====================================================================
+    clock.begin("joint_direct", min(config.per_solve_timeout_s + 2.0,
+                                    clock.remaining_s()))
+    stop_reason = "done"
+    if not ledger.can_attempt():
+        stop_reason = local_vroom.ERR_GLOBAL_TIME_LIMIT
+        ledger.record_skip_for_time()
+        diag["joint_direct_error"] = stop_reason
+    else:
+        try:
+            direct = hybrid_direct_joint_solve(
+                points, indices, dur_matrix, dist_matrix, adjacency,
+                start_idx, end_idx, capacity, ledger, clock, service_s, diag)
+            solutions.append(direct)
+            diag.update({
+                "joint_direct_valid": bool(direct["connected"]
+                                           and direct["cardinality_ok"]),
+                "joint_direct_duration_s": round(direct["duration_s"], 1),
+                "joint_direct_distance_m": round(direct["distance_m"], 1),
+                "joint_direct_sizes": direct["sizes"],
+                "joint_direct_components": direct["components"],
+                "joint_direct_enclaves": direct["boundary"]["enclave_points"],
+            })
+            print("  Bloc A: VROOM conjoint %s, duree rescoree %.1fmin, "
+                  "%.2fkm, composantes %s, %d enclaves"
+                  % (direct["sizes"], direct["duration_s"] / 60,
+                     direct["distance_m"] / 1000, direct["components"],
+                     direct["boundary"]["enclave_points"]), flush=True)
+        except local_vroom.LocalVroomError as exc:
+            # Un echec VROOM ne fait pas tomber la strategie : les blocs
+            # suivants travaillent sans solution directe, et la selection
+            # finale ne retiendra que ce qui est reellement valide.
+            stop_reason = exc.code
+            diag["joint_direct_error"] = exc.code
+            print("  Bloc A: echec VROOM local (%s)" % exc.code, flush=True)
+    clock.end(stop_reason)
+
+    # =====================================================================
+    # BLOC B -- ROUTE-FIRST PUIS NOYAUX
+    # =====================================================================
+    # Route-first passe EN PREMIER bien qu'il vienne apres dans l'enonce : il
+    # ne depend d'aucun solveur, donc il garantit aux noyaux une graine meme
+    # quand la resolution directe a echoue. Dans le cas nominal l'ordre ne
+    # change rien -- la graine reste la meilleure solution connue.
+    # --- route-first : aucun appel reseau, budget dur ----------------------
+    clock.begin("route_first", min(config.route_first_budget_s,
+                                   clock.remaining_s()))
+    n_idx = len(indices)
+    rf_solutions, rf_stats = hybrid_route_first(
+        points, indices, dur_matrix, dist_matrix, adjacency, start_idx,
+        end_idx, n_idx // 2, clock, service_s)
+    solutions.extend(rf_solutions)
+    diag["route_first_cycles"] = rf_stats["cycles"]
+    diag["route_first_unique"] = rf_stats["unique"]
+    if rf_solutions:
+        diag["route_first_best_duration_s"] = round(
+            min(s["duration_s"] for s in rf_solutions), 1)
+    print("  Bloc B: route-first %d cycles, %d decoupes, %d connexes, "
+          "%d partitions uniques, %d affinees"
+          % (rf_stats["cycles"], rf_stats["cuts"], rf_stats["connected"],
+             rf_stats["unique"], len(rf_solutions)), flush=True)
+    clock.end("budget_exhausted" if clock.expired() else "done")
+
+    # La graine des noyaux est la meilleure solution deja obtenue : direct si
+    # elle existe, sinon la meilleure decoupe route-first. Sans aucune des
+    # deux, la variante n'aurait pas de frontiere a redessiner et on saute
+    # plutot que de depenser une resolution a l'aveugle.
+    clock.begin("joint_nucleus", min(
+        config.nucleus_solves * (config.per_solve_timeout_s + 2.0),
+        clock.remaining_s()))
+    stop_reason = "done"
+    seed = select_best_solution(solutions) if solutions else None
+    if seed is None:
+        stop_reason = "no_seed"
+        diag["joint_nucleus_error"] = "no seed solution"
+    else:
+        best_nucleus = None
+        for depth in range(1, config.nucleus_solves + 1):
+            if clock.expired():
+                stop_reason = local_vroom.ERR_GLOBAL_TIME_LIMIT
+                break
+            if not ledger.can_attempt():
+                stop_reason = (local_vroom.ERR_BUDGET_EXHAUSTED
+                               if ledger.budget_left() <= 0
+                               else local_vroom.ERR_GLOBAL_TIME_LIMIT)
+                if ledger.budget_left() > 0:
+                    ledger.record_skip_for_time()
+                break
+            diag["joint_nucleus_attempted"] += 1
+            try:
+                solution, free = hybrid_nucleus_solve(
+                    points, indices, dur_matrix, dist_matrix, adjacency,
+                    start_idx, end_idx, capacity, seed, depth, ledger, clock,
+                    service_s)
+                solutions.append(solution)
+                diag["joint_nucleus_valid"] += 1
+                if best_nucleus is None or solution["duration_s"] < best_nucleus:
+                    best_nucleus = solution["duration_s"]
+                print("  Bloc B: noyaux d%d, %d points libres, %s, "
+                      "duree rescoree %.1fmin"
+                      % (depth, len(free), solution["sizes"],
+                         solution["duration_s"] / 60), flush=True)
+            except local_vroom.LocalVroomError as exc:
+                diag["joint_nucleus_error"] = exc.code
+                stop_reason = exc.code
+                print("  Bloc B: variante noyaux d%d rejetee (%s)"
+                      % (depth, exc.code), flush=True)
+        if best_nucleus is not None:
+            diag["joint_nucleus_best_duration_s"] = round(best_nucleus, 1)
+    clock.end(stop_reason)
+
+    # =====================================================================
+    # BLOC C -- ALNS TERRITORIALE PUIS FINALISTES VROOM
+    # =====================================================================
+    clock.begin("joint_alns", min(config.alns_budget_s, clock.remaining_s()))
+    finalists, alns_stats = hybrid_territorial_alns(
+        points, indices, dur_matrix, dist_matrix, adjacency, start_idx,
+        end_idx, solutions, diag["common_rescore_matrix_hash"], clock,
+        service_s)
+    diag["joint_alns_iterations"] = alns_stats["iterations"]
+    diag["joint_alns_accepted"] = alns_stats["accepted"]
+    diag["joint_alns_seed"] = alns_stats["seed"]
+    diag["joint_finalists"] = len(finalists)
+    print("  Bloc C: ALNS %d iterations, %d acceptees, %d partitions uniques, "
+          "%d finalistes, graine %d"
+          % (alns_stats["iterations"], alns_stats["accepted"],
+             alns_stats.get("unique", 0), len(finalists), alns_stats["seed"]),
+          flush=True)
+    clock.end("budget_exhausted" if clock.expired() else "done")
+
+    # Les partitions issues de l'ALNS n'ont qu'un ordre au plus proche voisin.
+    # On leur donne un ordre affine sur la matrice, sans reseau : sans cela
+    # elles seraient systematiquement battues par les solutions VROOM pour une
+    # raison d'ordonnancement, pas de territoire.
+    clock.begin("alns_refine", min(2.0, clock.remaining_s()))
+    already_solved = {s["partition_key"] for s in solutions}
+    best_alns = None
+    for finalist in finalists:
+        if clock.expired():
+            break
+        if finalist["partition_key"] in already_solved:
+            continue
+        _, route_a, route_b = _hybrid_partition_cost(
+            dur_matrix, finalist["group_a"], finalist["group_b"],
+            start_idx, end_idx)
+        route_a = _hybrid_refine_order(dur_matrix, route_a, clock.stage_deadline)
+        route_b = _hybrid_refine_order(dur_matrix, route_b, clock.stage_deadline)
+        solution = _hybrid_solution(
+            finalist["group_a"], finalist["group_b"], route_a, route_b,
+            dur_matrix, dist_matrix, adjacency, points, "joint_alns",
+            "matrix_local_search", service_s)
+        if not (solution["connected"] and solution["cardinality_ok"]):
+            continue
+        solutions.append(solution)
+        finalist["duration_s"] = solution["duration_s"]
+        if best_alns is None or solution["duration_s"] < best_alns["duration_s"]:
+            best_alns = solution
+    if best_alns is not None:
+        diag["joint_alns_best_duration_s"] = round(best_alns["duration_s"], 1)
+        diag["joint_alns_best_distance_m"] = round(best_alns["distance_m"], 1)
+        diag["joint_alns_best_enclaves"] = best_alns["boundary"]["enclave_points"]
+    clock.end("budget_exhausted" if clock.expired() else "done")
+
+    # --- finalistes VROOM : les meilleures partitions encore non resolues ---
+    clock.begin("joint_finalists", min(
+        config.finalist_solves * (config.per_solve_timeout_s + 2.0),
+        clock.remaining_s()))
+    stop_reason = "done"
+    solved = 0
+    for finalist in sorted(finalists, key=lambda f: f.get("duration_s",
+                                                          f["proxy_cost"])):
+        if solved >= config.finalist_solves:
+            stop_reason = "finalist_quota"
+            break
+        if clock.expired():
+            stop_reason = local_vroom.ERR_GLOBAL_TIME_LIMIT
+            break
+        # Une partition deja resolue par VROOM ne l'est jamais deux fois :
+        # la resolution est deterministe, le second appel rendrait le meme
+        # ordre pour le meme quart de budget.
+        if finalist["partition_key"] in already_solved:
+            ledger.record_reuse()
+            diag["joint_finalists_reused"] += 1
+            continue
+        if not ledger.can_attempt():
+            stop_reason = (local_vroom.ERR_BUDGET_EXHAUSTED
+                           if ledger.budget_left() <= 0
+                           else local_vroom.ERR_GLOBAL_TIME_LIMIT)
+            if ledger.budget_left() > 0:
+                ledger.record_skip_for_time()
+            break
+        try:
+            solution = hybrid_fixed_partition_solve(
+                points, indices, dur_matrix, dist_matrix, adjacency,
+                start_idx, end_idx, capacity, finalist["group_a"],
+                finalist["group_b"], ledger, clock, service_s)
+            solutions.append(solution)
+            already_solved.add(solution["partition_key"])
+            solved += 1
+        except local_vroom.LocalVroomError as exc:
+            stop_reason = exc.code
+            print("  Bloc C: finaliste rejete (%s)" % exc.code, flush=True)
+            # Seule une solution invalide est propre a CETTE partition : le
+            # finaliste suivant peut encore reussir. Toute autre cause --
+            # binaire absent, budget epuise, temps ecoule -- se reproduira a
+            # l'identique, et douze tentatives ne feraient qu'allonger les
+            # journaux.
+            if exc.code != local_vroom.ERR_INVALID_SOLUTION:
+                break
+    diag["joint_finalists_local_vroom_solved"] = solved
+    print("  Bloc C: %d finaliste(s) resolus par VROOM, %d reutilises, "
+          "arret=%s" % (solved, diag["joint_finalists_reused"], stop_reason),
+          flush=True)
+    clock.end(stop_reason)
+
+    return _hybrid_finish(points, indices, start_idx, end_idx, dur_matrix,
+                          dist_matrix, adjacency, solutions, clock, ledger,
+                          config, diag, meta, service_s)
+
+
+def _hybrid_finish(points, indices, start_idx, end_idx, dur_matrix, dist_matrix,
+                   adjacency, solutions, clock, ledger, config, diag, meta,
+                   service_s):
+    """Selection finale et mise en forme du retour.
+
+    Appelee quel que soit l'etat d'avancement : c'est ici que se traduit la
+    regle "aucune etape ne jette ce qui a deja ete obtenu". Meme si tous les
+    blocs posterieurs ont expire, ce qui existe est compare et retourne.
+    """
+    diag["joint_solutions_considered"] = len(solutions)
+    ledger.stop(local_vroom.ERR_GLOBAL_TIME_LIMIT if clock.soft_limit_reached()
+                else "completed")
+    diag.update(local_vroom.diagnostics(ledger, config))
+    diag.update(clock.as_diagnostics())
+
+    if not solutions:
+        diag["hybrid_error"] = diag["hybrid_error"] or "no valid solution produced"
+        return None, diag["hybrid_error"], meta
+
+    best, territorial = select_territorial_solution(
+        solutions, len(indices), CONNECTED_TIE_SECONDS, config.max_enclave_ratio)
+    diag.update({
+        "joint_territorial_level": territorial["level"],
+        "joint_territorial_max_enclaves": territorial["max_enclaves"],
+        "joint_territorial_admissible": territorial["admissible"],
+        "joint_territorial_fallback_used": territorial["fallback_used"],
+        "joint_territorial_fallback_reason": territorial["fallback_reason"],
+        "joint_territorial_thresholds": territorial["thresholds"],
+        "joint_territorial_level_counts": territorial["level_counts"],
+    })
+    if best is None:
+        diag["hybrid_error"] = "no valid solution produced"
+        return None, diag["hybrid_error"], meta
+
+    diag.update({
+        "common_rescore_duration_s": round(best["duration_s"], 1),
+        "common_rescore_distance_m": round(best["distance_m"], 1),
+        "joint_selected_source": best["source"],
+        "joint_selected_duration_s": round(best["duration_s"], 1),
+        "joint_selected_distance_m": round(best["distance_m"], 1),
+        "joint_selected_sizes": best["sizes"],
+        "joint_selected_components": best["components"],
+        "joint_selected_enclaves": best["boundary"]["enclave_points"],
+    })
+
+    meta["hybrid_routes"] = [list(best["route_a"]), list(best["route_b"])]
+    meta["hybrid_membership_locked"] = True
+    meta["hybrid_sequencer"] = best["sequencer"]
+    # Ces deux cles alimentent le compte rendu commun a toutes les strategies
+    # pre-sequencees. Elles disent si un solveur a bien produit l'ordre retenu,
+    # jamais si "Vroom public" a ete appele -- il ne l'est jamais ici.
+    meta["connected_vroom_ok"] = best["sequencer"] == "vroom_local"
+    meta["connected_vroom_error"] = diag["joint_direct_error"] or None
+
+    if territorial["admissible"]:
+        print("  Admissibilite territoriale: niveau %d (plafonds %s enclaves "
+              "pour %d points), repartition par niveau %s"
+              % (territorial["level"], territorial["thresholds"], len(indices),
+                 territorial["level_counts"]), flush=True)
+    else:
+        print("  ATTENTION: aucune solution territorialement admissible (%s). "
+              "L'incumbent retourne est DEGRADE : %d enclaves pour un plafond "
+              "de %d."
+              % (territorial["fallback_reason"],
+                 best["boundary"]["enclave_points"],
+                 territorial["max_enclaves"]), flush=True)
+
+    print("  Retenue: %s pts, source=%s, composantes %s, %d enclaves, "
+          "duree %.1fmin, %.2fkm, %d solutions comparees, %d solves VROOM "
+          "(%dms)"
+          % (best["sizes"], best["source"], best["components"],
+             best["boundary"]["enclave_points"], best["duration_s"] / 60,
+             best["distance_m"] / 1000, len(solutions), ledger.attempted,
+             diag["total_elapsed_ms"]), flush=True)
+    for stage in diag["hybrid_stages"]:
+        print("    etape %-14s budget %.1fs, consomme %dms, arret=%s, "
+              "restant %.1fs"
+              % (stage["stage"], stage["budget_s"], stage["elapsed_ms"],
+                 stage["stop_reason"], stage["remaining_after_s"]), flush=True)
+
+    return [best["group_a"], best["group_b"]], None, meta
+
+
+# =========================
 # 5. NEAREST-NEIGHBOR FALLBACK
 # =========================
 def _nearest_neighbor_route(points, vehicle_points, start_idx, end_idx):
@@ -4972,6 +6356,18 @@ def optimize():
             # plus ET remplacerait l'ordre retenu par celui de Vroom, quel que
             # soit selected_sequencer.
             presequenced_routes = (matrix_meta or {}).get("connected_routes")
+        elif strategy == "hybrid_local_vroom_territorial":
+            groups, part_err, matrix_meta = hybrid_local_vroom_territorial(
+                points, num_vehicles, max_per_vehicle, start_idx, end_idx,
+                headers, solution_limit=ortools_solution_limit
+            )
+            # Meme contrat que la strategie connexe : l'appartenance est un
+            # engagement, et les ordres sont deja choisis par le juge commun.
+            # Les resequencer ici remplacerait le gagnant par un autre ordre.
+            if (matrix_meta or {}).get("hybrid_membership_locked"):
+                membership_locked = True
+                swap_lock_reason = "connected_partition_locked"
+            presequenced_routes = (matrix_meta or {}).get("hybrid_routes")
         else:
             groups, part_err = None, f"no partition function for '{strategy}'"
 
@@ -5322,11 +6718,323 @@ def optimize():
 
 
 # =========================
+# 7b. GEOMETRIE DE CARTE (endpoint isole)
+# =========================
+# Cette section est ENTIEREMENT separee de l'optimisation. Elle ne partage
+# avec elle ni compteur, ni cache, ni fonction. Elle sert uniquement a tracer
+# sur la carte l'itineraire routier reel, la ou le gabarit affichait jusqu'ici
+# des segments droits en pointilles.
+#
+# Trois regles non negociables :
+#
+# 1. AUCUN appel depuis /optimize. La geometrie est demandee par la carte,
+#    apres coup, une fois l'optimisation terminee et mesuree. Le temps et les
+#    appels du Benchmark n'en voient rien.
+# 2. La cle ORS ne quitte jamais le serveur. C'est la seule raison d'etre de
+#    cet endpoint : Apps Script ne peut pas appeler ORS sans exposer la cle
+#    dans le classeur.
+# 3. Ce n'est PAS un proxy ORS. Aucune URL ne vient du client, le profil est
+#    en liste blanche, le nombre de routes et de coordonnees est borne, et
+#    les distances/durees renvoyees par Directions sont jetees : seule la
+#    trace geometrique est conservee.
+
+ORS_DIRECTIONS_URL = "https://api.heigit.org/openrouteservice/v2/directions/%s/geojson"
+
+# Liste blanche stricte. Un profil hors liste est refuse, jamais substitue.
+MAP_GEOMETRY_PROFILES = ("driving-car",)
+
+MAP_GEOMETRY_ROUTES = 2            # exactement deux tournees, ni une ni trois
+MAP_GEOMETRY_MIN_COORDS = 2        # un trajet a au moins un depart et une arrivee
+MAP_GEOMETRY_MAX_COORDS = 60       # plafond ORS = 50 waypoints ; 32 en usage reel
+MAP_GEOMETRY_MAX_BODY_BYTES = 64 * 1024
+MAP_GEOMETRY_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+MAP_GEOMETRY_TIMEOUT_S = 12        # borne dure : la carte ne doit jamais pendre
+MAP_GEOMETRY_CACHE_MAX = 8
+
+# Compteurs PROPRES a la carte. _API_STATS mesure la consommation de
+# l'optimisation et ne doit pas bouger d'un iota a cause d'un affichage.
+_MAP_STATS = {"requests": 0, "directions": 0, "cache_hits": 0}
+
+_MAP_GEOMETRY_CACHE = {}
+
+
+def _reset_map_stats():
+    _MAP_STATS["requests"] = 0
+    _MAP_STATS["directions"] = 0
+    _MAP_STATS["cache_hits"] = 0
+
+
+def _post_directions(profile, coordinates, headers, timeout):
+    """Unique point de sortie vers ORS Directions (compte les appels carte).
+
+    Le pendant de _post_matrix pour la geometrie, avec son propre compteur :
+    un appel de carte ne doit jamais apparaitre dans les appels d'optimisation.
+    """
+    _MAP_STATS["directions"] += 1
+    # URL sur la meme ligne que l'appel, comme _post_matrix et _post_vroom :
+    # le controle statique de la CI verifie chaque sortie reseau par sa
+    # destination, et il lit une ligne a la fois.
+    return requests.post(ORS_DIRECTIONS_URL % profile,
+                         json={"coordinates": coordinates,
+                               "geometry_simplify": True},
+                         headers=headers, timeout=timeout)
+
+
+def _map_geometry_cache_key(profile, routes):
+    """Empreinte de l'ORDRE EXACT des coordonnees des deux tournees.
+
+    Deux ouvertures de la meme carte donnent la meme cle, donc zero appel. Un
+    seul point deplace, ou deux points permutes, donnent une cle differente :
+    le cache ne peut pas resservir une trace qui ne correspond plus.
+    """
+    digest = hashlib.md5()
+    digest.update(profile.encode("utf-8"))
+    for route in routes:
+        digest.update(b"|")
+        for lon, lat in route:
+            digest.update(("%.6f,%.6f;" % (lon, lat)).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _map_geometry_cache_get(key):
+    hit = _MAP_GEOMETRY_CACHE.get(key)
+    if hit is not None:
+        _MAP_STATS["cache_hits"] += 1
+    return hit
+
+
+def _map_geometry_cache_put(key, geometries):
+    # Borne dure sur le nombre d'entrees : sans elle, un service qui tourne
+    # des semaines accumulerait une trace par carte ouverte.
+    if len(_MAP_GEOMETRY_CACHE) >= MAP_GEOMETRY_CACHE_MAX:
+        _MAP_GEOMETRY_CACHE.pop(next(iter(_MAP_GEOMETRY_CACHE)))
+    _MAP_GEOMETRY_CACHE[key] = geometries
+
+
+def _validate_map_geometry(data):
+    """Validation stricte de la requete. Retourne (profile, routes, erreur).
+
+    Tout est refuse par defaut : ce qui n'est pas explicitement autorise
+    n'entre pas. C'est ce qui empeche l'endpoint de devenir un proxy.
+    """
+    if not isinstance(data, dict):
+        return None, None, "body must be a JSON object"
+
+    # Profil ABSENT -> defaut. Profil FOURNI -> il doit etre dans la liste
+    # blanche, sans exception. Un `or` sur la valeur substituerait
+    # silencieusement le defaut a une chaine vide, c'est-a-dire accepterait
+    # une entree que l'appelant croit refusee.
+    if "profile" not in data or data["profile"] is None:
+        profile = MAP_GEOMETRY_PROFILES[0]
+    else:
+        profile = data["profile"]
+    if not isinstance(profile, str) or profile not in MAP_GEOMETRY_PROFILES:
+        return None, None, ("profile must be one of %s"
+                            % list(MAP_GEOMETRY_PROFILES))
+
+    routes = data.get("routes")
+    if not isinstance(routes, list) or len(routes) != MAP_GEOMETRY_ROUTES:
+        return None, None, ("routes must be a list of exactly %d route(s)"
+                            % MAP_GEOMETRY_ROUTES)
+
+    cleaned = []
+    for position, route in enumerate(routes):
+        if not isinstance(route, list):
+            return None, None, "route %d must be a list of coordinates" % position
+        if len(route) < MAP_GEOMETRY_MIN_COORDS:
+            return None, None, ("route %d needs at least %d coordinates"
+                                % (position, MAP_GEOMETRY_MIN_COORDS))
+        if len(route) > MAP_GEOMETRY_MAX_COORDS:
+            return None, None, ("route %d exceeds %d coordinates"
+                                % (position, MAP_GEOMETRY_MAX_COORDS))
+        pairs = []
+        for coord in route:
+            if not isinstance(coord, (list, tuple)) or len(coord) != 2:
+                return None, None, ("route %d has a coordinate that is not "
+                                    "a [lon, lat] pair" % position)
+            lon, lat = coord
+            if isinstance(lon, bool) or isinstance(lat, bool):
+                return None, None, "route %d has a boolean coordinate" % position
+            if not isinstance(lon, (int, float)) or not isinstance(lat, (int, float)):
+                return None, None, ("route %d has a non numeric coordinate"
+                                    % position)
+            lon, lat = float(lon), float(lat)
+            if not (math.isfinite(lon) and math.isfinite(lat)):
+                return None, None, ("route %d has a non finite coordinate"
+                                    % position)
+            if not (-180.0 <= lon <= 180.0):
+                return None, None, "route %d has longitude out of range" % position
+            if not (-90.0 <= lat <= 90.0):
+                return None, None, "route %d has latitude out of range" % position
+            pairs.append([lon, lat])
+        cleaned.append(pairs)
+
+    return profile, cleaned, None
+
+
+def _extract_geometry(payload):
+    """Trace [lon, lat] d'une reponse Directions GeoJSON, ou None.
+
+    Les champs distance et duration renvoyes par Directions sont
+    DELIBEREMENT ignores : les metriques du Benchmark viennent de la matrice
+    ORS et ne doivent jamais etre remplacees par celles d'un autre appel.
+    """
+    if not isinstance(payload, dict):
+        return None
+    features = payload.get("features")
+    if not isinstance(features, list) or not features:
+        return None
+    geometry = (features[0] or {}).get("geometry") or {}
+    coords = geometry.get("coordinates")
+    if not isinstance(coords, list) or len(coords) < 2:
+        return None
+    out = []
+    for coord in coords:
+        if not isinstance(coord, (list, tuple)) or len(coord) < 2:
+            return None
+        try:
+            lon, lat = float(coord[0]), float(coord[1])
+        except (TypeError, ValueError):
+            return None
+        if not (math.isfinite(lon) and math.isfinite(lat)):
+            return None
+        out.append([lon, lat])
+    return out
+
+
+def _fetch_route_geometry(profile, coordinates, headers):
+    """Une tournee, un appel Directions. Retourne (geometrie, code_erreur)."""
+    try:
+        response = _post_directions(profile, coordinates, headers,
+                                    MAP_GEOMETRY_TIMEOUT_S)
+    except Exception as exc:                        # noqa: BLE001
+        # Le type d'exception est lu par son NOM plutot que par
+        # `except requests.Timeout`. La classe n'existe pas quand requests est
+        # remplace par un double dans les tests, et une clause introuvable
+        # leverait une AttributeError a la place du repli attendu. Aucun echec
+        # reseau ne doit pouvoir casser l'affichage de la carte.
+        name = type(exc).__name__
+        if "Timeout" in name:
+            return None, "timeout"
+        print("  Carte: Directions injoignable (%s: %s)" % (name, exc), flush=True)
+        return None, "network_error"
+
+    content = response.content or b""
+    if len(content) > MAP_GEOMETRY_MAX_RESPONSE_BYTES:
+        return None, "response_too_large"
+    if response.status_code != 200:
+        print("  Carte: Directions HTTP %d" % response.status_code, flush=True)
+        return None, "http_%d" % response.status_code
+
+    try:
+        payload = response.json()
+    except ValueError:
+        return None, "invalid_response"
+
+    geometry = _extract_geometry(payload)
+    if geometry is None:
+        return None, "invalid_response"
+    return geometry, None
+
+
+@app.route("/map-geometry", methods=["POST"])
+def map_geometry():
+    """Trace routier des deux tournees, pour l'affichage seul.
+
+    Repond TOUJOURS de facon structuree. Un echec ORS n'est pas une erreur
+    de service : la carte doit pouvoir retomber sur ses segments indicatifs
+    sans que rien ne casse. Seule une requete malformee vaut un 400, parce
+    qu'elle signale un defaut d'appelant et non une indisponibilite.
+    """
+    started = time.monotonic()
+    _MAP_STATS["requests"] += 1
+
+    def answer(geometries, status, cache_hit, calls, fallback, code=200,
+               error=None):
+        body = {
+            "geometries": geometries,
+            "status": status,
+            "cache_hit": bool(cache_hit),
+            "calls": int(calls),
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
+            "fallback_used": bool(fallback),
+        }
+        if error:
+            body["error"] = error
+        return jsonify(body), code
+
+    raw = request.get_data(cache=False, as_text=False) or b""
+    if len(raw) > MAP_GEOMETRY_MAX_BODY_BYTES:
+        return answer(None, "body_too_large", False, 0, True, 413,
+                      "body exceeds %d bytes" % MAP_GEOMETRY_MAX_BODY_BYTES)
+
+    try:
+        data = json.loads(raw.decode("utf-8")) if raw else None
+    except (ValueError, UnicodeDecodeError):
+        return answer(None, "validation_error", False, 0, True, 400,
+                      "body is not valid JSON")
+
+    profile, routes, error = _validate_map_geometry(data)
+    if error:
+        return answer(None, "validation_error", False, 0, True, 400, error)
+
+    key = _map_geometry_cache_key(profile, routes)
+    cached = _map_geometry_cache_get(key)
+    if cached is not None:
+        return answer(cached, "cached", True, 0, False)
+
+    if not ORS_KEY:
+        return answer(None, "missing_ors_key", False, 0, True)
+
+    headers = {"Authorization": ORS_KEY, "Content-Type": "application/json"}
+    geometries = []
+    calls_before = _MAP_STATS["directions"]
+    failures = []
+    for position, coordinates in enumerate(routes):
+        geometry, failure = _fetch_route_geometry(profile, coordinates, headers)
+        if failure:
+            failures.append("route %d: %s" % (position, failure))
+            geometries.append(None)
+        else:
+            geometries.append(geometry)
+    calls = _MAP_STATS["directions"] - calls_before
+
+    if all(geometry is None for geometry in geometries):
+        return answer(None, failures[0].split(": ", 1)[-1] if failures else "error",
+                      False, calls, True, 200, "; ".join(failures) or None)
+
+    if any(geometry is None for geometry in geometries):
+        # Une seule tournee tracee : la carte affiche l'autre en pointilles.
+        # Non mis en cache -- un succes partiel ne doit pas se figer.
+        return answer(geometries, "partial", False, calls, True, 200,
+                      "; ".join(failures))
+
+    _map_geometry_cache_put(key, geometries)
+    return answer(geometries, "ok", False, calls, False)
+
+
+# =========================
 # 8. TEST
 # =========================
 @app.route("/")
 def home():
     return "API OK - Vroom VRP ready"
+
+
+@app.route("/healthz")
+def healthz():
+    """Sonde legere : aucun fork, aucun reseau, aucun calcul.
+
+    Elle sert au controle de demarrage du conteneur. Avec un worker Gunicorn
+    synchrone, elle reste en file d'attente pendant une optimisation longue --
+    c'est le comportement actuel du service et il ne change pas ici."""
+    payload = {"status": "ok", "ortools": ORTOOLS_AVAILABLE}
+    if LOCAL_VROOM_MODULE_AVAILABLE:
+        payload.update(local_vroom.healthz())
+    else:
+        payload["local_vroom_enabled"] = False
+        payload["local_vroom_binary_present"] = False
+    return jsonify(payload)
 
 
 if __name__ == "__main__":

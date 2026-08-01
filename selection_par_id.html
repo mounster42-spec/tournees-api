@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<base target="_top">
+<style>
+  body{font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#222;
+       margin:0;padding:12px;line-height:1.5}
+  h1{font-size:15px;margin:0 0 14px}
+  label{display:block;font-weight:bold;margin:12px 0 4px}
+  .depot{background:#f1f3f4;border:1px solid #dadce0;border-radius:4px;
+         padding:8px 10px;color:#3c4043;word-break:break-word;min-height:19px}
+  .depot .id{font-weight:bold}
+  .depot .lib{color:#5f6368}
+  .depot.ko{background:#fce8e6;border-color:#d93025;color:#a50e0e}
+  .note{color:#5f6368;font-size:12px;margin-top:4px}
+  textarea{width:100%;box-sizing:border-box;min-height:190px;font-family:
+           "Courier New",monospace;font-size:13px;padding:8px;
+           border:1px solid #dadce0;border-radius:4px;resize:vertical}
+  .compteur{color:#5f6368;font-size:12px;margin-top:4px}
+  button{font:inherit;width:100%;min-height:44px;margin-top:14px;cursor:pointer;
+         border-radius:4px;border:1px solid #1a73e8;background:#1a73e8;
+         color:#fff;font-weight:bold}
+  button.secondaire{background:#fff;color:#1a73e8}
+  button:disabled{opacity:.5;cursor:default}
+  #rapport{margin-top:16px;border-top:1px solid #dadce0;padding-top:12px;
+           display:none}
+  .ok{color:#188038}
+  .ko{color:#d93025}
+  .avert{color:#b06000}
+  ul{margin:4px 0 8px;padding-left:20px}
+  li{word-break:break-all}
+</style>
+</head>
+<body>
+
+<h1>Sélectionner les points</h1>
+
+<!-- Les deux dépôts sont en LECTURE SEULE : ils restent pilotés depuis la
+     feuille Paramètres, et cette barre latérale ne les écrit jamais. -->
+<label>Point de départ</label>
+<div class="depot" id="depart">Chargement…</div>
+
+<label>Point d'arrivée</label>
+<div class="depot" id="arrivee">Chargement…</div>
+<div class="note" id="note-depots"></div>
+
+<label for="collectes">ID des points de collecte</label>
+<textarea id="collectes" placeholder="Un identifiant par ligne.&#10;Le collage d'une colonne de tableur fonctionne aussi&#10;(virgules, points-virgules et tabulations acceptés)."></textarea>
+<div class="compteur" id="compteur">0 identifiant saisi</div>
+
+<button id="valider" type="button">Vérifier et sélectionner</button>
+<div id="rapport"></div>
+<button id="fermer" type="button" class="secondaire">Fermer</button>
+
+<script>
+var contexte = null;
+var derniereSaisie = "";
+
+function esc(s){
+  return String(s === null || s === undefined ? "" : s)
+    .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
+    .replace(/"/g,"&quot;");
+}
+
+function afficherDepot(el, d, role){
+  if (d.vide && role === "arrivee"){
+    el.className = "depot";
+    el.innerHTML = "<span class='lib'>identique au départ</span>";
+    return;
+  }
+  if (d.vide){
+    el.className = "depot ko";
+    el.textContent = "non configuré dans Paramètres";
+    return;
+  }
+  if (d.ambigu){
+    el.className = "depot ko";
+    el.innerHTML = "<span class='id'>" + esc(d.id) + "</span> — plusieurs lignes portent cet identifiant";
+    return;
+  }
+  if (!d.trouve){
+    el.className = "depot ko";
+    el.innerHTML = "<span class='id'>" + esc(d.id) + "</span> — introuvable dans Horodateurs";
+    return;
+  }
+  el.className = "depot";
+  el.innerHTML = "<span class='id'>" + esc(d.id) + "</span>"
+    + (d.libelle ? " — <span class='lib'>" + esc(d.libelle) + "</span>" : "");
+}
+
+function chargerContexte(){
+  google.script.run
+    .withSuccessHandler(function(json){
+      var c;
+      try { c = JSON.parse(json); } catch (e) { return; }
+      contexte = c;
+      if (c.erreur){
+        document.getElementById("depart").className = "depot ko";
+        document.getElementById("depart").textContent = c.erreur;
+        return;
+      }
+      afficherDepot(document.getElementById("depart"), c.depart, "depart");
+      afficherDepot(document.getElementById("arrivee"), c.arrivee, "arrivee");
+      document.getElementById("note-depots").textContent =
+        (c.memeDepot ? "Départ et arrivée au même dépôt. " : "")
+        + "Ces deux points se modifient dans la feuille Paramètres.";
+    })
+    .withFailureHandler(function(err){
+      document.getElementById("depart").className = "depot ko";
+      document.getElementById("depart").textContent =
+        "Erreur : " + (err && err.message ? err.message : err);
+    })
+    .getSelectionContexte();
+}
+
+function compter(){
+  var n = document.getElementById("collectes").value
+    .split(/[\n\r,;\t]+/).filter(function(s){ return s.trim() !== ""; }).length;
+  document.getElementById("compteur").textContent =
+    n + (n > 1 ? " identifiants saisis" : " identifiant saisi");
+}
+
+function ligneListe(titre, items, classe){
+  if (!items || !items.length) return "";
+  var html = "<div class='" + classe + "'>" + esc(titre) + " (" + items.length + ") :</div><ul>";
+  for (var i = 0; i < items.length && i < 25; i++){
+    var it = items[i];
+    html += "<li>" + esc(typeof it === "object" ? it.id + " — lignes " + it.rows.join(", ") : it) + "</li>";
+  }
+  if (items.length > 25) html += "<li>… et " + (items.length - 25) + " autres</li>";
+  return html + "</ul>";
+}
+
+function afficherRapport(r, appliquer){
+  var box = document.getElementById("rapport");
+  box.style.display = "block";
+  var html = "";
+
+  if (r.bloquant){
+    html += "<div class='ko'><b>" + esc(r.bloquant) + "</b></div>";
+    html += "<div class='note'>Aucune case n'a été modifiée.</div>";
+  }
+
+  if (r.depart){
+    html += "<div>Départ : " + (r.depart.trouve
+      ? "<span class='ok'>trouvé</span>" : "<span class='ko'>introuvable</span>") + "</div>";
+    html += "<div>Arrivée : " + (r.arrivee.trouve
+      ? "<span class='ok'>trouvée</span>" : "<span class='ko'>introuvable</span>") + "</div>";
+  }
+
+  if (r.saisis){
+    html += "<div>" + r.saisis + " identifiant(s) saisi(s), "
+         + r.uniques + " unique(s), <b>" + r.trouves + "</b> trouvé(s).</div>";
+    html += ligneListe("Identifiants inconnus", r.inconnus, "ko");
+    html += ligneListe("Identifiants ambigus", r.ambigus, "ko");
+    html += ligneListe("Dépôts saisis comme collecte, ignorés",
+                       r.depotsDansCollectes, "avert");
+  }
+
+  if (r.applique){
+    html = "<div class='ok'><b>Départ et arrivée validés. "
+         + r.collectesCochees + " points de collecte sélectionnés.</b></div>"
+         + "<div>" + r.lignesCochees + " lignes cochées au total, dépôt compris.</div>"
+         + "<div class='note'>Vous pouvez maintenant lancer l'optimisation.</div>";
+  } else if (!r.bloquant && !appliquer){
+    html += "<div class='note'>" + r.lignesCochees
+         + " lignes seraient cochées. Cliquez à nouveau pour appliquer.</div>";
+  }
+
+  box.innerHTML = html;
+}
+
+function valider(){
+  var bouton = document.getElementById("valider");
+  var saisie = document.getElementById("collectes").value;
+  // Deuxième clic sur une saisie inchangée = application. Le premier ne fait
+  // que rapporter : rien n'est écrit avant que l'utilisateur ait vu le bilan.
+  var appliquer = (saisie === derniereSaisie);
+  derniereSaisie = saisie;
+
+  bouton.disabled = true;
+  bouton.textContent = appliquer ? "Application en cours…" : "Vérification en cours…";
+
+  google.script.run
+    .withSuccessHandler(function(json){
+      bouton.disabled = false;
+      var r;
+      try { r = JSON.parse(json); }
+      catch (e){ bouton.textContent = "Vérifier et sélectionner"; return; }
+      afficherRapport(r, appliquer);
+      if (r.applique){
+        derniereSaisie = "";
+        bouton.textContent = "Vérifier et sélectionner";
+      } else {
+        bouton.textContent = r.bloquant ? "Vérifier et sélectionner"
+                                        : "Confirmer et sélectionner";
+      }
+    })
+    .withFailureHandler(function(err){
+      bouton.disabled = false;
+      bouton.textContent = "Vérifier et sélectionner";
+      afficherRapport({bloquant: "Erreur : "
+        + (err && err.message ? err.message : err)}, appliquer);
+    })
+    .appliquerSelectionParId(saisie, appliquer);
+}
+
+document.getElementById("collectes").addEventListener("input", function(){
+  compter();
+  // La saisie a changé : on repasse par une vérification avant d'appliquer.
+  derniereSaisie = "";
+  document.getElementById("valider").textContent = "Vérifier et sélectionner";
+});
+document.getElementById("valider").addEventListener("click", valider);
+document.getElementById("fermer").addEventListener("click", function(){
+  google.script.host.close();
+});
+
+chargerContexte();
+compter();
+</script>
+</body>
+</html>

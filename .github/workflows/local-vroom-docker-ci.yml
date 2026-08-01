@@ -1,0 +1,783 @@
+name: local vroom docker ci
+
+# Environnement de construction et de preuve de l'image VROOM locale.
+#
+# Ce workflow ne parle a personne : ni ORS, ni HeiGIT, ni Render, ni un
+# endpoint VROOM public. Les seuls acces reseau sont ceux du build (Debian,
+# PyPI, le depot VROOM). Toutes les mesures reposent sur une matrice
+# synthetique deterministe.
+#
+# Il ne publie aucune image et ne deploie rien.
+
+on:
+  push:
+    branches:
+      - exp-local-vroom-alns
+  pull_request:
+    branches:
+      - lot-ors-matrix-connected
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: tournees-api-local-vroom:ci
+  HOST_PORT: "18080"
+
+jobs:
+
+  # =======================================================================
+  # JOB 1 — BUILD ET TESTS FONCTIONNELS
+  # =======================================================================
+  build-and-functional:
+    name: build image et tests fonctionnels
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Preparer le repertoire d'artefacts
+        run: mkdir -p artifacts
+
+      - name: Construire l'image (BuildKit)
+        env:
+          DOCKER_BUILDKIT: "1"
+        run: |
+          set -o pipefail
+          start=$(date +%s)
+          docker build --progress=plain -t "$IMAGE" . 2>&1 | tee artifacts/docker-build.log
+          end=$(date +%s)
+          echo "build_seconds=$((end - start))" >> "$GITHUB_ENV"
+          echo "Duree du build : $((end - start)) s"
+
+      - name: Enregistrer les metadonnees de l'image
+        run: |
+          set -euo pipefail
+          size=$(docker image inspect "$IMAGE" --format '{{.Size}}')
+          image_id=$(docker image inspect "$IMAGE" --format '{{.Id}}')
+          {
+            echo "image=$IMAGE"
+            echo "image_id=$image_id"
+            echo "size_bytes=$size"
+            echo "size_mb=$((size / 1024 / 1024))"
+            echo "build_seconds=${build_seconds}"
+          } | tee artifacts/image-metadata.txt
+          docker image inspect "$IMAGE" > artifacts/docker-inspect.json
+
+      - name: Verifier vroom --version dans l'image
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint /usr/local/bin/vroom "$IMAGE" --version \
+            | tee artifacts/vroom-version.txt
+          grep -q "1.15.0" artifacts/vroom-version.txt
+
+      - name: Verifier que l'image n'embarque ni secret ni port supplementaire
+        run: |
+          set -euo pipefail
+          # Un seul port declare, celui de Flask.
+          ports=$(docker image inspect "$IMAGE" --format '{{json .Config.ExposedPorts}}')
+          echo "ExposedPorts=$ports"
+          test "$ports" = '{"10000/tcp":{}}'
+
+          # Aucune cle ne doit avoir ete figee dans l'image.
+          envjson=$(docker image inspect "$IMAGE" --format '{{json .Config.Env}}')
+          echo "$envjson" > artifacts/image-env.json
+          if echo "$envjson" | grep -Eiq '(ORS_KEY|api_key|authorization|token)='; then
+            echo "Une variable sensible est figee dans l'image"; exit 1
+          fi
+
+          # Ni vroom-express, ni serveur HTTP VROOM.
+          if docker run --rm --entrypoint sh "$IMAGE" -c 'command -v vroom-express' ; then
+            echo "vroom-express est present dans l'image"; exit 1
+          fi
+
+          # L'experimentation est inactive par defaut dans l'image.
+          enabled=$(docker run --rm --entrypoint python "$IMAGE" -c \
+            'import local_vroom; print(local_vroom.LocalVroomConfig().enabled)')
+          echo "LOCAL_VROOM_EXPERIMENT_ENABLED par defaut = $enabled"
+          test "$enabled" = "False"
+
+      - name: Demarrer le conteneur Flask
+        run: |
+          set -euo pipefail
+          docker run -d --name tournees-ci \
+            -e PORT=10000 \
+            -e ORS_KEY=dummy \
+            -e LOCAL_VROOM_EXPERIMENT_ENABLED=true \
+            -p "${HOST_PORT}:10000" \
+            "$IMAGE"
+
+      - name: Attendre /healthz
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            if curl -fsS "http://127.0.0.1:${HOST_PORT}/healthz" -o artifacts/healthz.json; then
+              echo "healthz OK apres ${i}s"
+              cat artifacts/healthz.json | tee -a artifacts/healthcheck.log
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "healthz n'a jamais repondu"
+          docker logs tournees-ci | tail -100
+          exit 1
+
+      - name: Verifier GET /
+        run: |
+          set -euo pipefail
+          curl -fsS "http://127.0.0.1:${HOST_PORT}/" | tee -a artifacts/healthcheck.log
+          echo "" >> artifacts/healthcheck.log
+
+      - name: Verifier qu'un seul port ecoute dans le conteneur
+        run: |
+          set -euo pipefail
+          # Etat 0A = LISTEN dans /proc/net/tcp. Le conteneur ne doit exposer
+          # que Gunicorn : si VROOM ouvrait un port, il y en aurait deux.
+          listening=$(docker exec tournees-ci sh -c \
+            'cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | awk "\$4 == \"0A\"" | wc -l')
+          echo "sockets en ecoute = $listening" | tee artifacts/listening-sockets.txt
+          test "$listening" -eq 1
+
+      - name: Resolution synthetique 60 taches dans le conteneur
+        run: |
+          set -euo pipefail
+          docker exec tournees-ci python tools/synthetic_joint_solve.py \
+            --mode solve --tasks 60 --max-tasks 30 \
+            --output /tmp/synthetic-solve.json 2>&1 | tee artifacts/synthetic-solve.log
+          docker cp tournees-ci:/tmp/synthetic-solve.json artifacts/synthetic-solve.json
+
+      - name: Verifier la solution 30/30
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, sys
+
+          with open("artifacts/synthetic-solve.json") as handle:
+              report = json.load(handle)
+
+          problems = []
+          if not report.get("ok"):
+              problems.append("la resolution a echoue: %s" % report.get("error_code"))
+          if report.get("unassigned"):
+              problems.append("%s tache(s) non affectee(s)" % report["unassigned"])
+          if sorted(report.get("sizes", {}).values()) != [30, 30]:
+              problems.append("cardinalites %s au lieu de 30/30" % report.get("sizes"))
+          if not report.get("cardinality_ok"):
+              problems.append("les 60 taches ne sont pas toutes presentes exactement une fois")
+          if report.get("duplicates"):
+              problems.append("%s doublon(s)" % report["duplicates"])
+          if report.get("missing"):
+              problems.append("taches manquantes: %s" % report["missing"])
+          if not report.get("routes_non_empty"):
+              problems.append("une route est vide")
+          ledger = report.get("ledger") or {}
+          if ledger.get("local_vroom_attempted") != 1:
+              problems.append("une requete a deux vehicules doit compter une seule resolution")
+
+          print(json.dumps(report, indent=2, sort_keys=True))
+          if problems:
+              for item in problems:
+                  print("ECHEC:", item)
+              sys.exit(1)
+          print("OK: 60 taches, 30/30, une seule resolution VROOM")
+          PY
+
+      - name: Scenario de timeout volontaire
+        run: |
+          set -euo pipefail
+          docker exec tournees-ci python tools/synthetic_joint_solve.py \
+            --mode timeout --output /tmp/timeout-cleanup.json 2>&1 \
+            | tee artifacts/timeout-cleanup.log
+          docker cp tournees-ci:/tmp/timeout-cleanup.json artifacts/timeout-cleanup.json
+
+      - name: Verifier l'absence de processus et de fichier residuel
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, sys
+
+          with open("artifacts/timeout-cleanup.json") as handle:
+              report = json.load(handle)
+
+          problems = []
+          if report.get("error_code") != "local_vroom_timeout":
+              problems.append("code attendu local_vroom_timeout, obtenu %s"
+                              % report.get("error_code"))
+          if report.get("children_after"):
+              problems.append("processus enfants restants: %s" % report["children_after"])
+          if report.get("zombies_after"):
+              problems.append("zombies restants: %s" % report["zombies_after"])
+          if not report.get("tmp_clean"):
+              problems.append("fichiers temporaires residuels: %s" % report.get("tmp_after"))
+
+          print(json.dumps(report, indent=2, sort_keys=True))
+          if problems:
+              for item in problems:
+                  print("ECHEC:", item)
+              sys.exit(1)
+          print("OK: processus tue avec sa descendance, aucun temporaire residuel")
+          PY
+
+      - name: Verifier qu'aucun processus vroom ne survit dans le conteneur
+        run: |
+          set -euo pipefail
+          # On lit /proc/PID/comm, le NOM DE L'EXECUTABLE, et non la ligne de
+          # commande : une recherche sur cmdline se trouverait elle-meme, le
+          # script de controle contenant le mot cherche.
+          survivors=$(docker exec tournees-ci sh -c \
+            'for p in /proc/[0-9]*; do
+               [ -r "$p/comm" ] || continue
+               name=$(cat "$p/comm" 2>/dev/null)
+               if [ "$name" = "vroom" ]; then echo "${p#/proc/} $name"; fi
+             done' || true)
+          echo "survivants: [$survivors]" | tee artifacts/vroom-survivors.txt
+          test -z "$survivors"
+
+      - name: Strategie experimentale complete, quatre scenarios
+        run: |
+          set -euo pipefail
+          # Quatre reglages sur la MEME image et le MEME binaire :
+          #   default   : les budgets de production ;
+          #   max8      : le plafond releve par variable d'environnement ;
+          #   tight     : une limite globale courte, arret propre attendu ;
+          #   noblocks  : route-first et ALNS a budget nul, blocs B/C expires.
+          run_case() {
+            label="$1"; shift
+            echo "=== scenario $label ==="
+            docker exec "$@" tournees-ci python tools/synthetic_strategy_run.py \
+              --tasks 60 --label "$label" --output "/tmp/strategy-$label.json" \
+              2>&1 | tee "artifacts/strategy-$label.log"
+            docker cp "tournees-ci:/tmp/strategy-$label.json" \
+              "artifacts/strategy-$label.json"
+          }
+
+          run_case default
+          run_case max8 \
+            -e LOCAL_VROOM_MAX_SOLVES=8 \
+            -e LOCAL_VROOM_NUCLEUS_SOLVES=2 \
+            -e LOCAL_VROOM_FINALIST_SOLVES=5
+          run_case tight -e LOCAL_VROOM_TOTAL_SOFT_LIMIT_S=12
+          run_case noblocks \
+            -e LOCAL_VROOM_ROUTE_FIRST_BUDGET_S=0 \
+            -e LOCAL_VROOM_ALNS_BUDGET_S=0
+
+      - name: Verifier les quatre scenarios
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, sys
+
+          def load(label):
+              with open("artifacts/strategy-%s.json" % label) as handle:
+                  return json.load(handle)
+
+          cases = {label: load(label)
+                   for label in ("default", "max8", "tight", "noblocks")}
+          problems = []
+
+          for label, report in cases.items():
+              print("=== %s ===" % label)
+              print(json.dumps(report, indent=2, sort_keys=True))
+              if not report.get("ok"):
+                  problems += ["[%s] %s" % (label, p)
+                               for p in report.get("problems", ["echec"])]
+              # Invariants valables dans TOUS les scenarios.
+              if report.get("api_vroom_calls"):
+                  problems.append("[%s] appel VROOM public" % label)
+              if report.get("api_matrix_calls"):
+                  problems.append("[%s] appel Matrix reel" % label)
+              if (report.get("declared_matrix_calls") or 0) > 2:
+                  problems.append("[%s] plus de 2 appels Matrix" % label)
+              if report.get("sizes") != [30, 30]:
+                  problems.append("[%s] cardinalites %s au lieu de 30/30"
+                                  % (label, report.get("sizes")))
+              if report.get("children_after"):
+                  problems.append("[%s] processus enfants restants" % label)
+              if report.get("tmp_after"):
+                  problems.append("[%s] fichiers temporaires residuels" % label)
+              # Une decoupe hors plafond ne doit jamais sortir en se
+              # presentant comme acceptable.
+              if not report.get("territorial_admissible") \
+                      and not report.get("territorial_fallback_used"):
+                  problems.append("[%s] non admissible sans marquage de repli"
+                                  % label)
+
+          default = cases["default"]
+          if default.get("max_solves") != 4:
+              problems.append("le plafond par defaut n'est pas 4")
+          if (default.get("solves_attempted") or 0) > 4:
+              problems.append("cinquieme resolution avec les valeurs par defaut")
+          if (default.get("joint_finalists_local_vroom_solved") or 0) > 2:
+              problems.append("plus de deux finalistes resolus par defaut")
+          if not default.get("joint_direct_valid"):
+              problems.append("la resolution directe n'est pas valide")
+          if (default.get("joint_nucleus_attempted") or 0) < 1:
+              problems.append("aucune variante a noyaux tentee")
+          if (default.get("route_first_unique") or 0) < 1:
+              problems.append("route-first n'a produit aucune partition")
+          if (default.get("joint_alns_iterations") or 0) < 1:
+              problems.append("l'ALNS n'a fait aucune iteration")
+          if (default.get("joint_finalists") or 0) < 1:
+              problems.append("aucun finaliste construit")
+          if not default.get("territorial_admissible"):
+              problems.append("le resultat par defaut n'est pas territorialement "
+                              "admissible: %s"
+                              % default.get("territorial_fallback_reason"))
+          if default.get("territorial_thresholds") != [0, 3, 6, 9]:
+              problems.append("plafonds territoriaux inattendus pour 60 points: %s"
+                              % default.get("territorial_thresholds"))
+
+          max8 = cases["max8"]
+          if max8.get("max_solves") != 8:
+              problems.append("le plafond ne monte pas a 8 par environnement")
+          if (max8.get("solves_attempted") or 0) <= 4:
+              problems.append("le plafond releve ne change rien au nombre de solves")
+          if (max8.get("solves_attempted") or 0) > 8:
+              problems.append("neuvieme resolution avec un plafond de 8")
+
+          tight = cases["tight"]
+          if (tight.get("total_elapsed_ms") or 0) > 16000:
+              problems.append("la limite globale courte n'a pas ete respectee")
+
+          noblocks = cases["noblocks"]
+          if (noblocks.get("route_first_unique") or 0) != 0:
+              problems.append("route-first a tourne malgre un budget nul")
+          if (noblocks.get("joint_alns_iterations") or 0) != 0:
+              problems.append("l'ALNS a tourne malgre un budget nul")
+          if noblocks.get("error"):
+              problems.append("aucun resultat quand les blocs B et C expirent")
+
+          if problems:
+              for item in problems:
+                  print("ECHEC:", item)
+              sys.exit(1)
+          print("OK: quatre scenarios conformes")
+          PY
+
+      - name: Journaux du conteneur
+        if: always()
+        run: docker logs tournees-ci > artifacts/container.log 2>&1 || true
+
+      - name: Arreter et supprimer le conteneur
+        if: always()
+        run: |
+          docker stop tournees-ci || true
+          docker rm -f tournees-ci || true
+
+      - name: Televerser les artefacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-and-functional
+          path: artifacts/
+          retention-days: 14
+
+  # =======================================================================
+  # JOB 2 — ENVELOPPE SOUS CONTRAINTES RENDER FREE
+  # =======================================================================
+  # 512 Mo et 0,10 CPU reproduisent le PLAN Render Free, pas Render lui-meme.
+  # Le resultat est une estimation utile pour dimensionner, jamais une preuve
+  # de performance en production.
+  render-free-envelope:
+    name: enveloppe 512 Mo / 0,10 CPU
+    runs-on: ubuntu-latest
+    needs: build-and-functional
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Preparer le repertoire d'artefacts
+        run: mkdir -p artifacts
+
+      - name: Reconstruire l'image
+        env:
+          DOCKER_BUILDKIT: "1"
+        run: docker build -t "$IMAGE" . > artifacts/docker-build-job2.log 2>&1
+
+      - name: Mesurer la memoire du service au repos
+        run: |
+          set -euo pipefail
+          docker run -d --name tournees-mem \
+            --memory=512m --memory-swap=512m --cpus=0.10 --pids-limit=128 \
+            -e PORT=10000 -e ORS_KEY=dummy \
+            -e LOCAL_VROOM_EXPERIMENT_ENABLED=true \
+            -p "${HOST_PORT}:10000" "$IMAGE"
+          for i in $(seq 1 300); do
+            if curl -fsS "http://127.0.0.1:${HOST_PORT}/healthz" -o /dev/null; then
+              echo "healthz OK apres ${i}s sous 0,10 CPU"
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS "http://127.0.0.1:${HOST_PORT}/healthz" -o artifacts/healthz-constrained.json
+          docker stats --no-stream --format '{{.Name}} {{.MemUsage}} {{.MemPerc}}' tournees-mem \
+            | tee artifacts/service-idle-memory.txt
+
+      - name: Resolution synthetique unique sous contrainte
+        run: |
+          set -euo pipefail
+          # Le budget par resolution est relache a 55 s pour MESURER la duree
+          # reelle sous 0,10 CPU. Couper a 6 s ici ne mesurerait rien : on
+          # observerait seulement notre propre couperet.
+          start=$(date +%s%3N)
+          set +e
+          docker exec \
+            -e LOCAL_VROOM_PER_SOLVE_TIMEOUT_S=55 \
+            -e LOCAL_VROOM_TOTAL_SOFT_LIMIT_S=200 \
+            tournees-mem python tools/synthetic_joint_solve.py \
+            --mode solve --tasks 60 --max-tasks 30 \
+            --output /tmp/constrained.json > artifacts/constrained-solve.log 2>&1
+          exit_code=$?
+          set -e
+          end=$(date +%s%3N)
+          echo "exit_code=$exit_code" | tee artifacts/constrained-exit.txt
+          echo "outer_wall_s=$(awk "BEGIN{printf \"%.3f\", ($end - $start)/1000}")" \
+            | tee -a artifacts/constrained-exit.txt
+          cat artifacts/constrained-solve.log
+          docker cp tournees-mem:/tmp/constrained.json artifacts/constrained.json || true
+
+      - name: Strategie complete sous contrainte
+        run: |
+          set -euo pipefail
+          start=$(date +%s%3N)
+          set +e
+          docker exec tournees-mem python tools/synthetic_strategy_run.py \
+            --tasks 60 --label constrained \
+            --output /tmp/strategy-constrained.json \
+            > artifacts/strategy-constrained.log 2>&1
+          strategy_exit=$?
+          set -e
+          end=$(date +%s%3N)
+          echo "strategy_exit=$strategy_exit" | tee -a artifacts/constrained-exit.txt
+          echo "strategy_outer_wall_s=$(awk "BEGIN{printf \"%.3f\", ($end - $start)/1000}")" \
+            | tee -a artifacts/constrained-exit.txt
+          cat artifacts/strategy-constrained.log
+          docker cp tournees-mem:/tmp/strategy-constrained.json \
+            artifacts/strategy-constrained.json || true
+          docker stats --no-stream --format '{{.Name}} {{.MemUsage}} {{.MemPerc}}' \
+            tournees-mem | tee artifacts/service-strategy-memory.txt
+
+      - name: Etat du conteneur apres la resolution
+        if: always()
+        run: |
+          set -euo pipefail
+          docker inspect tournees-mem > artifacts/docker-inspect-constrained.json
+          docker stats --no-stream --format '{{.Name}} {{.MemUsage}} {{.MemPerc}}' tournees-mem \
+            | tee artifacts/service-after-memory.txt || true
+
+      - name: Construire le rapport d'enveloppe
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, subprocess, sys
+
+          def read_json(path, default=None):
+              try:
+                  with open(path) as handle:
+                      return json.load(handle)
+              except (OSError, ValueError):
+                  return default
+
+          def read_text(path):
+              try:
+                  with open(path) as handle:
+                      return handle.read().strip()
+              except OSError:
+                  return ""
+
+          solve = read_json("artifacts/constrained.json", {}) or {}
+          strategy = read_json("artifacts/strategy-constrained.json", {}) or {}
+          inspect = read_json("artifacts/docker-inspect-constrained.json", [{}]) or [{}]
+          state = (inspect[0] or {}).get("State", {})
+
+          exit_info = {}
+          for line in read_text("artifacts/constrained-exit.txt").splitlines():
+              if "=" in line:
+                  key, value = line.split("=", 1)
+                  exit_info[key.strip()] = value.strip()
+
+          # /proc/PID/comm et non cmdline : sur cmdline, le script de controle
+          # se trouverait lui-meme puisqu'il contient le mot cherche.
+          survivors = subprocess.run(
+              ["docker", "exec", "tournees-mem", "sh", "-c",
+               'for p in /proc/[0-9]*; do [ -r "$p/comm" ] || continue; '
+               'name=$(cat "$p/comm" 2>/dev/null); '
+               'if [ "$name" = "vroom" ]; then echo "${p#/proc/}"; fi; done'],
+              stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+          remaining = [p for p in survivors.stdout.decode().split() if p.strip()]
+
+          child_rss_kb = solve.get("child_peak_rss_kb")
+          self_rss_kb = solve.get("self_peak_rss_kb")
+          solve_wall = solve.get("solve_wall_s")
+
+          report = {
+              "limits": {"memory": "512m", "memory_swap": "512m",
+                         "cpus": "0.10", "pids_limit": 128},
+              "exit_code": int(exit_info.get("exit_code", "1") or 1),
+              "oom_killed": bool(state.get("OOMKilled")),
+              "container_status": state.get("Status"),
+              "n_tasks": solve.get("n_tasks"),
+              "sizes": solve.get("sizes"),
+              "cardinality_ok": solve.get("cardinality_ok"),
+              "unassigned": solve.get("unassigned"),
+              "solve_ok": bool(solve.get("ok")),
+              "vroom_wall_s": solve_wall,
+              "vroom_elapsed_ms": solve.get("solve_elapsed_ms"),
+              "outer_wall_s": exit_info.get("outer_wall_s"),
+              "child_user_s": solve.get("child_user_s"),
+              "child_sys_s": solve.get("child_sys_s"),
+              "vroom_peak_rss_kb": child_rss_kb,
+              "vroom_peak_rss_mb": None if child_rss_kb is None else round(child_rss_kb / 1024.0, 1),
+              "harness_peak_rss_kb": self_rss_kb,
+              "harness_peak_rss_mb": None if self_rss_kb is None else round(self_rss_kb / 1024.0, 1),
+              "service_idle_memory": read_text("artifacts/service-idle-memory.txt"),
+              "service_after_memory": read_text("artifacts/service-after-memory.txt"),
+              "processes_remaining": remaining,
+              "vroom_version": solve.get("vroom_version"),
+              "ledger": solve.get("ledger"),
+              "exceeds_58s": bool(solve_wall is not None and solve_wall > 58.0),
+
+              # --- strategie complete sous la meme contrainte ---
+              "strategy_ok": bool(strategy.get("ok")),
+              "strategy_sizes": strategy.get("sizes"),
+              "strategy_components": strategy.get("components"),
+              "strategy_wall_s": strategy.get("wall_s"),
+              "strategy_total_elapsed_ms": strategy.get("total_elapsed_ms"),
+              "strategy_soft_limit_reached": strategy.get("soft_limit_reached"),
+              "strategy_solves": strategy.get("solves_attempted"),
+              "strategy_selected_source": strategy.get("selected_source"),
+              "strategy_selected_duration_s": strategy.get("selected_duration_s"),
+              "strategy_service_peak_rss_mb": (
+                  None if strategy.get("service_peak_rss_kb") is None
+                  else round(strategy["service_peak_rss_kb"] / 1024.0, 1)),
+              "strategy_stages": strategy.get("stages"),
+              "service_memory_during_strategy": read_text(
+                  "artifacts/service-strategy-memory.txt"),
+              "strategy_exceeds_58s": bool(
+                  (strategy.get("total_elapsed_ms") or 0) > 58000),
+              "caveat": ("Mesure sur runner GitHub sous quota Docker. "
+                         "Estimation de dimensionnement, pas une preuve Render."),
+          }
+
+          os.makedirs("artifacts", exist_ok=True)
+          with open("artifacts/render-free-envelope.json", "w") as handle:
+              json.dump(report, handle, indent=2, sort_keys=True)
+
+          lines = ["ENVELOPPE 512 Mo / 0,10 CPU — estimation, pas une preuve Render", ""]
+          for key in sorted(report):
+              if key != "caveat":
+                  lines.append("%-24s %s" % (key, report[key]))
+          lines += ["", report["caveat"]]
+          with open("artifacts/render-free-envelope.txt", "w") as handle:
+              handle.write("\n".join(lines) + "\n")
+          print("\n".join(lines))
+
+          problems = []
+          if report["oom_killed"]:
+              problems.append("le conteneur a ete tue par manque de memoire")
+          if report["exit_code"] != 0:
+              problems.append("code de sortie %s" % report["exit_code"])
+          if not report["solve_ok"]:
+              problems.append("solution invalide ou resolution echouee")
+          if sorted((report["sizes"] or {}).values()) != [30, 30]:
+              problems.append("cardinalites %s au lieu de 30/30" % report["sizes"])
+          if remaining:
+              problems.append("processus vroom restants: %s" % remaining)
+          if not report["strategy_ok"]:
+              problems.append("la strategie complete a echoue sous contrainte: %s"
+                              % strategy.get("problems"))
+          if report["strategy_sizes"] not in (None, [30, 30]):
+              problems.append("strategie: cardinalites %s au lieu de 30/30"
+                              % report["strategy_sizes"])
+
+          if report["exceeds_58s"]:
+              # Signale bruyamment, mais ce n'est pas en soi un echec du job :
+              # c'est l'information de dimensionnement que le job doit produire.
+              print("ATTENTION: la resolution depasse 58 s sous 0,10 CPU")
+          if report["strategy_exceeds_58s"]:
+              print("ATTENTION: la strategie complete depasse 58 s sous 0,10 CPU")
+
+          if problems:
+              for item in problems:
+                  print("ECHEC:", item)
+              sys.exit(1)
+          PY
+
+      - name: Arreter et supprimer le conteneur
+        if: always()
+        run: |
+          docker stop tournees-mem || true
+          docker rm -f tournees-mem || true
+
+      - name: Televerser les artefacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: render-free-envelope
+          path: artifacts/
+          retention-days: 14
+
+  # =======================================================================
+  # JOB 3 — TESTS PYTHON ET GARANTIES STATIQUES
+  # =======================================================================
+  python-tests:
+    name: tests python et garanties statiques
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Preparer le repertoire d'artefacts
+        run: mkdir -p artifacts
+
+      # La suite existante remplace flask, numpy, sklearn et ortools par des
+      # modules factices : elle tourne sur la bibliotheque standard seule.
+      # Installer les vraies dependances ne changerait rien au resultat et
+      # allongerait le job.
+      - name: python -m unittest
+        run: |
+          set -o pipefail
+          python -m unittest 2>&1 | tee artifacts/unittest.log
+
+      - name: python -m py_compile
+        run: |
+          python -m py_compile app.py local_vroom.py \
+            tools/synthetic_joint_solve.py tools/slow_stub.py
+          echo "py_compile OK" | tee artifacts/py_compile.log
+
+      - name: git diff --check
+        run: |
+          git diff --check | tee artifacts/git-diff-check.log
+          test ! -s artifacts/git-diff-check.log
+
+      - name: Garanties statiques
+        run: |
+          set -euo pipefail
+          fail=0
+
+          echo "--- aucun shell=True ---"
+          # tests_local_vroom.py est exclu : il CITE la chaine pour verifier
+          # qu'elle est absente du code de production.
+          if grep -rn "shell=True" app.py local_vroom.py tools/; then
+            echo "ECHEC: shell=True present"; fail=1
+          fi
+
+          echo "--- aucun endpoint VROOM public ni Optimization HeiGIT dans la couche locale ---"
+          if grep -rniE "heigit\.org|api\.openrouteservice\.org|vroom/v0|vroom-express" \
+               local_vroom.py tools/; then
+            echo "ECHEC: la couche locale reference un service distant"; fail=1
+          fi
+
+          echo "--- points de sortie reseau d'app.py ---"
+          # Verification par DESTINATION plutot que par simple comptage : ce
+          # qui doit rester fige, ce sont les deux sorties de l'OPTIMISATION.
+          # La geometrie de carte a la sienne, comptee a part et jamais
+          # appelee depuis /optimize.
+          for pair in "ORS_VROOM_URL:1" "ORS_MATRIX_URL:1" "ORS_DIRECTIONS_URL:1"; do
+            name="${pair%%:*}"; want="${pair##*:}"
+            got=$(grep -c "requests.post($name" app.py || true)
+            echo "  requests.post($name...) : $got (attendu $want)"
+            test "$got" -eq "$want" \
+              || { echo "ECHEC: sortie reseau $name modifiee"; fail=1; }
+          done
+          total=$(grep -c "requests.post(" app.py)
+          echo "  total requests.post : $total (attendu 3)"
+          test "$total" -eq 3 \
+            || { echo "ECHEC: un appel sortant inattendu a ete ajoute"; fail=1; }
+
+          echo "--- experimentation desactivee par defaut ---"
+          python -c "
+          import os, local_vroom
+          os.environ.pop('LOCAL_VROOM_EXPERIMENT_ENABLED', None)
+          assert local_vroom.LocalVroomConfig().enabled is False
+          print('LOCAL_VROOM_EXPERIMENT_ENABLED=false par defaut: OK')
+          "
+
+          echo "--- strategies existantes inchangees ---"
+          grep -q 'VALID_STRATEGIES = ("kmeans", "ortools_haversine", "ortools_ors_matrix",' app.py \
+            || { echo "ECHEC: VALID_STRATEGIES modifie"; fail=1; }
+
+          echo "--- CLI/ non suivi ---"
+          if [ -n "$(git ls-files CLI)" ]; then
+            echo "ECHEC: des fichiers de CLI/ sont suivis"; fail=1
+          fi
+
+          echo "--- un seul port dans le Dockerfile ---"
+          test "$(grep -c '^EXPOSE' Dockerfile)" -eq 1
+
+          echo "--- la strategie experimentale ne peut pas appeler le reseau ---"
+          python - <<'PY'
+          import ast
+          import sys
+
+          # Analyse SYNTAXIQUE d'app.py, sans l'importer : le controle ne
+          # depend donc d'aucune dependance installee, et il porte sur le code
+          # tel qu'il est ecrit. Route-first et l'ALNS ne doivent contenir
+          # aucune reference a un point de sortie reseau ; la seule fonction
+          # autorisee a en avoir une est l'entree de strategie, qui appelle le
+          # constructeur de matrice ORS.
+          offline = {
+              "hybrid_route_first",
+              "hybrid_territorial_alns",
+              "_hybrid_alns_neighbour",
+              "_hybrid_build_cycles",
+              "_hybrid_refine_order",
+              "_hybrid_partition_cost",
+              "build_knn_graph_g5",
+              "score_routes_on_matrix",
+          }
+          forbidden = ("requests.", "_post_matrix", "_post_vroom",
+                       "ORS_VROOM_URL", "ORS_MATRIX_URL",
+                       "_build_full_matrix_chunked", "_fetch_ors_matrix",
+                       "urlopen", "socket")
+
+          with open("app.py", encoding="utf-8") as handle:
+              source = handle.read()
+          tree = ast.parse(source)
+
+          found = {}
+          for node in ast.walk(tree):
+              if isinstance(node, ast.FunctionDef) and node.name in offline:
+                  found[node.name] = ast.get_source_segment(source, node) or ""
+
+          missing = offline - set(found)
+          if missing:
+              print("ECHEC: fonctions introuvables dans app.py:", sorted(missing))
+              sys.exit(1)
+
+          failures = []
+          for name, body in sorted(found.items()):
+              for needle in forbidden:
+                  if needle in body:
+                      failures.append("%s reference %s" % (name, needle))
+          for item in failures:
+              print("ECHEC:", item)
+          if failures:
+              sys.exit(1)
+          print("OK: %d fonctions de recherche sans acces reseau" % len(found))
+          PY
+
+          exit $fail
+
+      - name: Televerser les artefacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-tests
+          path: artifacts/
+          retention-days: 14

@@ -7,22 +7,41 @@
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
-  html,body{height:100%;margin:0;font-family:Arial,Helvetica,sans-serif;color:#222}
+  html,body{margin:0;font-family:Arial,Helvetica,sans-serif;color:#222;
+            overflow:hidden}
 
-  /* Colonne : panneau en haut, carte qui prend le reste. Evite qu'une carte
-     en 100vh depasse sous le panneau. */
-  #layout{display:flex;flex-direction:column;height:100%}
-  #panel{flex:0 0 auto;background:#fafafa;border-bottom:1px solid #ddd;
-         padding:10px 14px;display:flex;flex-wrap:wrap;gap:18px;align-items:flex-start}
+  /* 100dvh suit la barre d'adresse mobile qui se retracte ; 100vh reste le
+     repli pour les navigateurs qui l'ignorent. Declares dans cet ordre : le
+     second gagne quand il est compris. */
+  html,body{height:100vh;height:100dvh}
 
-  /* min-height : filet de securite si le conteneur parent n'a aucune hauteur,
-     sans quoi Leaflet rendrait une carte vide. */
-  #map{flex:1 1 auto;width:100%;min-height:320px}
+  /* ORDINATEUR : panneau lateral etroit a gauche, carte a droite.
+     La carte est l'element principal, elle ne se contente plus du reste. */
+  #layout{display:flex;flex-direction:row;height:100%;
+          padding-left:env(safe-area-inset-left);
+          padding-right:env(safe-area-inset-right)}
+  #panel{flex:0 0 290px;background:#fafafa;border-right:1px solid #ddd;
+         padding:12px 14px;overflow-y:auto;-webkit-overflow-scrolling:touch;
+         display:flex;flex-direction:column;gap:14px}
+  #map{flex:1 1 auto;height:100%;min-height:0}
+
+  /* Poignee du tiroir : masquee sur ordinateur, seule commande du panneau
+     sur telephone. */
+  #drawer-handle{display:none}
 
   #empty{display:none;flex:1 1 auto;align-items:center;justify-content:center;
          text-align:center;padding:40px 20px;color:#555;font-size:15px;line-height:1.6}
 
   .block{font-size:12px;line-height:1.6}
+  /* Il y avait ici un bloc « #actions button » herite d'avant la barre
+     d'actions. Un selecteur d'ID (1,0,1) l'emportait sur
+     « .actions button.primaire » (0,2,1) : le fond redevenait blanc, tandis
+     que la couleur de texte, elle, n'avait pas de concurrent et restait
+     blanche. Le bouton principal etait donc ecrit en blanc sur blanc. Les
+     regles de .actions plus bas suffisent, et elles fixent les deux. */
+  #geo-status,#download-result{margin-left:10px;color:#555}
+  #geo-status.loaded{color:#1e8449}
+  #geo-status.fallback{color:#b9770e}
   .block h2{margin:0 0 4px;font-size:13px}
   table.sum{border-collapse:collapse;font-size:12px}
   table.sum th,table.sum td{padding:2px 8px 2px 0;text-align:left;white-space:nowrap}
@@ -32,8 +51,8 @@
       vertical-align:middle;margin-right:5px;border:1px solid rgba(0,0,0,.2)}
   .dash{display:inline-block;width:22px;border-top:3px dashed #666;
         vertical-align:middle;margin-right:5px}
-  .toggles label{margin-right:12px;cursor:pointer;white-space:nowrap}
-  .toggles button{font-size:12px;padding:3px 9px;cursor:pointer}
+  .toggles button{font:inherit;min-height:44px;padding:0 12px;cursor:pointer;
+    border:1px solid #999;border-radius:6px;background:#fff;margin-top:4px}
   .warn{color:#b00;font-size:12px}
   .alert{color:#fff;background:#c0392b;padding:6px 8px;border-radius:3px;
          font-size:12px;margin-bottom:4px}
@@ -45,24 +64,133 @@
        border:2px solid;background:#fff}
   .pin-depot{width:30px;height:30px;line-height:28px;font-size:9px}
 
-  @media (max-width:640px){
-    #panel{gap:10px;padding:8px 10px}
-    .block,table.sum th,table.sum td{font-size:11px}
+  /* Boutons et cases : 44 px, le minimum tactile. Sur ordinateur la souris
+     s'en accommode ; sur telephone c'est la difference entre viser et rater. */
+  /* Les boutons ne descendent jamais sous la largeur de leur libelle : le
+     min-width:auto par defaut d'un element flex les fait passer a la ligne
+     plutot que de rogner le texte. max-width borne la largeur au panneau,
+     donc rien ne deborde de l'ecran. */
+  /* Fond ET couleur de texte declares ensemble, sur chaque etat : c'est
+     l'absence de l'un des deux qui avait produit du blanc sur blanc.
+     #0b57d0 sur blanc, et blanc sur #0b57d0, donnent le meme contraste
+     d'environ 5,9:1 — au-dessus du seuil AA pour du texte normal. */
+  .actions{display:flex;flex-wrap:wrap;gap:8px}
+  .actions button{font:inherit;font-weight:600;min-height:44px;padding:0 16px;
+    cursor:pointer;display:inline-flex;align-items:center;
+    justify-content:center;
+    border:1px solid #0b57d0;border-radius:6px;
+    background:#ffffff;color:#0b57d0;
+    flex:1 1 auto;max-width:100%;box-sizing:border-box;
+    white-space:nowrap;overflow:visible}
+  .actions button:hover{background:#eaf1fb;color:#0b57d0}
+  .actions button:focus{outline:3px solid #0b57d0;outline-offset:2px}
+  .actions button:focus-visible{outline:3px solid #0b57d0;outline-offset:2px}
+  .actions button.primaire{background:#0b57d0;color:#ffffff;
+    border-color:#0b57d0}
+  .actions button.primaire:hover{background:#0842a0;color:#ffffff}
+  .actions button:disabled{opacity:.5;cursor:default}
+
+  /* Il y avait ici une regle « .actions a.bouton », pour des liens presentes
+     comme des boutons. Le seul qui l'utilisait pointait vers Drive et a ete
+     retire : plus aucun lien sortant dans la barre d'actions, donc plus de
+     regle a maintenir. */
+
+  /* Reglage du deploiement : replie par defaut, il ne sert qu'une fois. */
+  details.deploiement{margin-top:8px;font-size:11px;color:#666}
+  details.deploiement>summary{cursor:pointer;min-height:44px;display:flex;
+    align-items:center;color:#5f6368}
+  details.deploiement input{width:100%;box-sizing:border-box;min-height:44px;
+    padding:0 10px;font:inherit;font-size:12px;color:#222;background:#fff;
+    border:1px solid #999;border-radius:6px;margin:6px 0}
+  .divergent{color:#b06000;font-weight:600}
+
+  /* Bloc de partage : le lien doit etre visible et selectionnable, y compris
+     si la copie automatique est refusee par le navigateur. */
+  .partage{margin-top:10px}
+  .partage input{width:100%;box-sizing:border-box;min-height:44px;
+    padding:0 10px;font:inherit;font-size:12px;color:#222;background:#fff;
+    border:1px solid #999;border-radius:6px;margin:8px 0}
+  .partage .actions{margin-bottom:8px}
+
+  /* Mode agrandi : le dialogue lui-meme a grandi (google.script.host). Le
+     panneau RETRECIT au lieu de s'elargir — toute la place gagnee doit
+     aller a la carte, c'est le seul but de l'agrandissement. 250 px reste
+     au-dessus de la largeur du tableau recapitulatif, rien n'est tronque. */
+  body.agrandi #panel{flex:0 0 250px}
+  .toggles label{display:inline-flex;align-items:center;min-height:44px;
+                 margin-right:12px;cursor:pointer;white-space:nowrap}
+  .toggles input[type=checkbox]{width:20px;height:20px;margin-right:6px}
+
+  /* Bloc technique : ferme par defaut. Rien n'est retire du payload, tout
+     reste consultable en un clic. */
+  details.tech{border-top:1px solid #e0e0e0;padding-top:8px}
+  details.tech>summary{cursor:pointer;font-weight:bold;font-size:12px;
+    min-height:44px;display:flex;align-items:center;color:#5f6368}
+  details.tech .block{margin-top:6px}
+
+  /* TELEPHONE : la carte prend tout l'ecran, le panneau devient un tiroir
+     bas, replie par defaut. Le paysage etait le pire cas -- 74 % de panneau
+     pour 101 px de carte visible -- et c'est lui que cette bascule corrige. */
+  @media (max-width:820px), (max-height:520px){
+    #layout{flex-direction:column}
+    #map{flex:1 1 auto;width:100%;min-height:0}
+    #panel{position:relative;flex:0 0 auto;max-height:45vh;
+           border-right:none;border-top:1px solid #ddd;
+           padding:0 12px 12px;gap:12px;
+           padding-bottom:calc(12px + env(safe-area-inset-bottom))}
+    /* Replie : seule la poignee reste visible. */
+    #panel.replie{max-height:none;overflow:hidden}
+    #panel.replie>*:not(#drawer-handle){display:none}
+    #drawer-handle{display:flex;align-items:center;justify-content:space-between;
+      position:sticky;top:0;background:#fafafa;min-height:44px;
+      border:0;width:100%;font:inherit;font-weight:bold;cursor:pointer;
+      padding:0;color:#222}
+    #drawer-handle .chev{color:#5f6368;font-size:16px;padding-left:10px}
+    .actions button{flex:1 1 100%}
+  }
+
+  @media (max-width:400px){
+    .block,table.sum th,table.sum td{font-size:12px}
   }
 </style>
 </head>
 <body>
 <div id="layout">
 
-  <div id="panel">
-    <div class="block" id="summary"></div>
-    <div class="block" id="legend"></div>
-    <div class="block toggles" id="toggles"></div>
-    <div class="block" id="territorial"></div>
-  </div>
-
-  <div id="empty"></div>
   <div id="map"></div>
+  <div id="empty"></div>
+
+  <div id="panel">
+    <!-- Poignée du tiroir : n'apparaît que sur téléphone, où le panneau est
+         replié par défaut pour laisser l'écran à la carte. -->
+    <button id="drawer-handle" type="button" aria-expanded="false">
+      <span id="drawer-resume">Détails</span><span class="chev">▲</span>
+    </button>
+
+    <div class="block" id="summary"></div>
+    <div class="block toggles" id="toggles"></div>
+
+    <!-- Actions et état du tracé. Masqué hors Apps Script : dans un fichier
+         exporté, ni les boutons ni le chargement n'ont de sens. -->
+    <div class="block" id="actions" style="display:none">
+      <div class="actions">
+        <button id="btn-zoom" type="button" class="primaire"
+                aria-pressed="false">Agrandir</button>
+        <button id="btn-download" type="button">Exporter et partager</button>
+      </div>
+      <div id="geo-status"></div>
+      <div id="download-result"></div>
+      <div class="meta" id="export-hint">Le partage produit un lien à envoyer
+        et une archive HTML dans Google Drive.</div>
+    </div>
+
+    <details class="tech" id="technique">
+      <summary>Détails techniques</summary>
+      <div class="block" id="legend"></div>
+      <div class="block" id="meta"></div>
+      <div class="block" id="territorial"></div>
+    </details>
+  </div>
 </div>
 
 <script>
@@ -86,6 +214,12 @@ var COLOR_END   = "#6c3483";   // violet
 var FALLBACK_COLORS = ["#1f5fa9", "#d35400"];
 
 var MSG_EMPTY = "Aucune tournée récente disponible. Lancez une optimisation.";
+
+var MSG_AUCUNE_TOURNEE = "Sélectionnez au moins une tournée.";
+
+var MSG_PARTAGE_AIDE = "Utilisez le lien pour consulter la carte sur "
+  + "ordinateur, iPhone, iPad ou Android. Le fichier HTML sert "
+  + "principalement d'archive.";
 
 
 /* ---------- utilitaires ---------- */
@@ -160,6 +294,13 @@ function showMap(){
 /* ---------- carte ---------- */
 
 function initMap(){
+  // Un second rendu (arrivée du tracé routier) réutilise le même conteneur :
+  // sans cette destruction, Leaflet refuse de s'y réinstaller.
+  if (map){ map.remove(); map = null; }
+  layers = [];
+  allLatLngs = [];
+  depotSeen = {};
+  usesRoadGeometry = false;
   map = L.map("map");
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
               {attribution:"&copy; OpenStreetMap", maxZoom:19}).addTo(map);
@@ -185,6 +326,9 @@ function drawRoute(route, index){
   var group = L.layerGroup();
   var pts = Array.isArray(route.points) ? route.points : [];
   var valid = [];
+  // Coordonnees de CETTE tournee seulement : le recentrage doit pouvoir
+  // ignorer une tournee decochee, ce qu'une liste globale ne permet pas.
+  var routeLatLngs = [];
 
   for (var i = 0; i < pts.length; i++){
     if (hasValidCoords(pts[i])) {
@@ -199,7 +343,7 @@ function drawRoute(route, index){
 
   // Tournée vide : aucun tracé, aucune erreur. La seconde tournée s'affiche seule.
   if (valid.length === 0){
-    layers.push({label:label, color:color, group:group, count:0});
+    layers.push({label:label, color:color, group:group, count:0, latlngs:[]});
     return;
   }
 
@@ -214,6 +358,7 @@ function drawRoute(route, index){
     L.polyline(latlngs, {pane:"routeLines", color:color,
                          weight:5, opacity:0.85}).addTo(group);
     allLatLngs = allLatLngs.concat(latlngs);
+    routeLatLngs = routeLatLngs.concat(latlngs);
   } else {
     // Aucune géométrie routière disponible : segments droits, en POINTILLÉS,
     // pour ne jamais faire passer une ligne droite pour un itinéraire réel.
@@ -241,6 +386,7 @@ function drawRoute(route, index){
     if (isDepotRole(p.role)){
       registerDepot(p, p.role);
       allLatLngs.push(toLatLng(p));
+      routeLatLngs.push(toLatLng(p));
       continue;                        // marqueurs de dépôt posés une seule fois
     }
 
@@ -261,10 +407,12 @@ function drawRoute(route, index){
       );
 
     allLatLngs.push(toLatLng(p));
+    routeLatLngs.push(toLatLng(p));
   }
 
   group.addTo(map);
-  layers.push({label:label, color:color, group:group, count:valid.length});
+  layers.push({label:label, color:color, group:group, count:valid.length,
+               latlngs:routeLatLngs});
 }
 
 
@@ -302,6 +450,7 @@ function drawDepots(){
 
 function buildSummary(payload){
   var rows = "", totalKm = 0, totalMin = 0, kmKnown = false, minKnown = false;
+  var totalPts = 0;
 
   for (var i = 0; i < payload.routes.length; i++){
     var r = payload.routes[i];
@@ -312,6 +461,7 @@ function buildSummary(payload){
     for (var j = 0; j < pts.length; j++){
       if (pts[j].role === "collection" && hasValidCoords(pts[j])) n++;
     }
+    totalPts += n;
 
     var km = r.distance_km, mn = r.duration_min;
     if (km !== null && km !== undefined && km !== "" && isFinite(Number(km))){
@@ -332,14 +482,28 @@ function buildSummary(payload){
         + "<th class='num'>" + (kmKnown ? fmt(totalKm,2,"km") : "—") + "</th>"
         + "<th class='num'>" + (minKnown ? fmt(totalMin,1,"min") : "—") + "</th></tr>";
 
+  // Le nom interne de la stratégie et la signature du jeu n'aident pas à
+  // conduire une tournée : ils partent sous « Détails techniques ». La date,
+  // elle, situe la carte et reste en vue.
   var meta = "";
   if (payload.strategy) meta += "Stratégie : " + esc(payload.strategy);
-  if (payload.points_signature) meta += " | jeu " + esc(payload.points_signature);
-  if (payload.generated_at) meta += "<br>" + esc(payload.generated_at);
+  if (payload.points_signature) meta += "<br>Jeu : " + esc(payload.points_signature);
+  document.getElementById("meta").innerHTML =
+    "<h2>Origine</h2><div class='meta'>" + (meta || "—") + "</div>";
+
+  var titre = payload.generated_at
+    ? "<div class='meta'>" + esc(payload.generated_at) + "</div>" : "";
 
   document.getElementById("summary").innerHTML =
-    "<h2>Récapitulatif</h2><table class='sum'>" + rows + "</table>"
-    + (meta ? "<div class='meta'>" + meta + "</div>" : "");
+    "<h2>Récapitulatif</h2>" + titre
+    + "<table class='sum'>" + rows + "</table>"
+    + "<div class='meta'>" + (usesRoadGeometry
+        ? "Itinéraire routier" : "Tracé indicatif") + "</div>";
+
+  // Résumé d'une ligne, affiché sur la poignée du tiroir quand il est replié.
+  document.getElementById("drawer-resume").textContent =
+    (kmKnown ? fmt(totalKm, 1, "km") : "—") + " · "
+    + (minKnown ? fmt(totalMin, 0, "min") : "—") + " · " + totalPts + " collectes";
 }
 
 
@@ -470,7 +634,10 @@ function buildToggles(){
     html += "<label><input type='checkbox' data-layer='" + i + "' checked> "
           + esc(layers[i].label) + "</label>";
   }
-  html += "<br><button type='button' id='showAll'>Afficher les deux</button>";
+  // Aucun bouton « Afficher les deux » : les deux cases disent deja tout ce
+  // qu'il rejouait, et il occupait une place qui compte sur telephone.
+  html += "<div id='toggles-hint' class='meta'></div>"
+        + "<br><button type='button' id='btn-fit'>Ajuster la vue</button>";
   host.innerHTML = html;
 
   var boxes = host.querySelectorAll("input[data-layer]");
@@ -478,16 +645,41 @@ function buildToggles(){
     boxes[b].addEventListener("change", function(){
       var g = layers[Number(this.getAttribute("data-layer"))].group;
       if (this.checked) { map.addLayer(g); } else { map.removeLayer(g); }
+      majIndicationTournees();
     });
   }
 
-  document.getElementById("showAll").addEventListener("click", function(){
-    for (var i = 0; i < layers.length; i++){
-      if (!map.hasLayer(layers[i].group)) map.addLayer(layers[i].group);
-    }
-    var bx = host.querySelectorAll("input[data-layer]");
-    for (var j = 0; j < bx.length; j++) bx[j].checked = true;
-  });
+  document.getElementById("btn-fit").addEventListener("click", recadrer);
+  majIndicationTournees();
+}
+
+
+/**
+ * Aucune tournée cochée : on le signale discrètement.
+ *
+ * Le fond de carte reste en place et rien ne plante — décocher les deux est
+ * une façon légitime de regarder le terrain seul.
+ */
+function majIndicationTournees(){
+  var host = document.getElementById("toggles");
+  var hint = document.getElementById("toggles-hint");
+  if (!host || !hint) return;
+  var boxes = host.querySelectorAll("input[data-layer]");
+  var coches = 0;
+  for (var i = 0; i < boxes.length; i++){ if (boxes[i].checked) coches++; }
+  hint.textContent = coches ? "" : MSG_AUCUNE_TOURNEE;
+}
+
+
+/** Coordonnées des seules tournées actuellement affichées. */
+function latLngsVisibles(){
+  var out = [];
+  for (var i = 0; i < layers.length; i++){
+    if (map && !map.hasLayer(layers[i].group)) continue;
+    var pts = layers[i].latlngs || [];
+    for (var j = 0; j < pts.length; j++) out.push(pts[j]);
+  }
+  return out;
 }
 
 
@@ -510,6 +702,13 @@ function renderCarte(payload){
   }
 
   showMap();
+  // Mémorisé pour le rechargement à l'arrivée du tracé routier et pour
+  // l'export : l'ordre des points n'est jamais recalculé.
+  currentPayload = payload;
+  // Remis à zéro ici et non dans initMap : les points écartés sont collectés
+  // avant ET après la création de la carte. Sans cela, le second rendu
+  // listerait deux fois les mêmes.
+  skipped = [];
 
   // Points écartés en amont par Apps Script (coordonnées absentes du Sheet).
   if (Array.isArray(payload.skipped) && payload.skipped.length){
@@ -540,23 +739,422 @@ function renderCarte(payload){
     return;
   }
 
-  // Le dialogue Apps Script peut encore se redimensionner après le premier
-  // rendu : on réaligne, puis on recadre pour rester exact.
-  window.addEventListener("resize", function(){
-    map.invalidateSize();
-    if (allLatLngs.length > 1) map.fitBounds(L.latLngBounds(allLatLngs).pad(0.08));
+  initTiroir();
+
+  // Le dialogue peut encore se redimensionner après le premier rendu, et un
+  // téléphone qui bascule en paysage change tout. Les deux événements sont
+  // écoutés : orientationchange arrive avant que les dimensions soient à
+  // jour, d'où le léger différé.
+  if (!window.__resizeBranche){
+    window.__resizeBranche = true;
+    window.addEventListener("resize", recadrer);
+    window.addEventListener("orientationchange", function(){
+      setTimeout(recadrer, 150);
+    });
+  }
+  setTimeout(recadrer, 0);
+}
+
+
+/* ---------- tiroir et redimensionnement ---------- */
+
+/** Recadre après un changement de taille, d'orientation ou de sélection.
+ *
+ *  Leaflet ne détecte pas seul qu'on est passé en paysage ou que le tiroir
+ *  s'est ouvert : sans invalidateSize, la carte garde l'ancienne taille et
+ *  laisse une bande grise.
+ *
+ *  Le cadrage ne retient que les tournées VISIBLES : recadrer sur une
+ *  tournée décochée ramènerait à l'écran ce qu'on vient d'en retirer. Sans
+ *  aucune tournée visible, le cadre courant est conservé tel quel. */
+function recadrer(){
+  if (!map) return;
+  map.invalidateSize();
+  var pts = latLngsVisibles();
+  if (pts.length > 1) map.fitBounds(L.latLngBounds(pts).pad(0.08));
+  else if (pts.length === 1) map.setView(pts[0], 15);
+}
+
+function basculerTiroir(){
+  var panel = document.getElementById("panel");
+  var handle = document.getElementById("drawer-handle");
+  var replie = panel.classList.toggle("replie");
+  handle.setAttribute("aria-expanded", replie ? "false" : "true");
+  handle.querySelector(".chev").textContent = replie ? "▲" : "▼";
+  setTimeout(recadrer, 0);
+}
+
+/** Le tiroir démarre replié sur téléphone, déployé sur ordinateur. */
+function initTiroir(){
+  var petit = window.matchMedia("(max-width:820px), (max-height:520px)").matches;
+  var panel = document.getElementById("panel");
+  panel.classList.toggle("replie", petit);
+  document.getElementById("drawer-handle")
+          .setAttribute("aria-expanded", petit ? "false" : "true");
+  document.getElementById("drawer-handle").querySelector(".chev")
+          .textContent = petit ? "▲" : "▼";
+}
+
+
+/* ---------- tracé routier et export ---------- */
+
+// Payload du run courant et géométries reçues. Les géométries ne sont JAMAIS
+// renvoyées vers le classeur : une cellule de feuille plafonne à 50 000
+// caractères et deux tracés routiers la feraient sauter. Elles ne vivent
+// que dans cette fenêtre, et dans le fichier exporté.
+var currentPayload = null;
+var currentGeometries = null;
+
+function enAppsScript(){
+  return typeof google !== "undefined" && google.script && google.script.run;
+}
+
+function setGeoStatus(texte, etat){
+  var el = document.getElementById("geo-status");
+  if (!el) return;
+  el.textContent = texte;
+  el.className = etat || "";
+}
+
+/** Recharge la carte avec les tracés routiers reçus. */
+function appliquerGeometries(geometries){
+  if (!currentPayload || !Array.isArray(geometries)) return false;
+  var applique = 0;
+  for (var i = 0; i < currentPayload.routes.length && i < geometries.length; i++){
+    if (Array.isArray(geometries[i]) && geometries[i].length > 1){
+      currentPayload.routes[i].geometry = geometries[i];
+      applique++;
+    }
+  }
+  if (!applique) return false;
+  currentGeometries = geometries;
+  renderCarte(currentPayload);
+  return true;
+}
+
+/**
+ * Demande le tracé routier APRÈS l'affichage.
+ *
+ * La carte est déjà lisible quand cet appel part : si le serveur dort ou
+ * échoue, les segments indicatifs restent en place et rien n'est perdu.
+ */
+function chargerGeometrie(){
+  if (!enAppsScript() || !currentPayload) return;
+
+  var coords = [];
+  for (var r = 0; r < currentPayload.routes.length; r++){
+    var pts = currentPayload.routes[r].points || [];
+    var route = [];
+    for (var i = 0; i < pts.length; i++){
+      var lat = Number(pts[i].lat), lon = Number(pts[i].lon);
+      if (isFinite(lat) && isFinite(lon)) route.push([lon, lat]);
+    }
+    coords.push(route);
+  }
+  if (coords.length !== 2 || coords[0].length < 2 || coords[1].length < 2){
+    setGeoStatus("Tracé routier indisponible pour ce jeu.", "fallback");
+    return;
+  }
+
+  setGeoStatus("Chargement du tracé routier…");
+  google.script.run
+    .withSuccessHandler(function(json){
+      var reponse;
+      try { reponse = JSON.parse(json); }
+      catch (e){ setGeoStatus("Tracé indicatif (réponse illisible).", "fallback"); return; }
+
+      if (appliquerGeometries(reponse.geometries)){
+        setGeoStatus(reponse.status === "partial"
+          ? "Tracé routier partiel : une tournée reste indicative."
+          : "Tracé routier chargé.", "loaded");
+      } else {
+        setGeoStatus("Tracé indicatif (" + (reponse.status || "indisponible") + ").",
+                     "fallback");
+      }
+    })
+    .withFailureHandler(function(){
+      setGeoStatus("Tracé indicatif : serveur injoignable.", "fallback");
+    })
+    .getCarteGeometrie(JSON.stringify(coords));
+}
+
+/* ---------- mode agrandi ---------- */
+
+// Dimensions demandees par code.js a l'ouverture du dialogue. Le retour a
+// l'etat normal les restaure telles quelles.
+var DIALOG_L = 1200, DIALOG_H = 800;
+
+// Plancher : en dessous, la carte n'est plus utilisable et il ne resterait
+// plus de bouton pour revenir en arriere.
+var DIALOG_MIN_L = 480, DIALOG_MIN_H = 380;
+
+var agrandi = false;
+
+/** Le cadre du dialogue est-il redimensionnable depuis la page ? */
+function peutRedimensionner(){
+  return typeof google !== "undefined" && google.script && google.script.host
+      && typeof google.script.host.setWidth === "function";
+}
+
+/**
+ * Agrandit ou réduit LE DIALOGUE lui-même.
+ *
+ * L'iframe d'un dialogue Apps Script est sandboxée : requestFullscreen n'y
+ * est pas fiable, et agrandir le contenu depuis l'intérieur ne ferait que
+ * remplir un cadre qui, lui, n'a pas bougé — c'est ce qui rendait l'ancien
+ * « Plein écran » décevant. google.script.host.setWidth / setHeight agissent
+ * sur le cadre, ce qui est le seul agrandissement réel possible ici. D'où le
+ * mot « Agrandir » : la page ne promet pas un plein écran du navigateur,
+ * qu'elle ne peut pas tenir.
+ */
+function basculerAgrandissement(){
+  var bouton = document.getElementById("btn-zoom");
+  if (!bouton) return;
+
+  var vise = !agrandi;
+  var largeur, hauteur;
+
+  if (vise){
+    // On demande la surface de l'ecran, moins un liseré. Aucun plafond de
+    // notre part : les anciens 1500x950 bridaient le dialogue bien en deçà
+    // de ce que Sheets accorde sur un ecran large. Google ramène de
+    // lui-même la valeur au maximum qu'il autorise, et c'est exactement le
+    // maximum reellement disponible que l'on veut.
+    largeur = (screen.availWidth  || DIALOG_L) - 24;
+    hauteur = (screen.availHeight || DIALOG_H) - 24;
+  } else {
+    largeur = DIALOG_L;
+    hauteur = DIALOG_H;
+  }
+  largeur = Math.max(largeur, DIALOG_MIN_L);
+  hauteur = Math.max(hauteur, DIALOG_MIN_H);
+
+  try {
+    if (peutRedimensionner()){
+      google.script.host.setWidth(largeur);
+      google.script.host.setHeight(hauteur);
+    }
+  } catch (e){
+    // Redimensionnement refusé : on n'insiste pas et surtout on ne casse
+    // rien. La classe et le libellé suivent quand même, la carte reste
+    // utilisable telle qu'elle est.
+  }
+
+  agrandi = vise;
+  document.body.classList.toggle("agrandi", agrandi);
+  bouton.textContent = agrandi ? "Réduire" : "Agrandir";
+  bouton.setAttribute("aria-pressed", agrandi ? "true" : "false");
+
+  // Leaflet ne detecte pas seul que son conteneur a change de taille. true
+  // force le recalcul immediat plutot qu'anime, sinon le premier fitBounds
+  // travaille encore sur l'ancienne taille.
+  if (map){
+    map.invalidateSize(true);
+    recadrer();
+  }
+}
+
+
+/**
+ * Export depuis la fenêtre.
+ *
+ * Le téléchargement direct depuis une iframe HtmlService n'est pas garanti :
+ * elle est sandboxée et le navigateur peut bloquer un Blob. On passe donc
+ * par Drive, puis on affiche un vrai lien.
+ *
+ * Les géométries déjà chargées partent avec la demande : l'export ne
+ * redemande jamais le tracé et ne coûte aucun appel externe de plus.
+ */
+function telechargerCarte(){
+  if (!enAppsScript()) return;
+  var bouton = document.getElementById("btn-download");
+  var sortie = document.getElementById("download-result");
+  bouton.disabled = true;
+  sortie.textContent = " Préparation du fichier…";
+
+  google.script.run
+    .withSuccessHandler(function(json){
+      bouton.disabled = false;
+      var info;
+      try { info = JSON.parse(json); }
+      catch (e){ sortie.textContent = " Export illisible."; return; }
+      if (info.error){ sortie.textContent = " " + info.error; return; }
+      afficherPartage(info);
+    })
+    .withFailureHandler(function(err){
+      bouton.disabled = false;
+      sortie.textContent = " Export impossible : "
+        + (err && err.message ? err.message : String(err));
+    })
+    .exporterCarteDepuisDialogue(
+      currentGeometries ? JSON.stringify(currentGeometries) : "");
+}
+
+
+/**
+ * Résultat du partage : un lien d'abord, le fichier ensuite.
+ *
+ * Le lien est la voie de consultation, sur ordinateur comme sur téléphone.
+ * Le fichier reste une archive : Drive ne l'affiche pas, il le télécharge.
+ */
+function afficherPartage(info){
+  var sortie = document.getElementById("download-result");
+  var html = "<div class='partage'><b>Carte prête à être partagée</b>";
+
+  // AUCUNE adresse Drive dans ce panneau, sous aucune forme. L'aperçu comme
+  // le téléchargement d'un fichier HTML aboutissent tous deux à « Impossible
+  // d'ouvrir le fichier pour le moment » — et c'était le seul lien cliquable
+  // qui restait quand le lien de partage manquait. L'archive existe toujours
+  // dans Drive ; on en donne le nom, pas un lien.
+  if (info.shareUrl){
+    html += "<input id='share-url' type='text' readonly value=\""
+          + esc(info.shareUrl) + "\">"
+          + "<div class='actions'>"
+          + "<button type='button' id='btn-copy' class='primaire'>"
+          + "Copier le lien</button>"
+          + "<button type='button' id='btn-close-share'>Fermer</button>"
+          + "</div><div id='copy-state' class='meta'></div>";
+  } else {
+    html += "<div class='warn'>"
+          + esc(info.shareError || "Lien de partage indisponible.")
+          + "</div>"
+          + "<div class='actions'>"
+          + "<button type='button' id='btn-close-share'>Fermer</button></div>";
+  }
+
+  html += "<div class='meta'>Archive dans votre Drive : "
+        + esc(info.name) + " — " + esc(String(info.sizeKb)) + " Ko<br>"
+        + esc(MSG_PARTAGE_AIDE)
+        + "<br>version " + esc(info.buildId || "?") + "</div>"
+        + blocDeploiement() + "</div>";
+
+  sortie.innerHTML = html;
+
+  var copier = document.getElementById("btn-copy");
+  if (copier) copier.addEventListener("click", copierLien);
+  brancherDeploiement();
+
+  var fermer = document.getElementById("btn-close-share");
+  if (fermer) fermer.addEventListener("click", function(){
+    sortie.innerHTML = "";
   });
-  setTimeout(function(){
-    map.invalidateSize();
-    if (allLatLngs.length > 1) map.fitBounds(L.latLngBounds(allLatLngs).pad(0.08));
-  }, 0);
+}
+
+
+/* ---------- déploiement utilisé ---------- */
+
+// Rempli avant l'export par getInfoDeploiement() : on veut SAVOIR quel
+// déploiement le lien va désigner avant de l'envoyer à quelqu'un.
+var infoDeploiement = null;
+
+/** Demande au script quel déploiement le partage utilisera. */
+function chargerInfoDeploiement(){
+  if (!enAppsScript()) return;
+  google.script.run
+    .withSuccessHandler(function(json){
+      try { infoDeploiement = JSON.parse(json); } catch (e){ infoDeploiement = null; }
+    })
+    .withFailureHandler(function(){ infoDeploiement = null; })
+    .getInfoDeploiement();
+}
+
+/**
+ * Bloc « Déploiement utilisé », replié.
+ *
+ * ScriptApp.getService().getUrl() rend l'adresse du service du script, pas
+ * celle du déploiement qu'on vient de mettre à jour. Créer un NOUVEAU
+ * déploiement au lieu d'une nouvelle version fait diverger les deux, et le
+ * lien part alors vers un déploiement qui ne sert plus le code courant. On
+ * montre donc l'identifiant retenu, et on laisse le corriger.
+ */
+function blocDeploiement(){
+  var info = infoDeploiement || {};
+  var id = info.deploiement || "(inconnu)";
+  var alerte = info.divergent
+    ? "<div class='divergent'>L'adresse enregistrée et celle du service "
+      + "diffèrent. C'est l'adresse enregistrée qui est utilisée.</div>"
+    : "";
+
+  return "<details class='deploiement'><summary>Déploiement utilisé : "
+       + esc(id) + "</summary>"
+       + alerte
+       + "<div>Source : " + esc(info.source || "aucune") + ".</div>"
+       + "<div>Si ce n'est pas le déploiement actif, collez son adresse "
+       + "/exec ci-dessous, puis relancez « Exporter et partager ».</div>"
+       + "<input id='webapp-url' type='text' placeholder='https://script."
+       + "google.com/macros/s/.../exec'>"
+       + "<div class='actions'>"
+       + "<button type='button' id='btn-save-url'>Enregistrer ce déploiement"
+       + "</button></div>"
+       + "<div id='url-state' class='meta'></div></details>";
+}
+
+function brancherDeploiement(){
+  var bouton = document.getElementById("btn-save-url");
+  if (bouton) bouton.addEventListener("click", enregistrerUrlWebApp);
+}
+
+/** Enregistre l'adresse collée, après validation côté script. */
+function enregistrerUrlWebApp(){
+  if (!enAppsScript()) return;
+  var champ = document.getElementById("webapp-url");
+  var etat = document.getElementById("url-state");
+  if (!champ || !etat) return;
+
+  etat.textContent = "Vérification…";
+  google.script.run
+    .withSuccessHandler(function(json){
+      var r;
+      try { r = JSON.parse(json); }
+      catch (e){ etat.textContent = "Réponse illisible."; return; }
+      if (!r.ok){ etat.textContent = r.message || "Adresse refusée."; return; }
+      etat.textContent = "Déploiement enregistré : " + r.deploiement
+        + ". Relancez « Exporter et partager » pour obtenir un lien à jour.";
+      chargerInfoDeploiement();
+    })
+    .withFailureHandler(function(){
+      etat.textContent = "Enregistrement impossible.";
+    })
+    .definirUrlWebApp(champ.value);
+}
+
+
+/**
+ * Copie le lien, ou à défaut le sélectionne.
+ *
+ * L'iframe d'un dialogue Apps Script est sandboxée : l'API presse-papiers y
+ * est souvent refusée. Le champ reste donc affiché et sélectionné, ce qui
+ * laisse toujours un Ctrl+C possible — jamais d'impasse.
+ */
+function copierLien(){
+  var champ = document.getElementById("share-url");
+  var etat = document.getElementById("copy-state");
+  if (!champ || !etat) return;
+
+  champ.focus();
+  champ.select();
+
+  var ok = false;
+  try { ok = document.execCommand("copy"); } catch (e){ ok = false; }
+  if (!ok && navigator.clipboard && navigator.clipboard.writeText){
+    try { navigator.clipboard.writeText(champ.value); ok = true; }
+    catch (e){ ok = false; }
+  }
+
+  etat.textContent = ok
+    ? "Lien copié."
+    : "Lien sélectionné : copiez-le avec Ctrl+C (⌘C sur Mac).";
 }
 
 
 /* ---------- amorçage ---------- */
 
+document.getElementById("drawer-handle")
+        .addEventListener("click", basculerTiroir);
+
 (function boot(){
-  // 1. Payload déjà posé sur window : utilisé par les tests hors Apps Script.
+  // 1. Payload déjà posé sur window : fichier exporté autonome, et tests hors
+  //    Apps Script. Aucun bouton, aucun appel : tout est déjà dans le fichier.
   if (window.TOURNEES_PAYLOAD){
     renderCarte(window.TOURNEES_PAYLOAD);
     return;
@@ -564,6 +1162,15 @@ function renderCarte(payload){
 
   // 2. Contexte Apps Script : on demande au serveur le dernier résultat.
   if (typeof google !== "undefined" && google.script && google.script.run){
+    document.getElementById("actions").style.display = "block";
+    document.getElementById("btn-download")
+            .addEventListener("click", telechargerCarte);
+    document.getElementById("btn-zoom")
+            .addEventListener("click", basculerAgrandissement);
+    // Demandé dès l'ouverture : le déploiement retenu doit être connu AVANT
+    // qu'un lien soit créé, pas découvert après l'avoir envoyé.
+    chargerInfoDeploiement();
+
     google.script.run
       .withSuccessHandler(function(json){
         if (!json){ showEmpty(); return; }
@@ -571,6 +1178,9 @@ function renderCarte(payload){
         try { data = JSON.parse(json); }
         catch (e){ showEmpty("Données de carte illisibles."); return; }
         renderCarte(data);
+        // La carte est AFFICHÉE avant que le tracé routier ne soit demandé :
+        // l'utilisateur ne patiente jamais devant un écran vide.
+        chargerGeometrie();
       })
       .withFailureHandler(function(err){
         showEmpty("Impossible de charger la carte : "
