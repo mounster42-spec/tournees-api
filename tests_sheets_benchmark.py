@@ -1185,49 +1185,169 @@ class TestMapResponsive(unittest.TestCase):
             self.assertIn(champ, self.html)
 
     def test_the_two_dialog_actions_are_the_requested_ones(self):
-        self.assertIn('id="btn-fullscreen"', self.html)
-        self.assertIn(">Plein écran<", self.html)
+        self.assertIn('id="btn-zoom"', self.html)
+        self.assertIn(">Agrandir<", self.html)
         self.assertIn(">Exporter<", self.html)
-        # L'ancien libelle a disparu de la barre d'actions, et « Ouvrir la
-        # carte » n'y reapparait sous aucune forme : c'est le nom de l'entree
-        # de menu, pas celui d'un bouton de la carte.
-        self.assertNotIn("Ouvrir en grand", self.html)
-        self.assertNotIn("Ouvrir la carte", self.html)
+        # L'ancien bouton et son vocabulaire ont disparu : Apps Script ne
+        # peut pas tenir la promesse d'un plein ecran de navigateur, et
+        # « Ouvrir la carte » est le nom d'une entree de menu, pas d'un
+        # bouton de la carte.
+        # Sur le fichier SANS commentaires : celui qui explique le changement
+        # doit forcement nommer ce qui a ete retire.
+        rendu = strip_comments(self.html)
+        for interdit in ("btn-fullscreen", "ouvrirEnGrand", "Plein écran",
+                         "Ouvrir en grand", "Ouvrir la carte",
+                         "requestFullscreen"):
+            self.assertNotIn(interdit, rendu,
+                             "%s subsiste dans la carte" % interdit)
 
-    def test_fullscreen_opens_the_web_app_not_a_fake_one(self):
-        """Le Fullscreen API n'est pas fiable dans l'iframe d'un dialogue :
-        agrandir l'iframe donnerait un faux plein ecran."""
-        body = extract_function(self.html, "ouvrirEnGrand")
-        self.assertIn('window.open(url, "_blank")', body)
-        self.assertIn("getWebAppUrl()", body)
-        self.assertNotIn("requestFullscreen", self.html)
-
-    def test_fullscreen_never_opens_the_drive_archive(self):
-        """Le bouton lit l'adresse validee cote script, et rien d'autre."""
-        body = extract_function(self.html, "ouvrirEnGrand")
-        for interdit in ("drive.google.com", "downloadUrl", "info.url",
-                         "exporterCarteDepuisDialogue", "/view", "/file/d/"):
-            self.assertNotIn(interdit, body,
-                             "« Plein écran » peut ouvrir %s" % interdit)
-
-    def test_a_blocked_popup_leaves_the_map_open_and_offers_a_second_click(self):
-        body = extract_function(self.html, "ouvrirEnGrand")
-        self.assertIn("bloqué la ", body)
-        self.assertIn("Plein écran ↗</a>", body)
-        # La carte courante n'est ni fermee ni rechargee.
-        for interdit in ("window.close", "location.reload", "renderCarte("):
-            self.assertNotIn(interdit, body)
-
-    def test_a_missing_web_app_is_explained_not_a_dead_link(self):
-        body = extract_function(self.html, "ouvrirEnGrand")
-        self.assertIn("MSG_WEB_APP_KO", body)
-        self.assertIn("La Web App n'est pas encore disponible.", self.html)
-        # La meme phrase des deux cotes : une seule facon de dire la chose.
-        self.assertIn("La Web App n'est pas encore disponible.", read_code())
-
-    def test_the_export_is_described_as_an_archive_not_as_the_way_to_consult(self):
+    def test_the_export_is_described_as_an_archive(self):
         self.assertIn("L'export crée une archive HTML dans", self.html)
-        self.assertIn("Plein écran", self.html[self.html.index("export-hint"):])
+
+
+class TestEnlargeDialog(unittest.TestCase):
+    """« Agrandir / Réduire » agit sur le CADRE du dialogue.
+
+    L'ancien bouton ouvrait un onglet, ce qui ne repondait pas au besoin.
+    requestFullscreen n'est pas fiable dans l'iframe sandboxee d'un dialogue
+    Apps Script, et agrandir le contenu depuis l'interieur ne ferait que
+    remplir un cadre inchange. google.script.host.setWidth / setHeight sont
+    le seul agrandissement reel disponible ici."""
+
+    def setUp(self):
+        self.html = read_map_html()
+        self.body = extract_function(self.html, "basculerAgrandissement")
+
+    def test_the_button_is_a_toggle_with_both_labels(self):
+        self.assertIn('id="btn-zoom"', self.html)
+        self.assertIn(">Agrandir<", self.html)
+        self.assertIn('bouton.textContent = agrandi ? "Réduire" : "Agrandir";',
+                      self.body)
+        self.assertIn('aria-pressed', self.html)
+        self.assertIn('setAttribute("aria-pressed"', self.body)
+        self.assertIn('getElementById("btn-zoom")\n'
+                      '            .addEventListener("click", '
+                      'basculerAgrandissement);', self.html)
+
+    def test_it_resizes_the_dialog_and_never_opens_a_tab(self):
+        self.assertIn("google.script.host.setWidth(largeur)", self.body)
+        self.assertIn("google.script.host.setHeight(hauteur)", self.body)
+        for interdit in ("window.open", "requestFullscreen", "_blank",
+                         "getWebAppUrl", "location."):
+            self.assertNotIn(interdit, self.body,
+                             "l'agrandissement passe par %s" % interdit)
+
+    def test_the_enlarged_size_follows_the_screen_with_a_margin(self):
+        self.assertIn("screen.availWidth", self.body)
+        self.assertIn("screen.availHeight", self.body)
+        self.assertIn("1500", self.body)
+        self.assertIn("950", self.body)
+
+    def test_it_restores_the_original_dialog_size(self):
+        self.assertIn("var DIALOG_L = 1200, DIALOG_H = 800;", self.html)
+        self.assertIn("largeur = DIALOG_L;", self.body)
+        self.assertIn("hauteur = DIALOG_H;", self.body)
+        # Les memes dimensions que celles demandees par code.js.
+        code = read_code()
+        self.assertIn("const MAP_DIALOG_WIDTH  = 1200;", code)
+        self.assertIn("const MAP_DIALOG_HEIGHT = 800;", code)
+
+    def test_no_size_can_be_negative_or_unusably_small(self):
+        self.assertIn("var DIALOG_MIN_L = 480, DIALOG_MIN_H = 380;", self.html)
+        self.assertIn("largeur = Math.max(largeur, DIALOG_MIN_L);", self.body)
+        self.assertIn("hauteur = Math.max(hauteur, DIALOG_MIN_H);", self.body)
+
+    def test_a_refused_resize_does_not_break_the_display(self):
+        self.assertIn("try {", self.body)
+        self.assertIn("catch (e)", self.body)
+        # Le libelle et la classe suivent quand meme : ils sont poses APRES
+        # le bloc protege, donc un echec ne laisse pas l'etat incoherent.
+        self.assertLess(self.body.index("catch (e)"),
+                        self.body.index("agrandi = vise;"))
+
+    def test_leaflet_is_told_and_the_view_follows_the_visible_routes(self):
+        self.assertIn("map.invalidateSize(true)", self.body)
+        self.assertIn("recadrer()", self.body)
+        recadrer = extract_function(self.html, "recadrer")
+        self.assertIn("latLngsVisibles()", recadrer)
+
+    def test_the_enlarged_mode_adds_a_css_class(self):
+        self.assertIn('document.body.classList.toggle("agrandi", agrandi);',
+                      self.body)
+        self.assertIn("body.agrandi #panel", self.html)
+
+
+class TestActionButtonContrast(unittest.TestCase):
+    """Le bouton principal etait ecrit en BLANC SUR BLANC.
+
+    Deux regles se disputaient la barre d'actions :
+
+      #actions button        -> specificite (1,0,1), background:#fff
+      .actions button.primaire -> specificite (0,2,1), background:#1a73e8
+                                                       color:#fff
+
+    Le selecteur d'ID gagne sur `background`, qui redevenait blanc. Mais
+    `color` n'avait aucun concurrent dans la regle d'ID : le blanc de
+    .primaire s'appliquait. D'ou du blanc sur blanc, a taille correcte et
+    parfaitement cliquable — donc invisible sans etre casse."""
+
+    def setUp(self):
+        self.html = read_map_html()
+
+    def regle(self, selecteur):
+        """Corps d'une regle CSS, du selecteur a son accolade fermante."""
+        debut = self.html.index(selecteur + "{")
+        return self.html[debut:self.html.index("}", debut)]
+
+    def test_the_id_rule_that_caused_it_is_gone(self):
+        """Plus aucun selecteur d'ID ne peint la barre d'actions."""
+        self.assertNotIn("#actions button{", self.html)
+        self.assertNotIn("#actions button:disabled{", self.html)
+
+    def test_background_and_colour_are_always_declared_together(self):
+        """Une regle qui pose l'un sans l'autre reouvre exactement la faille."""
+        for selecteur in (".actions button", ".actions button:hover",
+                          ".actions button.primaire",
+                          ".actions button.primaire:hover"):
+            corps = self.regle(selecteur)
+            self.assertIn("background:", corps,
+                          "%s ne declare pas de fond" % selecteur)
+            self.assertIn("color:", corps,
+                          "%s ne declare pas de couleur de texte" % selecteur)
+
+    def test_the_two_states_are_contrasted(self):
+        base = self.regle(".actions button")
+        self.assertIn("background:#ffffff", base)
+        self.assertIn("color:#0b57d0", base)
+        primaire = self.regle(".actions button.primaire")
+        self.assertIn("background:#0b57d0", primaire)
+        self.assertIn("color:#ffffff", primaire)
+        self.assertIn("border-color:#0b57d0", primaire)
+
+    def test_the_button_is_touch_sized_and_never_clipped(self):
+        base = self.regle(".actions button")
+        for regle in ("min-height:44px", "padding:0 16px",
+                      "display:inline-flex", "align-items:center",
+                      "justify-content:center", "white-space:nowrap",
+                      "overflow:visible", "font-weight:600",
+                      "cursor:pointer", "box-sizing:border-box",
+                      "max-width:100%"):
+            self.assertIn(regle, base,
+                          "le bouton d'action n'a pas %s" % regle)
+
+    def test_hover_and_keyboard_focus_are_visible(self):
+        self.assertIn(".actions button:hover{", self.html)
+        self.assertIn(".actions button:focus{", self.html)
+        self.assertIn(".actions button:focus-visible{", self.html)
+        self.assertIn("outline:3px solid #0b57d0", self.html)
+
+    def test_both_labels_fit_the_same_button(self):
+        """« Agrandir » et « Réduire » partagent la meme boite : rien n'est
+        dimensionne sur un libelle particulier."""
+        base = self.regle(".actions button")
+        self.assertIn("flex:1 1 auto", base)
+        self.assertNotIn("width:", base.replace("max-width:", "")
+                                       .replace("min-width:", ""))
 
 
 class TestMapRouteToggles(unittest.TestCase):
@@ -1281,7 +1401,8 @@ class TestMapRouteToggles(unittest.TestCase):
         Le controle porte donc sur les fonctions REELLEMENT editees, ou il
         est exact : une accolade ou une parenthese manquante s'y verrait."""
         for name in ("drawRoute", "buildToggles", "majIndicationTournees",
-                     "latLngsVisibles", "recadrer", "ouvrirEnGrand"):
+                     "latLngsVisibles", "recadrer",
+                     "basculerAgrandissement"):
             body = extract_function(self.html, name)
             self.assertTrue(body.strip(), "%s introuvable" % name)
             # extract_function s'arrete AVANT l'accolade fermante de la

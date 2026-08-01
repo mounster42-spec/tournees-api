@@ -33,10 +33,13 @@
          text-align:center;padding:40px 20px;color:#555;font-size:15px;line-height:1.6}
 
   .block{font-size:12px;line-height:1.6}
-  #actions button{font:inherit;padding:5px 12px;cursor:pointer;
-    border:1px solid #999;border-radius:4px;background:#fff}
-  #actions button:disabled{opacity:.5;cursor:default}
-  #geo-status,#download-result,#fullscreen-result{margin-left:10px;color:#555}
+  /* Il y avait ici un bloc « #actions button » herite d'avant la barre
+     d'actions. Un selecteur d'ID (1,0,1) l'emportait sur
+     « .actions button.primaire » (0,2,1) : le fond redevenait blanc, tandis
+     que la couleur de texte, elle, n'avait pas de concurrent et restait
+     blanche. Le bouton principal etait donc ecrit en blanc sur blanc. Les
+     regles de .actions plus bas suffisent, et elles fixent les deux. */
+  #geo-status,#download-result{margin-left:10px;color:#555}
   #geo-status.loaded{color:#1e8449}
   #geo-status.fallback{color:#b9770e}
   .block h2{margin:0 0 4px;font-size:13px}
@@ -67,12 +70,30 @@
      min-width:auto par defaut d'un element flex les fait passer a la ligne
      plutot que de rogner le texte. max-width borne la largeur au panneau,
      donc rien ne deborde de l'ecran. */
+  /* Fond ET couleur de texte declares ensemble, sur chaque etat : c'est
+     l'absence de l'un des deux qui avait produit du blanc sur blanc.
+     #0b57d0 sur blanc, et blanc sur #0b57d0, donnent le meme contraste
+     d'environ 5,9:1 — au-dessus du seuil AA pour du texte normal. */
   .actions{display:flex;flex-wrap:wrap;gap:8px}
-  .actions button{font:inherit;min-height:44px;padding:0 14px;cursor:pointer;
-    border:1px solid #1a73e8;border-radius:6px;background:#fff;color:#1a73e8;
-    flex:1 1 auto;max-width:100%;box-sizing:border-box;white-space:nowrap}
-  .actions button.primaire{background:#1a73e8;color:#fff;font-weight:bold}
+  .actions button{font:inherit;font-weight:600;min-height:44px;padding:0 16px;
+    cursor:pointer;display:inline-flex;align-items:center;
+    justify-content:center;
+    border:1px solid #0b57d0;border-radius:6px;
+    background:#ffffff;color:#0b57d0;
+    flex:1 1 auto;max-width:100%;box-sizing:border-box;
+    white-space:nowrap;overflow:visible}
+  .actions button:hover{background:#eaf1fb;color:#0b57d0}
+  .actions button:focus{outline:3px solid #0b57d0;outline-offset:2px}
+  .actions button:focus-visible{outline:3px solid #0b57d0;outline-offset:2px}
+  .actions button.primaire{background:#0b57d0;color:#ffffff;
+    border-color:#0b57d0}
+  .actions button.primaire:hover{background:#0842a0;color:#ffffff}
   .actions button:disabled{opacity:.5;cursor:default}
+
+  /* Mode agrandi : le dialogue lui-meme a grandi (google.script.host), la
+     carte prend la place gagnee et le panneau s'elargit juste ce qu'il
+     faut pour rester lisible. */
+  body.agrandi #panel{flex:0 0 330px}
   .toggles label{display:inline-flex;align-items:center;min-height:44px;
                  margin-right:12px;cursor:pointer;white-space:nowrap}
   .toggles input[type=checkbox]{width:20px;height:20px;margin-right:6px}
@@ -130,17 +151,14 @@
          exporté, ni les boutons ni le chargement n'ont de sens. -->
     <div class="block" id="actions" style="display:none">
       <div class="actions">
-        <button id="btn-fullscreen" type="button" class="primaire">Plein écran</button>
+        <button id="btn-zoom" type="button" class="primaire"
+                aria-pressed="false">Agrandir</button>
         <button id="btn-download" type="button">Exporter</button>
       </div>
-      <!-- Deux sorties distinctes : l'ouverture en grand et l'export ne se
-           recouvrent plus, chacune garde son message. -->
-      <div id="fullscreen-result"></div>
       <div id="geo-status"></div>
       <div id="download-result"></div>
       <div class="meta" id="export-hint">L'export crée une archive HTML dans
-        Google Drive. Pour consulter la carte sur PC ou smartphone, utilisez
-        Plein écran.</div>
+        Google Drive.</div>
     </div>
 
     <details class="tech" id="technique">
@@ -173,11 +191,6 @@ var COLOR_END   = "#6c3483";   // violet
 var FALLBACK_COLORS = ["#1f5fa9", "#d35400"];
 
 var MSG_EMPTY = "Aucune tournée récente disponible. Lancez une optimisation.";
-
-// Même phrase que côté script : une Web App absente se dit d'une seule façon,
-// et jamais en renvoyant l'utilisateur vers l'archive Drive.
-var MSG_WEB_APP_KO = "La Web App n'est pas encore disponible. Mettez à jour "
-                   + "ou déployez l'application Web Apps Script.";
 
 var MSG_AUCUNE_TOURNEE = "Sélectionnez au moins une tournée.";
 
@@ -838,42 +851,77 @@ function chargerGeometrie(){
     .getCarteGeometrie(JSON.stringify(coords));
 }
 
+/* ---------- mode agrandi ---------- */
+
+// Dimensions demandees par code.js a l'ouverture du dialogue. Le retour a
+// l'etat normal les restaure telles quelles.
+var DIALOG_L = 1200, DIALOG_H = 800;
+
+// Plancher : en dessous, la carte n'est plus utilisable et il ne resterait
+// plus de bouton pour revenir en arriere.
+var DIALOG_MIN_L = 480, DIALOG_MIN_H = 380;
+
+var agrandi = false;
+
+/** Le cadre du dialogue est-il redimensionnable depuis la page ? */
+function peutRedimensionner(){
+  return typeof google !== "undefined" && google.script && google.script.host
+      && typeof google.script.host.setWidth === "function";
+}
+
 /**
- * « Plein écran » : la même carte dans un vrai onglet HTTPS.
+ * Agrandit ou réduit LE DIALOGUE lui-même.
  *
- * Le Fullscreen API n'est pas fiable dans l'iframe sandboxée d'un dialogue
- * Apps Script. Agrandir l'iframe donnerait un faux plein écran, toujours
- * borné par le dialogue. On ouvre donc la Web App, qui est une vraie page.
- *
- * L'adresse vient de getWebAppUrl, qui délègue au seul helper validé côté
- * script. Ni archive Drive, ni lien /view, ni URL de téléchargement ne
- * peuvent arriver ici : le helper les refuse.
+ * L'iframe d'un dialogue Apps Script est sandboxée : requestFullscreen n'y
+ * est pas fiable, et agrandir le contenu depuis l'intérieur ne ferait que
+ * remplir un cadre qui, lui, n'a pas bougé — c'est ce qui rendait l'ancien
+ * « Plein écran » décevant. google.script.host.setWidth / setHeight agissent
+ * sur le cadre, ce qui est le seul agrandissement réel possible ici. D'où le
+ * mot « Agrandir » : la page ne promet pas un plein écran du navigateur,
+ * qu'elle ne peut pas tenir.
  */
-function ouvrirEnGrand(){
-  if (!enAppsScript()) return;
-  var sortie = document.getElementById("fullscreen-result");
-  sortie.textContent = " Ouverture…";
-  google.script.run
-    .withSuccessHandler(function(url){
-      if (!url){
-        sortie.innerHTML = " <span style='color:#b06000'>"
-          + esc(MSG_WEB_APP_KO) + "</span>";
-        return;
-      }
-      // Une fenêtre ouverte hors clic direct peut être bloquée. La carte
-      // courante n'est jamais fermée : le lien reste affiché et un second
-      // clic, celui-là direct, aboutit toujours.
-      var onglet = null;
-      try { onglet = window.open(url, "_blank"); } catch (e){ onglet = null; }
-      var lien = ' <a href="' + esc(url) + '" target="_blank">Plein écran ↗</a>';
-      sortie.innerHTML = onglet ? lien
-        : " <span style='color:#b06000'>Votre navigateur a bloqué la "
-          + "fenêtre.</span>" + lien;
-    })
-    .withFailureHandler(function(){
-      sortie.textContent = " Impossible d'obtenir l'adresse de la carte.";
-    })
-    .getWebAppUrl();
+function basculerAgrandissement(){
+  var bouton = document.getElementById("btn-zoom");
+  if (!bouton) return;
+
+  var vise = !agrandi;
+  var largeur, hauteur;
+
+  if (vise){
+    // Une marge est laissée à l'interface Sheets : un dialogue collé aux
+    // bords masquerait ses propres commandes.
+    largeur = Math.min((screen.availWidth  || DIALOG_L) - 80,  1500);
+    hauteur = Math.min((screen.availHeight || DIALOG_H) - 120, 950);
+  } else {
+    largeur = DIALOG_L;
+    hauteur = DIALOG_H;
+  }
+  largeur = Math.max(largeur, DIALOG_MIN_L);
+  hauteur = Math.max(hauteur, DIALOG_MIN_H);
+
+  try {
+    if (peutRedimensionner()){
+      google.script.host.setWidth(largeur);
+      google.script.host.setHeight(hauteur);
+    }
+  } catch (e){
+    // Redimensionnement refusé : on n'insiste pas et surtout on ne casse
+    // rien. La classe et le libellé suivent quand même, la carte reste
+    // utilisable telle qu'elle est.
+  }
+
+  agrandi = vise;
+  document.body.classList.toggle("agrandi", agrandi);
+  bouton.textContent = agrandi ? "Réduire" : "Agrandir";
+  bouton.setAttribute("aria-pressed", agrandi ? "true" : "false");
+
+  // Leaflet ne detecte pas seul que son conteneur a change de taille. true
+  // force le recalcul immediat plutot qu'anime, sinon le premier fitBounds
+  // travaille encore sur l'ancienne taille.
+  if (map){
+    map.invalidateSize(true);
+    recadrer();
+  }
 }
 
 
@@ -935,8 +983,8 @@ document.getElementById("drawer-handle")
     document.getElementById("actions").style.display = "block";
     document.getElementById("btn-download")
             .addEventListener("click", telechargerCarte);
-    document.getElementById("btn-fullscreen")
-            .addEventListener("click", ouvrirEnGrand);
+    document.getElementById("btn-zoom")
+            .addEventListener("click", basculerAgrandissement);
 
     google.script.run
       .withSuccessHandler(function(json){
