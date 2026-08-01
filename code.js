@@ -1301,8 +1301,18 @@ function _pageMessage_(titre, message) {
  * désormais lu dans le classeur et la page assemblée ici même.
  */
 function doGet(e) {
-  const jeton = (e && e.parameter && e.parameter[SHARE_PARAM])
-    ? String(e.parameter[SHARE_PARAM]) : "";
+  const params = (e && e.parameter) || {};
+
+  // Diagnostic : répond « Web App active » et le marqueur de version, rien
+  // d'autre. Aucune lecture du classeur, aucune donnée, aucun jeton requis.
+  // C'est ce qui permet de distinguer « mauvaise adresse » de « version
+  // ancienne encore servie ».
+  if (params[DIAG_PARAM]) {
+    return _pageMessage_("Web App active",
+      "Version servie : " + SHARE_BUILD_ID + ".");
+  }
+
+  const jeton = params[SHARE_PARAM] ? String(params[SHARE_PARAM]) : "";
 
   if (!jeton) {
     return _pageMessage_("Lien incomplet",
@@ -1325,7 +1335,10 @@ function doGet(e) {
     // Le MÊME constructeur que l'archive téléchargeable : gabarit courant
     // plus instantané injecté. La page rend donc seule, sans google.script.run
     // et sans le moindre accès au classeur.
-    html = _buildStandaloneCarteHtml_(payload);
+    // Marqueur en commentaire HTML, visible par « afficher la source » : il
+    // dit quelle version a réellement produit la page, sans rien exposer.
+    html = _buildStandaloneCarteHtml_(payload)
+      + "\n<!-- tournees-build " + SHARE_BUILD_ID + " -->\n";
   } catch (err) {
     return _pageMessage_("Carte indisponible", MSG_PARTAGE_INDISPONIBLE);
   }
@@ -1364,6 +1377,11 @@ const WEB_APP_URL_INTERDITS = [
   "drive.google.com", "/file/d/", "uc?export=", "/view", "/download"
 ];
 
+// Hôtes acceptables pour une Web App Apps Script. Contrôler le domaine, et
+// pas seulement l'absence de motifs Drive : une liste de motifs interdits
+// ne dit rien de ce qui n'y figure pas encore.
+const WEB_APP_URL_HOTES = ["script.google.com", "googleusercontent.com"];
+
 const MSG_WEB_APP_INDISPONIBLE =
     "La Web App n'est pas encore disponible. Mettez à jour ou déployez "
   + "l'application Web Apps Script.";
@@ -1381,9 +1399,30 @@ function _validerUrlWebApp_(brut) {
   if (url.indexOf("https://") !== 0) return "";
 
   const bas = url.toLowerCase();
+
+  // Ni fragment, ni paramètre hérité : le jeton est le seul paramètre, et il
+  // est ajouté ensuite. Une adresse qui en porte déjà n'est pas celle qu'on
+  // croit.
+  if (bas.indexOf("#") !== -1 || bas.indexOf("?") !== -1) return "";
+
   for (var i = 0; i < WEB_APP_URL_INTERDITS.length; i++) {
     if (bas.indexOf(WEB_APP_URL_INTERDITS[i]) !== -1) return "";
   }
+
+  // Domaine attendu, et pas seulement absence de motifs Drive.
+  const apresSchema = bas.slice("https://".length);
+  const barre = apresSchema.indexOf("/");
+  const hote = barre === -1 ? apresSchema : apresSchema.slice(0, barre);
+  var hoteConnu = false;
+  for (var h = 0; h < WEB_APP_URL_HOTES.length; h++) {
+    const attendu = WEB_APP_URL_HOTES[h];
+    if (hote === attendu
+        || hote.slice(-(attendu.length + 1)) === "." + attendu) {
+      hoteConnu = true;
+      break;
+    }
+  }
+  if (!hoteConnu) return "";
 
   // Un déploiement d'application Web se termine par /exec. /dev est l'adresse
   // de brouillon : réservée aux éditeurs du script, elle n'ouvrirait rien
@@ -1743,9 +1782,20 @@ const SHARE_MAX_FRAGMENTS = 40;
 // il est retiré à la relecture.
 const SHARE_FRAGMENT_PREFIX = "~";
 
-// Paramètre d'URL portant le jeton. Court, parce qu'il voyage dans un lien
-// que quelqu'un va recopier ou coller dans une messagerie.
-const SHARE_PARAM = "c";
+// Paramètre d'URL portant le jeton. Nommé « share » plutôt que « c » : un
+// lien que quelqu'un va coller dans une messagerie doit dire ce qu'il est.
+// Une seule constante sert à le POSER et à le LIRE — les deux côtés ne
+// peuvent donc pas diverger.
+const SHARE_PARAM = "share";
+
+// Paramètre de diagnostic. Ne rend que le marqueur de version : aucune
+// donnée du classeur, aucune adresse, aucune coordonnée.
+const DIAG_PARAM = "diagnostic";
+
+// Marqueur de version, non sensible. Il sert à répondre sans ambiguïté à
+// une seule question : le navigateur exécute-t-il bien le code recopié, ou
+// le déploiement sert-il encore une version antérieure ?
+const SHARE_BUILD_ID = "6634323-fix1";
 
 // Au-delà, le lien cesse de fonctionner sans qu'on ait à y penser. Une carte
 // de tournée n'a de sens que peu de temps.
@@ -1815,11 +1865,17 @@ function _enregistrerPartage_(payloadJson, nom, signature) {
   }
 
   const ligne = sh.getLastRow() + 1;
-  const plage = sh.getRange(ligne, 1, 1, largeur);
-  plage.setNumberFormat("@");   // ceinture, en plus du préfixe
-  plage.setValues([[jeton, cree, expire, String(nom || ""),
-                    String(signature || ""), morceaux.length]
-                   .concat(morceaux)]);
+
+  // Le format texte s'applique aux SEULS fragments. Appliqué à toute la
+  // ligne, il transformait « Expire le » en chaîne : à la relecture
+  // `expire instanceof Date` était faux et l'expiration ne se déclenchait
+  // jamais. Les deux dates doivent rester des dates.
+  sh.getRange(ligne, SHARE_COL_FRAGMENTS, 1, morceaux.length)
+    .setNumberFormat("@");
+
+  sh.getRange(ligne, 1, 1, largeur).setValues(
+    [[jeton, cree, expire, String(nom || ""),
+      String(signature || ""), morceaux.length].concat(morceaux)]);
   return jeton;
 }
 
@@ -1916,13 +1972,24 @@ function exporterCarteDepuisDialogue(geometriesJson) {
   const info = _deposerCarteSurDrive_(html, signature);
   info.withGeometry = !!(geometries && geometries.length);
 
+  // L'archive Drive ne sort PLUS d'ici. Ni son URL d'aperçu, ni son URL de
+  // téléchargement : toutes deux mènent à « Impossible d'ouvrir le fichier
+  // pour le moment » sur un fichier HTML. Le fichier existe dans Drive, on
+  // en donne le nom, pas un lien.
+  delete info.url;
+  delete info.downloadUrl;
+  delete info.id;
+
+  info.buildId = SHARE_BUILD_ID;
+
   // Lien de consultation. Un échec ici ne fait pas échouer l'export : le
   // fichier existe déjà, et la fenêtre le dira plutôt que de tout perdre.
   try {
     const base = _getWebAppUrl_();
     if (base) {
       info.shareUrl = base + "?" + SHARE_PARAM + "="
-        + _enregistrerPartage_(enrichi, info.name, signature);
+        + encodeURIComponent(_enregistrerPartage_(enrichi, info.name,
+                                                  signature));
     } else {
       info.shareError = MSG_WEB_APP_INDISPONIBLE;
     }

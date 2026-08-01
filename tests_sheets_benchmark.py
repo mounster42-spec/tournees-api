@@ -1243,6 +1243,75 @@ class TestShareableSnapshot(unittest.TestCase):
 
     # --- le lien ---------------------------------------------------------
 
+    def test_the_parameter_is_named_share_on_both_sides(self):
+        """Poser et lire le parametre viennent de la MEME constante : les
+        deux cotes ne peuvent pas diverger."""
+        self.assertIn('const SHARE_PARAM = "share";', self.code)
+        export = extract_function(self.code, "exporterCarteDepuisDialogue")
+        self.assertIn('base + "?" + SHARE_PARAM + "="', export)
+        lecture = extract_function(self.code, "doGet")
+        self.assertIn("params[SHARE_PARAM]", lecture)
+        # Plus aucun nom de parametre ecrit en dur.
+        sans = strip_comments(self.code)
+        self.assertNotIn('"?c="', sans)
+        self.assertNotIn('parameter["c"]', sans)
+
+    def test_the_token_is_percent_encoded_in_the_link(self):
+        export = extract_function(self.code, "exporterCarteDepuisDialogue")
+        self.assertIn("encodeURIComponent(_enregistrerPartage_(", export)
+
+    def test_the_url_must_be_an_apps_script_host(self):
+        """Une liste de motifs interdits ne dit rien de ce qui n'y figure
+        pas encore : le domaine est verifie positivement."""
+        self.assertIn('const WEB_APP_URL_HOTES = ["script.google.com", '
+                      '"googleusercontent.com"];', self.code)
+        valider = extract_function(self.code, "_validerUrlWebApp_")
+        self.assertIn("WEB_APP_URL_HOTES", valider)
+        self.assertIn("hoteConnu", valider)
+        self.assertIn('if (!hoteConnu) return "";', valider)
+
+    def test_the_url_carries_no_inherited_query_or_fragment(self):
+        valider = extract_function(self.code, "_validerUrlWebApp_")
+        self.assertIn('bas.indexOf("#") !== -1', valider)
+        self.assertIn('bas.indexOf("?") !== -1', valider)
+
+    def test_the_expiry_stays_a_real_date(self):
+        """Le format texte applique a TOUTE la ligne transformait « Expire
+        le » en chaine : `expire instanceof Date` etait faux et l'expiration
+        ne se declenchait jamais."""
+        ecrit = extract_function(self.code, "_enregistrerPartage_")
+        self.assertIn("sh.getRange(ligne, SHARE_COL_FRAGMENTS, 1, "
+                      "morceaux.length)\n    .setNumberFormat(\"@\");", ecrit)
+        # Le format texte ne touche plus la ligne entiere.
+        self.assertNotIn("sh.getRange(ligne, 1, 1, largeur)\n"
+                         "    .setNumberFormat", ecrit)
+        self.assertEqual(ecrit.count('setNumberFormat("@")'), 1)
+        lire = extract_function(self.code, "_lirePartage_")
+        self.assertIn("expire instanceof Date", lire)
+
+    def test_a_build_marker_says_which_version_is_served(self):
+        self.assertIn('const SHARE_BUILD_ID = "6634323-fix1";', self.code)
+        doget = extract_function(self.code, "doGet")
+        self.assertIn("SHARE_BUILD_ID", doget)
+        self.assertIn("tournees-build ", doget)
+        export = extract_function(self.code, "exporterCarteDepuisDialogue")
+        self.assertIn("info.buildId = SHARE_BUILD_ID;", export)
+        self.assertIn("esc(info.buildId", read_map_html())
+
+    def test_the_diagnostic_page_exposes_no_data(self):
+        self.assertIn('const DIAG_PARAM = "diagnostic";', self.code)
+        doget = extract_function(self.code, "doGet")
+        garde = doget.index("params[DIAG_PARAM]")
+        # Le diagnostic repond AVANT toute lecture du classeur.
+        self.assertLess(garde, doget.index("_lirePartage_"))
+        bloc = doget[garde:doget.index("const jeton")]
+        self.assertIn("Web App active", bloc)
+        self.assertIn("SHARE_BUILD_ID", bloc)
+        for interdit in ("_lirePartage_", "_classeur_", "SpreadsheetApp",
+                         "DriveApp", "payload", "routes"):
+            self.assertNotIn(interdit, bloc,
+                             "le diagnostic touche %s" % interdit)
+
     def test_the_link_is_built_from_the_validated_web_app_url(self):
         export = extract_function(self.code, "exporterCarteDepuisDialogue")
         self.assertIn("_getWebAppUrl_()", export)
@@ -1259,14 +1328,45 @@ class TestShareableSnapshot(unittest.TestCase):
         self.assertIn("try {", export)
         self.assertIn("catch (e)", export)
 
-    def test_the_drive_preview_url_is_never_offered_as_the_way_to_consult(self):
-        partage = extract_function(self.html, "afficherPartage")
+    def test_no_drive_url_can_be_clicked_from_the_share_panel(self):
+        """La cause prouvee de la page Drive.
+
+        Le panneau portait encore <a href=".../uc?export=download&id=...">.
+        Sur un fichier HTML, cette adresse rend exactement « Impossible
+        d'ouvrir le fichier pour le moment » — et quand le lien de partage
+        manquait, c'etait le SEUL element cliquable du panneau."""
+        partage = strip_comments(extract_function(self.html, "afficherPartage"))
         self.assertIn("info.shareUrl", partage)
-        self.assertIn("Télécharger l'archive", partage)
-        # Le lien /view de Drive, celui qui affiche « Impossible d'ouvrir le
-        # fichier », ne figure plus dans la fenetre.
-        self.assertNotIn("info.url", partage)
+        for interdit in ("downloadUrl", "info.url", "info.id",
+                         "drive.google.com", "uc?export=", "/file/d/",
+                         "/view", "<a ", "href"):
+            self.assertNotIn(interdit, partage,
+                             "le panneau de partage expose encore %s"
+                             % interdit)
+        # Et cote script, ces proprietes ne partent meme plus vers la fenetre.
+        export = extract_function(read_code(), "exporterCarteDepuisDialogue")
+        self.assertIn("delete info.url;", export)
+        self.assertIn("delete info.downloadUrl;", export)
+        self.assertIn("delete info.id;", export)
         self.assertNotIn("Ouvrir dans Drive", strip_comments(self.html))
+
+    def test_the_displayed_link_is_exactly_the_copied_link(self):
+        """Le champ affiche et la valeur copiee sont le MEME noeud DOM."""
+        partage = extract_function(self.html, "afficherPartage")
+        self.assertIn("<input id='share-url'", partage)
+        # Le champ est rempli avec shareUrl, et avec rien d'autre.
+        self.assertIn("+ esc(info.shareUrl) +", partage)
+        self.assertEqual(partage.count("esc(info.shareUrl)"), 1)
+        copie = extract_function(self.html, "copierLien")
+        self.assertIn('getElementById("share-url")', copie)
+        self.assertIn("champ.select();", copie)
+        self.assertIn("navigator.clipboard.writeText(champ.value)", copie)
+        # Ni « premier input trouve », ni variable conservee d'un export
+        # precedent : la lecture se fait par identifiant, sur le champ affiche.
+        for interdit in ("querySelector(\'input", 'getElementsByTagName("input")',
+                         "info.shareUrl", "downloadUrl"):
+            self.assertNotIn(interdit, copie,
+                             "copierLien lit %s au lieu du champ" % interdit)
 
     # --- ce que voit l'ami -----------------------------------------------
 
@@ -1335,9 +1435,9 @@ class TestShareableSnapshot(unittest.TestCase):
         partage = extract_function(self.html, "afficherPartage")
         self.assertIn("Carte prête à être partagée", partage)
         self.assertIn("Copier le lien", partage)
-        self.assertIn("Télécharger l'archive", partage)
         self.assertIn("Fermer", partage)
         self.assertIn("MSG_PARTAGE_AIDE", partage)
+        self.assertIn("Archive dans votre Drive : ", partage)
         self.assertNotIn("Ouvrir la carte partagée", self.html)
         # Le mot « map » ne remplace jamais « carte ».
         self.assertNotIn("map partag", self.html)
@@ -1363,12 +1463,10 @@ class TestShareableSnapshot(unittest.TestCase):
         self.assertIn("Ctrl+C", body)
 
     def test_the_share_controls_are_touch_sized_and_contrasted(self):
-        debut = self.html.index(".actions a.bouton{")
-        regle = self.html[debut:self.html.index("}", debut)]
-        for attendu in ("min-height:44px", "background:#ffffff",
-                        "color:#0b57d0", "display:inline-flex",
-                        "box-sizing:border-box", "max-width:100%"):
-            self.assertIn(attendu, regle)
+        # Plus aucun lien presente comme un bouton : le seul qui existait
+        # pointait vers Drive et a ete retire.
+        self.assertNotIn(".actions a.bouton{", self.html)
+        self.assertNotIn("class='bouton'", self.html)
         debut = self.html.index(".partage input{")
         champ = self.html[debut:self.html.index("}", debut)]
         self.assertIn("min-height:44px", champ)

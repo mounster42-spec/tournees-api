@@ -90,18 +90,10 @@
   .actions button.primaire:hover{background:#0842a0;color:#ffffff}
   .actions button:disabled{opacity:.5;cursor:default}
 
-  /* Liens presentes comme des boutons : memes regles, meme contraste, meme
-     hauteur tactile. Un lien doit ouvrir un onglet, un bouton non — d'ou
-     les deux formes cote a cote. */
-  .actions a.bouton{font:inherit;font-weight:600;min-height:44px;
-    padding:0 16px;cursor:pointer;display:inline-flex;align-items:center;
-    justify-content:center;
-    border:1px solid #0b57d0;border-radius:6px;
-    background:#ffffff;color:#0b57d0;text-decoration:none;
-    flex:1 1 auto;max-width:100%;box-sizing:border-box;
-    white-space:nowrap;overflow:visible}
-  .actions a.bouton:hover{background:#eaf1fb;color:#0b57d0}
-  .actions a.bouton:focus{outline:3px solid #0b57d0;outline-offset:2px}
+  /* Il y avait ici une regle « .actions a.bouton », pour des liens presentes
+     comme des boutons. Le seul qui l'utilisait pointait vers Drive et a ete
+     retire : plus aucun lien sortant dans la barre d'actions, donc plus de
+     regle a maintenir. */
 
   /* Bloc de partage : le lien doit etre visible et selectionnable, y compris
      si la copie automatique est refusee par le navigateur. */
@@ -1000,32 +992,31 @@ function afficherPartage(info){
   var sortie = document.getElementById("download-result");
   var html = "<div class='partage'><b>Carte prête à être partagée</b>";
 
+  // AUCUNE adresse Drive dans ce panneau, sous aucune forme. L'aperçu comme
+  // le téléchargement d'un fichier HTML aboutissent tous deux à « Impossible
+  // d'ouvrir le fichier pour le moment » — et c'était le seul lien cliquable
+  // qui restait quand le lien de partage manquait. L'archive existe toujours
+  // dans Drive ; on en donne le nom, pas un lien.
   if (info.shareUrl){
-    // Aucun bouton n'ouvre la carte partagée depuis ici : elle est déjà
-    // sous les yeux, et une seconde copie n'apporterait rien. Le besoin est
-    // de COPIER le lien pour l'envoyer.
     html += "<input id='share-url' type='text' readonly value=\""
           + esc(info.shareUrl) + "\">"
           + "<div class='actions'>"
           + "<button type='button' id='btn-copy' class='primaire'>"
           + "Copier le lien</button>"
-          + "<a class='bouton' href='" + esc(info.downloadUrl)
-          + "' target='_blank' rel='noopener'>Télécharger l'archive</a>"
           + "<button type='button' id='btn-close-share'>Fermer</button>"
           + "</div><div id='copy-state' class='meta'></div>";
   } else {
     html += "<div class='warn'>"
           + esc(info.shareError || "Lien de partage indisponible.")
           + "</div>"
-          + "<div class='actions'><a class='bouton' href='"
-          + esc(info.downloadUrl) + "' target='_blank' rel='noopener'>"
-          + "Télécharger l'archive</a>"
+          + "<div class='actions'>"
           + "<button type='button' id='btn-close-share'>Fermer</button></div>";
   }
 
-  html += "<div class='meta'>" + esc(info.name) + " — "
-        + esc(String(info.sizeKb)) + " Ko<br>" + esc(MSG_PARTAGE_AIDE)
-        + "</div></div>";
+  html += "<div class='meta'>Archive dans votre Drive : "
+        + esc(info.name) + " — " + esc(String(info.sizeKb)) + " Ko<br>"
+        + esc(MSG_PARTAGE_AIDE)
+        + "<br>version " + esc(info.buildId || "?") + "</div></div>";
 
   sortie.innerHTML = html;
 
