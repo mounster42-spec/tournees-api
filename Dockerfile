@@ -92,6 +92,13 @@ COPY --from=vroom-build /build/vroom-ldd.txt        /usr/local/share/vroom/LDD
 # Ce RUN echoue le build si ce n'etait pas vrai.
 RUN /usr/local/bin/vroom --version
 
+# Magasin de certificats systeme a jour. Le digest epingle de l'image de base
+# fige aussi sa version de ca-certificates : sans cette ligne, l'image garderait
+# la confiance dans les intermediaires eMudhra compromis (octobre 2026).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -104,8 +111,12 @@ WORKDIR /app
 
 # Les dependances Python d'abord : cette couche ne change pas quand app.py
 # change, donc les rebuilds restent rapides.
+# pip embarque sa propre copie de certifi : il est mis a jour avant de
+# telecharger quoi que ce soit d'autre depuis PyPI.
 COPY requirements-docker.txt ./
-RUN pip install -r requirements-docker.txt
+RUN pip install --upgrade "pip>=26.2.2" \
+ && pip install -r requirements-docker.txt \
+ && python -c "import certifi; print('certifi', certifi.__version__)"
 
 COPY app.py local_vroom.py ./
 COPY tools/ ./tools/
