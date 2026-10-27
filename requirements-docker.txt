@@ -15,3 +15,11 @@ requests==2.34.2
 numpy==2.5.1
 scikit-learn==1.9.0
 ortools==9.15.6755
+
+# Plancher de securite, pas une epingle de reproductibilite : certifi est le
+# magasin de certificats utilise par requests pour les appels HTTPS vers ORS.
+# Les versions anterieures font encore confiance aux intermediaires eMudhra
+# compromis (GHSA-6q48-6c7w-9gw2). Une borne basse laisse passer les futurs
+# retraits de CA ; elle change aussi le contenu de ce fichier, donc invalide la
+# couche pip en cache.
+certifi>=2026.10.19

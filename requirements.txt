@@ -4,3 +4,6 @@ requests
 numpy
 scikit-learn
 ortools
+# Securite : compromission des intermediaires eMudhra (GHSA-6q48-6c7w-9gw2).
+# requests verifie TLS avec le magasin de certificats de certifi.
+certifi>=2026.10.19
